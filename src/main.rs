@@ -3,6 +3,7 @@ mod config;
 mod output;
 mod rag;
 mod scan;
+mod sim;
 mod stats;
 mod store;
 mod tokenize;
@@ -62,6 +63,18 @@ enum Command {
         #[arg(short, long)]
         follow: bool,
     },
+    /// Interactive RAG simulator (TUI), or batch replay of prompt history
+    Sim {
+        /// Replay prompts from ~/.claude/history.jsonl instead of TUI
+        #[arg(long)]
+        replay: bool,
+        /// Number of history prompts to replay (most recent first)
+        #[arg(short = 'n', long, default_value_t = 100)]
+        count: usize,
+        /// Replay only prompts containing Hangul
+        #[arg(long)]
+        hangul: bool,
+    },
     /// Index/collection status
     Status,
 }
@@ -79,6 +92,13 @@ fn main() -> Result<()> {
         Command::Rag { hook, prompt } => cmd_rag(hook, prompt.as_deref()),
         Command::Stats { hours } => stats::print_stats(hours.map(|h| h * 3600)),
         Command::Log { count, follow } => stats::print_log(count, follow),
+        Command::Sim { replay, count, hangul } => {
+            if replay {
+                sim::replay(count, hangul)
+            } else {
+                sim::tui()
+            }
+        }
         Command::Status => cmd_status(),
     }
 }
