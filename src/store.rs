@@ -27,7 +27,7 @@ impl Store {
         }
         let conn = Connection::open(path)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
-        conn.pragma_update(None, "busy_timeout", 5000)?;
+        conn.pragma_update(None, "busy_timeout", 30000)?;
         conn.execute_batch(
             r#"
             CREATE TABLE IF NOT EXISTS documents (

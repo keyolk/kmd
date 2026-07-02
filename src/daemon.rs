@@ -157,7 +157,20 @@ fn handle_conn(
                         let cfg = crate::config::load()?;
                         let mut store = crate::store::Store::open(&crate::config::store_path())?;
                         crate::scan::update(&cfg, &mut store, false)?;
+                        #[cfg(feature = "embed")]
+                        {
+                            let dirty_ids: Vec<i64> =
+                                store.dirty_docs()?.iter().map(|d| d.id).collect();
+                            crate::embed::purge_stale(&store, &dirty_ids)?;
+                        }
                         crate::bm25::index_dirty(&crate::config::tantivy_dir(), &mut store)?;
+                        // 신규/변경 문서 임베딩 — 한 사이클에 200개 캡 (백그라운드 시간 바운드)
+                        #[cfg(feature = "embed")]
+                        {
+                            if let Err(e) = crate::embed::embed_pending(&mut store, Some(200)) {
+                                eprintln!("daemon embed failed (non-fatal): {}", e);
+                            }
+                        }
                         Ok(())
                     })();
                     if let Err(e) = r {

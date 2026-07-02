@@ -29,6 +29,9 @@ enum Command {
         /// Force reindex of all files
         #[arg(long)]
         force: bool,
+        /// Queue update on the daemon and return immediately (falls back to local)
+        #[arg(long = "async")]
+        r#async: bool,
     },
     /// Keyword search (Korean morphological BM25)
     Search {
@@ -113,7 +116,7 @@ enum Command {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Command::Update { force } => cmd_update(force),
+        Command::Update { force, r#async } => cmd_update(force, r#async),
         Command::Search {
             query,
             limit,
@@ -144,7 +147,17 @@ fn main() -> Result<()> {
     }
 }
 
-fn cmd_update(force: bool) -> Result<()> {
+fn cmd_update(force: bool, r#async: bool) -> Result<()> {
+    if r#async && !force {
+        // 데몬에 위임 — 즉시 반환 (Stop 훅용 논블로킹 경로)
+        if let Some(resp) = daemon::try_request(&serde_json::json!({"cmd": "update"})) {
+            if resp.get("ok").and_then(|v| v.as_bool()) == Some(true) {
+                eprintln!("update queued on daemon");
+                return Ok(());
+            }
+        }
+        eprintln!("daemon unavailable — running update locally");
+    }
     let cfg = config::load()?;
     let mut store = store::Store::open(&config::store_path())?;
     let stats = scan::update(&cfg, &mut store, force)?;

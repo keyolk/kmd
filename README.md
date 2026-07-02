@@ -11,11 +11,11 @@ actually works.
 
 Measured on 60 real Korean prompts (Claude Code RAG hook simulation):
 
-| Engine | Korean hit rate | English hit rate | median latency |
+| Engine | Korean hit rate | English hit rate | hook latency |
 |---|---|---|---|
 | qmd 1.0 (BM25) | 13% | 52% | ~150ms |
-| qmd 2.6.3 (BM25+CJK) | 18% | 67% | ~150ms |
-| **kmd (lindera BM25)** | **73%** | 63% | ~280ms |
+| qmd 2.6.3 (BM25+CJK per-char) | 18% | 67% | ~150ms |
+| **kmd (lindera BM25)** | **72%** | 62% | **~82ms (daemon) / ~370ms (cold)** |
 
 ## Usage
 
