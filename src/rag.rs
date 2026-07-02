@@ -220,7 +220,29 @@ pub fn run_pipeline(prompt: &str) -> Result<RagOutcome> {
     })
 }
 
+/// 파이프라인 결과를 rag.jsonl에 기록 (훅/데몬 공용).
+pub fn log_outcome(prompt: &str, session_id: &str, outcome: &RagOutcome) {
+    append_log(&RagLogEntry {
+        ts: now_iso(),
+        session_id: session_id.to_string(),
+        prompt: prompt.to_string(),
+        prompt_len: prompt.chars().count(),
+        hangul: has_hangul(prompt),
+        stage: if outcome.gate_reason.is_some() { "gated" } else { "searched" }.into(),
+        gate_reason: outcome.gate_reason.map(String::from),
+        query: outcome.query.clone(),
+        injected: outcome.context.as_ref().map(|_| outcome.hits.len()).unwrap_or(0),
+        hits: outcome
+            .hits
+            .iter()
+            .map(|h| RagHitLog { file: h.file.clone(), score: h.score })
+            .collect(),
+        latency_ms: outcome.latency_ms,
+    });
+}
+
 /// `kmd rag --hook`: stdin JSON → stdout 컨텍스트 (+ rag.jsonl 로깅).
+/// 데몬이 떠 있으면 데몬 경유(빠름), 아니면 인프로세스 폴백.
 /// 훅은 절대 실패하면 안 되므로 모든 에러는 빈 출력 + exit 0.
 pub fn run_hook() -> Result<()> {
     let mut raw = String::new();
@@ -233,28 +255,26 @@ pub fn run_hook() -> Result<()> {
         return Ok(());
     }
 
+    // 1) 데몬 경유 시도
+    if let Some(resp) = crate::daemon::try_request(&serde_json::json!({
+        "cmd": "rag",
+        "prompt": input.prompt,
+        "session_id": input.session_id,
+    })) {
+        if resp.get("ok").and_then(|v| v.as_bool()) == Some(true) {
+            if let Some(ctx) = resp.get("context").and_then(|v| v.as_str()) {
+                println!("{}", ctx);
+            }
+            return Ok(());
+        }
+    }
+
+    // 2) 인프로세스 폴백
     let outcome = match run_pipeline(&input.prompt) {
         Ok(o) => o,
         Err(_) => return Ok(()), // 인덱스 없음 등 — 훅은 조용히 통과
     };
-
-    append_log(&RagLogEntry {
-        ts: now_iso(),
-        session_id: input.session_id.clone(),
-        prompt: input.prompt.clone(),
-        prompt_len: input.prompt.chars().count(),
-        hangul: has_hangul(&input.prompt),
-        stage: if outcome.gate_reason.is_some() { "gated" } else { "searched" }.into(),
-        gate_reason: outcome.gate_reason.map(String::from),
-        query: outcome.query.clone(),
-        injected: outcome.context.as_ref().map(|_| outcome.hits.len()).unwrap_or(0),
-        hits: outcome
-            .hits
-            .iter()
-            .map(|h| RagHitLog { file: h.file.clone(), score: h.score })
-            .collect(),
-        latency_ms: outcome.latency_ms,
-    });
+    log_outcome(&input.prompt, &input.session_id, &outcome);
 
     if let Some(ctx) = outcome.context {
         println!("{}", ctx);

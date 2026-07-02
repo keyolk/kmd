@@ -1,5 +1,8 @@
 mod bm25;
 mod config;
+mod daemon;
+#[cfg(feature = "embed")]
+mod embed;
 mod output;
 mod rag;
 mod scan;
@@ -75,6 +78,34 @@ enum Command {
         #[arg(long)]
         hangul: bool,
     },
+    /// Generate embeddings for documents without them (requires 'embed' feature)
+    Embed {
+        /// Max documents to embed this run
+        #[arg(short = 'n', long)]
+        limit: Option<usize>,
+    },
+    /// Semantic vector search (requires 'embed' feature)
+    Vsearch {
+        query: String,
+        #[arg(short = 'n', long, default_value_t = 10)]
+        limit: usize,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Hybrid BM25 + vector search with RRF fusion (requires 'embed' feature)
+    Query {
+        query: String,
+        #[arg(short = 'n', long, default_value_t = 10)]
+        limit: usize,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Run the warm daemon (unix socket server)
+    Daemon {
+        /// Write launchd plist and print load instructions
+        #[arg(long)]
+        install: bool,
+    },
     /// Index/collection status
     Status,
 }
@@ -99,6 +130,16 @@ fn main() -> Result<()> {
                 sim::tui()
             }
         }
+        Command::Embed { limit } => cmd_embed(limit),
+        Command::Vsearch { query, limit, json } => cmd_vsearch(&query, limit, json),
+        Command::Query { query, limit, json } => cmd_query(&query, limit, json),
+        Command::Daemon { install } => {
+            if install {
+                daemon::install_launchd()
+            } else {
+                daemon::serve()
+            }
+        }
         Command::Status => cmd_status(),
     }
 }
@@ -107,6 +148,12 @@ fn cmd_update(force: bool) -> Result<()> {
     let cfg = config::load()?;
     let mut store = store::Store::open(&config::store_path())?;
     let stats = scan::update(&cfg, &mut store, force)?;
+    // 내용이 바뀐 문서는 임베딩도 무효 — tantivy 반영 전에 dirty 목록으로 제거
+    #[cfg(feature = "embed")]
+    {
+        let dirty_ids: Vec<i64> = store.dirty_docs()?.iter().map(|d| d.id).collect();
+        embed::purge_stale(&store, &dirty_ids)?;
+    }
     let indexed = bm25::index_dirty(&config::tantivy_dir(), &mut store)?;
     eprintln!(
         "scanned {} files ({} added, {} updated, {} removed), bm25 indexed {}",
@@ -157,4 +204,53 @@ fn cmd_status() -> Result<()> {
     let store = store::Store::open(&config::store_path())?;
     output::print_status(&cfg, &store)?;
     Ok(())
+}
+
+#[cfg(feature = "embed")]
+fn cmd_embed(limit: Option<usize>) -> Result<()> {
+    let mut store = store::Store::open(&config::store_path())?;
+    let n = embed::embed_pending(&mut store, limit)?;
+    let (vectors, pending) = embed::embedding_counts(&store)?;
+    eprintln!("embedded {} docs — {} chunks total, {} docs pending", n, vectors, pending);
+    Ok(())
+}
+
+#[cfg(feature = "embed")]
+fn cmd_vsearch(query: &str, limit: usize, json: bool) -> Result<()> {
+    let store = store::Store::open(&config::store_path())?;
+    let results = embed::vsearch(&store, query, limit)?;
+    if json {
+        println!("{}", output::to_json(&results)?);
+    } else {
+        output::print_cli(&results);
+    }
+    Ok(())
+}
+
+#[cfg(feature = "embed")]
+fn cmd_query(query: &str, limit: usize, json: bool) -> Result<()> {
+    let cfg = config::load()?;
+    let store = store::Store::open(&config::store_path())?;
+    let results = embed::hybrid(&store, &config::tantivy_dir(), &cfg, query, limit)?;
+    if json {
+        println!("{}", output::to_json(&results)?);
+    } else {
+        output::print_cli(&results);
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "embed"))]
+fn cmd_embed(_limit: Option<usize>) -> Result<()> {
+    anyhow::bail!("built without 'embed' feature — rebuild with: cargo build --release --features embed")
+}
+
+#[cfg(not(feature = "embed"))]
+fn cmd_vsearch(_query: &str, _limit: usize, _json: bool) -> Result<()> {
+    anyhow::bail!("built without 'embed' feature — rebuild with: cargo build --release --features embed")
+}
+
+#[cfg(not(feature = "embed"))]
+fn cmd_query(_query: &str, _limit: usize, _json: bool) -> Result<()> {
+    anyhow::bail!("built without 'embed' feature — rebuild with: cargo build --release --features embed")
 }

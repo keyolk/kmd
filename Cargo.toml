@@ -19,8 +19,8 @@ lindera-tantivy = "2.0"
 # 문서 스토어
 rusqlite = { version = "0.37", features = ["bundled"] }
 
-# 임베딩 (GGUF — 기존 qmd 모델 재활용)
-llama-cpp-2 = { version = "0.1", optional = true }
+# 임베딩 (GGUF — 기존 qmd 모델 재활용, macOS Metal 가속)
+llama-cpp-2 = { version = "0.1.150", optional = true, features = ["metal"] }
 
 # CLI / 직렬화 / 설정
 clap = { version = "4", features = ["derive"] }
