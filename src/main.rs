@@ -1,8 +1,10 @@
 mod bm25;
 mod config;
+mod ab;
 mod daemon;
 #[cfg(feature = "embed")]
 mod embed;
+mod eval;
 mod output;
 mod rag;
 mod scan;
@@ -10,6 +12,7 @@ mod sim;
 mod stats;
 mod store;
 mod tokenize;
+mod util;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -111,6 +114,54 @@ enum Command {
     },
     /// Index/collection status
     Status,
+    /// Retrieval quality eval (L1): known-item self-supervised or gold-labeled
+    Eval {
+        /// Path to a gold YAML (prompt/expect_any). Omit for known-item mode.
+        #[arg(long)]
+        gold: Option<std::path::PathBuf>,
+        /// known-item: collections to sample from (repeatable). Default: knowledge collections.
+        #[arg(long)]
+        collection: Vec<String>,
+        /// known-item: number of docs to sample (0 = all). Deterministic.
+        #[arg(long, default_value_t = 200)]
+        sample: usize,
+        /// Cutoff k for Recall@k / MRR
+        #[arg(short = 'k', long, default_value_t = 5)]
+        k: usize,
+        /// Also run each query against qmd for side-by-side comparison
+        #[arg(long)]
+        compare_qmd: bool,
+        /// known-item: only evaluate Korean-derived queries
+        #[arg(long)]
+        hangul: bool,
+        /// JSON output
+        #[arg(long)]
+        json: bool,
+    },
+    /// Injection utilization (L2): did answers actually use injected context?
+    Util {
+        /// Only include entries from the last N hours
+        #[arg(long)]
+        hours: Option<u64>,
+        /// JSON output
+        #[arg(long)]
+        json: bool,
+    },
+    /// A/B blind comparison (L3): kmd vs qmd context, proxy or external judge
+    Ab {
+        /// Prompts file (one per line) for building A/B pairs
+        #[arg(long)]
+        prompts: Option<std::path::PathBuf>,
+        /// Emit blind pairs to this file (+ .key.jsonl) for external judging
+        #[arg(long)]
+        emit: Option<std::path::PathBuf>,
+        /// Tally external verdicts.jsonl ({id,winner}); needs --prompts <pairs.jsonl>
+        #[arg(long)]
+        judge: Option<std::path::PathBuf>,
+        /// JSON output
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 fn main() -> Result<()> {
@@ -144,6 +195,33 @@ fn main() -> Result<()> {
             }
         }
         Command::Status => cmd_status(),
+        Command::Eval {
+            gold,
+            collection,
+            sample,
+            k,
+            compare_qmd,
+            hangul,
+            json,
+        } => {
+            if let Some(path) = gold {
+                eval::gold(&path, k, compare_qmd, json)
+            } else {
+                let colls = if collection.is_empty() {
+                    rag::CLAUDE_COLLECTIONS.iter().map(|s| s.to_string()).collect()
+                } else {
+                    collection
+                };
+                eval::known_item(colls, sample, k, compare_qmd, hangul, json)
+            }
+        }
+        Command::Util { hours, json } => util::print_utilization(hours.map(|h| h * 3600), json),
+        Command::Ab {
+            prompts,
+            emit,
+            judge,
+            json,
+        } => ab::run(prompts.as_deref(), emit.as_deref(), judge.as_deref(), json),
     }
 }
 

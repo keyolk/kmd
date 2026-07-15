@@ -71,6 +71,9 @@ pub struct RagLogEntry {
 pub struct RagHitLog {
     pub file: String,
     pub score: f32,
+    /// 주입된 스니펫 (L2 채택률 측정용 — 없으면 빈 문자열)
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub snippet: String,
 }
 
 pub fn state_dir() -> PathBuf {
@@ -235,7 +238,11 @@ pub fn log_outcome(prompt: &str, session_id: &str, outcome: &RagOutcome) {
         hits: outcome
             .hits
             .iter()
-            .map(|h| RagHitLog { file: h.file.clone(), score: h.score })
+            .map(|h| RagHitLog {
+                file: h.file.clone(),
+                score: h.score,
+                snippet: h.snippet.clone().unwrap_or_default(),
+            })
             .collect(),
         latency_ms: outcome.latency_ms,
     });
