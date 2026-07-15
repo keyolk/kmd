@@ -49,9 +49,21 @@ fn build_answer_map() -> HashMap<(String, String), String> {
     map
 }
 
-/// 한 transcript 파일을 순회하며 user 프롬프트 뒤 첫 assistant 텍스트를 잇는다.
+/// 한 transcript 파일을 순회하며, user 프롬프트 뒤 **다음 사용자 프롬프트 전까지**의
+/// 모든 assistant 텍스트를 이어붙인다(그 턴의 답변 전체). 첫 서두만 잡으면 오버랩이
+/// 0에 수렴하므로 턴 전체를 모아야 실제 활용을 측정할 수 있다.
+/// tool_result(role=user, content=array)와 슬래시 커맨드는 프롬프트로 치지 않는다.
 fn scan_transcript(raw: &str, map: &mut HashMap<(String, String), String>) {
-    let mut pending: Option<(String, String)> = None; // (session_id, prompt_key)
+    let mut cur: Option<(String, String)> = None; // (session_id, prompt_key)
+    let mut buf = String::new();
+    let flush = |cur: &Option<(String, String)>, buf: &mut String, map: &mut HashMap<(String, String), String>| {
+        if let Some(key) = cur {
+            if !buf.trim().is_empty() {
+                map.entry(key.clone()).or_insert_with(|| std::mem::take(buf));
+            }
+        }
+        buf.clear();
+    };
     for line in raw.lines() {
         let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
             continue;
@@ -64,25 +76,29 @@ fn scan_transcript(raw: &str, map: &mut HashMap<(String, String), String>) {
             .to_string();
         match ty {
             "user" => {
+                // 실제 텍스트 프롬프트만 새 턴으로 — tool_result 등은 무시.
                 if let Some(text) = extract_text(&v) {
-                    // 슬래시/툴결과 등은 건너뛰고 실제 프롬프트만
                     if !text.trim().is_empty() {
-                        pending = Some((sid, norm_key(&text)));
+                        // 이전 턴 답변을 확정하고 새 턴 시작
+                        flush(&cur, &mut buf, map);
+                        cur = Some((sid, norm_key(&text)));
                     }
                 }
             }
             "assistant" => {
-                if let (Some((psid, pkey)), Some(text)) = (pending.clone(), extract_text(&v)) {
-                    if !text.trim().is_empty() {
-                        // 프롬프트 뒤 첫 텍스트 답변만 기록
-                        map.entry((psid, pkey)).or_insert(text);
-                        pending = None;
+                if cur.is_some() {
+                    if let Some(text) = extract_text(&v) {
+                        if !text.trim().is_empty() {
+                            buf.push_str(&text);
+                            buf.push(' ');
+                        }
                     }
                 }
             }
             _ => {}
         }
     }
+    flush(&cur, &mut buf, map);
 }
 
 /// user/assistant 메시지에서 텍스트 본문 추출.
@@ -188,6 +204,19 @@ pub fn print_utilization(since_secs: Option<u64>, json: bool) -> Result<()> {
     let mut korean_inj = 0usize;
     let mut korean_util = 0usize;
     let mut examples: Vec<(f64, String)> = Vec::new();
+    // 무엇이 증강되나 — 컬렉션별 주입 파일 수
+    let mut coll_count: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    for e in &entries {
+        for h in &e.hits {
+            let coll = h
+                .file
+                .strip_prefix("qmd://")
+                .and_then(|r| r.split('/').next())
+                .unwrap_or("?")
+                .to_string();
+            *coll_count.entry(coll).or_default() += 1;
+        }
+    }
 
     for e in &entries {
         // 주입 스니펫은 로그에 파일만 남으므로, 조인 키로 답변을 찾은 뒤
@@ -250,6 +279,7 @@ pub fn print_utilization(since_secs: Option<u64>, json: bool) -> Result<()> {
             "avg_overlap_pct": if matched>0 { 100.0*overlap_sum/matched as f64 } else {0.0},
             "korean_injected": korean_inj,
             "korean_utilized": korean_util,
+            "injected_by_collection": coll_count,
             "note": "overlap approximates utilization via query-token reuse in the following answer; add snippet logging for precision",
         });
         println!("{}", serde_json::to_string_pretty(&out)?);
@@ -272,6 +302,13 @@ pub fn print_utilization(since_secs: Option<u64>, json: bool) -> Result<()> {
             if matched > 0 { 100.0 * overlap_sum / matched as f64 } else { 0.0 }
         );
         println!("한글 주입/활용:     {} / {}", korean_inj, korean_util);
+        let total_files: usize = coll_count.values().sum();
+        println!("\n무엇이 증강되나 (컬렉션별 주입 파일 {}건):", total_files);
+        let mut ranked: Vec<_> = coll_count.iter().collect();
+        ranked.sort_by(|a, b| b.1.cmp(a.1));
+        for (coll, n) in ranked {
+            println!("  {:<18} {:>4}  ({:.0}%)", coll, n, pct(*n, total_files));
+        }
         if !examples.is_empty() {
             println!("\n상위 활용 예시:");
             for (_, s) in examples.iter().take(8) {
@@ -297,6 +334,123 @@ fn now_secs() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+// ------------------------------------------------------- 세션 드릴다운 ----
+
+/// 실사용(사람) 세션인지 — session_id가 uuid 형태(8-4-…)면 실사용,
+/// bench/test/hook 등 합성 세션은 제외.
+fn is_real_session(sid: &str) -> bool {
+    let b = sid.as_bytes();
+    b.len() >= 9
+        && b[..8].iter().all(|c| c.is_ascii_hexdigit())
+        && b[8] == b'-'
+}
+
+/// 사람이 실제로 물은 프롬프트인지 — task-notification/tool-result 등 자동
+/// 주입성 프롬프트는 관측 가치가 낮으므로 걸러낸다.
+fn is_human_prompt(p: &str) -> bool {
+    let t = p.trim_start();
+    !(t.starts_with("<task-notification>")
+        || t.starts_with("<command-")
+        || t.starts_with("<tool-use")
+        || t.starts_with("<local-command")
+        || t.starts_with("Caveat:"))
+}
+
+/// `kmd show` — 실사용 세션에서 증강된 프롬프트→파일→(답변 활용 여부)를 훑는다.
+/// session이 주어지면 그 세션만, 아니면 최근 실사용 프롬프트 위주로.
+pub fn show(session: Option<&str>, limit: usize, all: bool, json: bool) -> Result<()> {
+    let raw = std::fs::read_to_string(rag_log_path())?;
+    let mut entries: Vec<RagLogEntry> = raw
+        .lines()
+        .filter_map(|l| serde_json::from_str::<RagLogEntry>(l).ok())
+        .filter(|e| e.injected > 0)
+        .filter(|e| all || is_real_session(&e.session_id))
+        .filter(|e| all || is_human_prompt(&e.prompt))
+        .collect();
+
+    if let Some(sid) = session {
+        entries.retain(|e| e.session_id.starts_with(sid));
+    }
+
+    // 동일 (session, 프롬프트 앞부분) 중복 제거 — 데몬+폴백 이중 로깅 방지.
+    let mut seen = HashSet::new();
+    entries.retain(|e| seen.insert((e.session_id.clone(), norm_key(&e.prompt))));
+
+    // 최근 것부터
+    entries.reverse();
+    entries.truncate(limit);
+    entries.reverse();
+
+    if entries.is_empty() {
+        println!("표시할 실사용 증강 기록이 없습니다 (--all 로 합성/자동 포함).");
+        return Ok(());
+    }
+
+    let answers = build_answer_map();
+
+    if json {
+        let out: Vec<_> = entries
+            .iter()
+            .map(|e| {
+                let ans = answers.get(&(e.session_id.clone(), norm_key(&e.prompt)));
+                let used = ans.map(|a| answer_uses(e, a));
+                serde_json::json!({
+                    "session": e.session_id,
+                    "prompt": e.prompt,
+                    "hangul": e.hangul,
+                    "query": e.query,
+                    "files": e.hits.iter().map(|h| h.file.replace("qmd://","")).collect::<Vec<_>>(),
+                    "answered": ans.is_some(),
+                    "used_ratio": used,
+                })
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&out)?);
+        return Ok(());
+    }
+
+    let mut cur = String::new();
+    for e in &entries {
+        if e.session_id != cur {
+            cur = e.session_id.clone();
+            println!("\n━━ session {} ━━", &cur[..cur.len().min(8)]);
+        }
+        let ans = answers.get(&(e.session_id.clone(), norm_key(&e.prompt)));
+        let mark = match ans.map(|a| answer_uses(e, a)) {
+            Some(r) if r >= 0.15 => format!("✓ 활용 {:.0}%", r * 100.0),
+            Some(r) => format!("· 답변있음 {:.0}%", r * 100.0),
+            None => "  (답변 미발견)".to_string(),
+        };
+        let flag = if e.hangul { "KO" } else { "en" };
+        println!("\n  [{}] {}  {}", flag, short(&e.prompt), mark);
+        if let Some(q) = &e.query {
+            println!("      q: {}", q.chars().take(64).collect::<String>());
+        }
+        for h in &e.hits {
+            println!("      → {}", h.file.replace("qmd://", "").chars().take(78).collect::<String>());
+        }
+    }
+    println!();
+    Ok(())
+}
+
+/// 답변이 이 엔트리의 주입 신호(snippet 우선, 없으면 query)를 얼마나 재사용했나(0..1).
+fn answer_uses(e: &RagLogEntry, answer: &str) -> f64 {
+    let logged: String = e.hits.iter().map(|h| h.snippet.as_str()).collect::<Vec<_>>().join(" ");
+    let signal = if logged.trim().is_empty() {
+        e.query.clone().unwrap_or_default()
+    } else {
+        logged
+    };
+    let prompt_tokens = tokens(&e.prompt);
+    let sig: HashSet<String> = tokens(&signal).into_iter().filter(|t| !prompt_tokens.contains(t)).collect();
+    if sig.is_empty() {
+        return 0.0;
+    }
+    let ans = tokens(answer);
+    sig.iter().filter(|t| ans.contains(*t)).count() as f64 / sig.len() as f64
 }
 
 #[cfg(test)]
@@ -329,5 +483,21 @@ mod tests {
         // "인증"/"증서"는 프롬프트에 있으니 제외, doppler/externalsecret는 남음.
         assert!(signal.contains("doppler"));
         assert!(!signal.contains("인증"));
+    }
+
+    #[test]
+    fn real_session_detection() {
+        assert!(is_real_session("a4d9c131-8b8c-404b-9ef6"));
+        assert!(!is_real_session("bench-daemon"));
+        assert!(!is_real_session("test-session-1"));
+        assert!(!is_real_session("hook-e2e"));
+    }
+
+    #[test]
+    fn human_prompt_filters_auto() {
+        assert!(is_human_prompt("soda의 모든 로그 소스 싱크 경로 리스트해줘"));
+        assert!(!is_human_prompt("<task-notification>\n<task-id>abc</task-id>"));
+        assert!(!is_human_prompt("<command-message>clear</command-message>"));
+        assert!(!is_human_prompt("Caveat: The messages below..."));
     }
 }

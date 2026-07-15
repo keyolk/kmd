@@ -147,6 +147,20 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Show what real sessions actually got augmented (prompt → files → usage)
+    Show {
+        /// Filter to a session id prefix
+        session: Option<String>,
+        /// Max prompts to show
+        #[arg(short = 'n', long, default_value_t = 20)]
+        limit: usize,
+        /// Include synthetic sessions and auto prompts (task-notification, etc.)
+        #[arg(long)]
+        all: bool,
+        /// JSON output
+        #[arg(long)]
+        json: bool,
+    },
     /// A/B blind comparison (L3): kmd vs qmd context, proxy or external judge
     Ab {
         /// Prompts file (one per line) for building A/B pairs
@@ -216,6 +230,12 @@ fn main() -> Result<()> {
             }
         }
         Command::Util { hours, json } => util::print_utilization(hours.map(|h| h * 3600), json),
+        Command::Show {
+            session,
+            limit,
+            all,
+            json,
+        } => util::show(session.as_deref(), limit, all, json),
         Command::Ab {
             prompts,
             emit,
