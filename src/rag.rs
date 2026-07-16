@@ -165,20 +165,43 @@ fn is_structural_noise(p: &str) -> bool {
     false
 }
 
-/// 검색 결과를 claude 컬렉션으로 필터 + 파일 단위 dedupe.
+/// 컬렉션 가중치 — 정제 지식(memory/skills/agents/rules/contexts)은 답변에
+/// 직접 반영될 가치가 높아 부스트하고, learnings(과거 세션 로그)는 배경 참고
+/// 성격이라 약간 낮춘다. kmd show/util 실측에서 주입의 97%가 learnings로 쏠려
+/// 정제 지식이 묻히는 걸 완화한다. BM25 점수에 곱해 재정렬한다.
+fn collection_weight(coll: &str) -> f32 {
+    match coll {
+        "claude-memory" | "claude-skills" | "claude-agents" | "claude-rules"
+        | "claude-contexts" => 1.3,
+        "learnings" => 0.75,
+        _ => 1.0,
+    }
+}
+
+fn collection_of(file: &str) -> &str {
+    file.strip_prefix("qmd://")
+        .and_then(|r| r.split('/').next())
+        .unwrap_or("")
+}
+
+/// 검색 결과를 claude 컬렉션으로 필터 + 파일 단위 dedupe + 컬렉션 가중 재정렬.
 pub fn filter_hits(hits: Vec<SearchHit>) -> Vec<SearchHit> {
     let mut seen = std::collections::HashSet::new();
-    hits.into_iter()
+    let mut kept: Vec<SearchHit> = hits
+        .into_iter()
         .filter(|h| {
-            let coll = h
-                .file
-                .strip_prefix("qmd://")
-                .and_then(|r| r.split('/').next())
-                .unwrap_or("");
+            let coll = collection_of(&h.file);
             CLAUDE_COLLECTIONS.contains(&coll) && seen.insert(h.file.clone())
         })
-        .take(MAX_RESULTS)
-        .collect()
+        .collect();
+    // 컬렉션 가중을 적용한 유효 점수로 재정렬 (원 score는 표시용으로 보존).
+    kept.sort_by(|a, b| {
+        let wa = a.score * collection_weight(collection_of(&a.file));
+        let wb = b.score * collection_weight(collection_of(&b.file));
+        wb.partial_cmp(&wa).unwrap_or(std::cmp::Ordering::Equal)
+    });
+    kept.truncate(MAX_RESULTS);
+    kept
 }
 
 /// 주입 컨텍스트 포맷 — 기존 qmd_rag.py 출력과 동일한 <qmd-context> 형태.
@@ -253,7 +276,9 @@ pub fn run_pipeline(prompt: &str) -> Result<RagOutcome> {
         }
     };
     let cfg = config::load()?;
-    let raw = bm25::search(&config::tantivy_dir(), &cfg, &query, 10, None)?;
+    // 컬렉션 가중 재정렬이 실효를 내려면 후보를 넉넉히 가져와야 한다.
+    // (정제 지식이 원 BM25 top-3 밖이어도 부스트로 올라올 여지 확보)
+    let raw = bm25::search(&config::tantivy_dir(), &cfg, &query, 30, None)?;
     let hits = filter_hits(raw);
     let context = format_context(&hits);
     Ok(RagOutcome {
@@ -353,5 +378,41 @@ mod tests {
         assert!(gate("왜 envoy/istio 기반으로 안만들고 rust로 따로 만들었는지 알아보자").is_ok());
         // URL이 포함돼도 뒤에 실제 질의가 있으면 통과
         assert!(gate("https://github.com/sendbird/ops-k8s/pull/7357 이 코멘트가 왜 반복되는지 봐줘").is_ok());
+    }
+
+    fn hit(file: &str, score: f32) -> SearchHit {
+        SearchHit {
+            docid: "#0".into(),
+            score,
+            file: file.into(),
+            title: String::new(),
+            context: None,
+            snippet: Some("x".into()),
+        }
+    }
+
+    #[test]
+    fn filter_hits_boosts_curated_over_learnings() {
+        // learnings가 원 BM25 점수는 약간 높아도, 정제 지식 부스트로 앞서야 한다.
+        // learnings 40*0.75=30 vs skills 34*1.3=44.2 → skills 우선.
+        let raw = vec![
+            hit("qmd://learnings/20260101 0-aaa.md", 40.0),
+            hit("qmd://claude-skills/sb:jira-ticket/SKILL.md", 34.0),
+            hit("qmd://learnings/20260102 0-bbb.md", 38.0),
+        ];
+        let out = filter_hits(raw);
+        assert_eq!(collection_of(&out[0].file), "claude-skills");
+    }
+
+    #[test]
+    fn filter_hits_keeps_learnings_when_dominant() {
+        // 정제 지식 후보가 없으면 learnings가 그대로 남는다.
+        let raw = vec![
+            hit("qmd://learnings/a.md", 40.0),
+            hit("qmd://learnings/b.md", 30.0),
+        ];
+        let out = filter_hits(raw);
+        assert_eq!(out.len(), 2);
+        assert_eq!(collection_of(&out[0].file), "learnings");
     }
 }
