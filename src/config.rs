@@ -1,4 +1,4 @@
-//! index.yml 로딩 — qmd의 ~/.config/qmd/index.yml 포맷과 호환.
+//! index.yml 로딩 — `~/.config/kmd/index.yml`. (이전 qmd 공유 경로에서 이관.)
 //!
 //! ```yaml
 //! collections:
@@ -43,8 +43,7 @@ fn config_home() -> PathBuf {
     if let Ok(dir) = std::env::var("KMD_CONFIG_DIR") {
         return PathBuf::from(dir);
     }
-    // qmd와 동일한 index.yml을 그대로 읽는다.
-    dirs_home().join(".config/qmd")
+    dirs_home().join(".config/kmd")
 }
 
 fn cache_home() -> PathBuf {
