@@ -5,6 +5,7 @@ mod daemon;
 #[cfg(feature = "embed")]
 mod embed;
 mod eval;
+mod learnings;
 mod output;
 mod rag;
 mod scan;
@@ -176,6 +177,21 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Extract learnings from Claude Code snapshots into kmd-learnings/
+    LearningsExtract {
+        /// Process specific session ID
+        #[arg(long)]
+        session: Option<String>,
+        /// Process last N days
+        #[arg(long, default_value_t = 0)]
+        recent: u32,
+        /// Preview without writing
+        #[arg(long)]
+        dry_run: bool,
+        /// Re-process already processed sessions
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 fn main() -> Result<()> {
@@ -242,6 +258,12 @@ fn main() -> Result<()> {
             judge,
             json,
         } => ab::run(prompts.as_deref(), emit.as_deref(), judge.as_deref(), json),
+        Command::LearningsExtract {
+            session,
+            recent,
+            dry_run,
+            force,
+        } => learnings::run(session.as_deref(), recent, dry_run, force),
     }
 }
 
