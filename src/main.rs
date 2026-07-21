@@ -5,6 +5,7 @@ mod daemon;
 #[cfg(feature = "embed")]
 mod embed;
 mod eval;
+mod hook;
 mod learnings;
 mod output;
 mod rag;
@@ -192,6 +193,19 @@ enum Command {
         #[arg(long)]
         force: bool,
     },
+    /// Claude Code hook entrypoints (never fail)
+    Hook {
+        #[command(subcommand)]
+        sub: HookSub,
+    },
+}
+
+#[derive(Subcommand)]
+enum HookSub {
+    /// Stop hook: extract session learnings + queue daemon reindex
+    Stop,
+    /// PostToolUse hook: mark index dirty on watched file edits
+    MarkDirty,
 }
 
 fn main() -> Result<()> {
@@ -264,6 +278,10 @@ fn main() -> Result<()> {
             dry_run,
             force,
         } => learnings::run(session.as_deref(), recent, dry_run, force),
+        Command::Hook { sub } => match sub {
+            HookSub::Stop => hook::stop(),
+            HookSub::MarkDirty => hook::mark_dirty(),
+        },
     }
 }
 

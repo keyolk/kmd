@@ -37,6 +37,9 @@ regex = "1"
 # 에러
 anyhow = "1"
 
+# 시간 (hook sync.log 타임스탬프)
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+
 # TUI (kmd sim)
 ratatui = "0.29"
 crossterm = "0.28"
