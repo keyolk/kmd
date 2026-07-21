@@ -179,7 +179,7 @@ fn collection_weight(coll: &str) -> f32 {
 }
 
 fn collection_of(file: &str) -> &str {
-    file.strip_prefix("qmd://")
+    file.strip_prefix("kmd://")
         .and_then(|r| r.split('/').next())
         .unwrap_or("")
 }
@@ -213,7 +213,7 @@ pub fn format_context(hits: &[SearchHit]) -> Option<String> {
             if snippet.is_empty() {
                 return None;
             }
-            let display = h.file.strip_prefix("qmd://").unwrap_or(&h.file);
+            let display = h.file.strip_prefix("kmd://").unwrap_or(&h.file);
             let mut header = format!("[QMD] {}", if h.title.is_empty() { display } else { &h.title });
             if let Some(ctx) = &h.context {
                 header.push_str(&format!(" ({})", ctx));
@@ -396,9 +396,9 @@ mod tests {
         // learnings가 원 BM25 점수는 약간 높아도, 정제 지식 부스트로 앞서야 한다.
         // learnings 40*0.75=30 vs skills 34*1.3=44.2 → skills 우선.
         let raw = vec![
-            hit("qmd://learnings/20260101 0-aaa.md", 40.0),
-            hit("qmd://claude-skills/sb:jira-ticket/SKILL.md", 34.0),
-            hit("qmd://learnings/20260102 0-bbb.md", 38.0),
+            hit("kmd://learnings/20260101 0-aaa.md", 40.0),
+            hit("kmd://claude-skills/sb:jira-ticket/SKILL.md", 34.0),
+            hit("kmd://learnings/20260102 0-bbb.md", 38.0),
         ];
         let out = filter_hits(raw);
         assert_eq!(collection_of(&out[0].file), "claude-skills");
@@ -408,8 +408,8 @@ mod tests {
     fn filter_hits_keeps_learnings_when_dominant() {
         // 정제 지식 후보가 없으면 learnings가 그대로 남는다.
         let raw = vec![
-            hit("qmd://learnings/a.md", 40.0),
-            hit("qmd://learnings/b.md", 30.0),
+            hit("kmd://learnings/a.md", 40.0),
+            hit("kmd://learnings/b.md", 30.0),
         ];
         let out = filter_hits(raw);
         assert_eq!(out.len(), 2);

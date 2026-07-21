@@ -284,7 +284,7 @@ pub fn vsearch(store: &Store, query: &str, limit: usize) -> Result<Vec<SearchHit
         .map(|(doc_id, (score, text, coll, relpath, title, context))| SearchHit {
             docid: format!("#{:06x}", doc_id),
             score,
-            file: format!("qmd://{}/{}", coll, relpath),
+            file: format!("kmd://{}/{}", coll, relpath),
             title,
             context,
             snippet: Some(text.chars().take(300).collect()),

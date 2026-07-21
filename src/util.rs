@@ -211,6 +211,7 @@ pub fn print_utilization(since_secs: Option<u64>, json: bool) -> Result<()> {
             let coll = h
                 .file
                 .strip_prefix("qmd://")
+                .or_else(|| h.file.strip_prefix("kmd://"))
                 .and_then(|r| r.split('/').next())
                 .unwrap_or("?")
                 .to_string();
@@ -401,7 +402,7 @@ pub fn show(session: Option<&str>, limit: usize, all: bool, json: bool) -> Resul
                     "prompt": e.prompt,
                     "hangul": e.hangul,
                     "query": e.query,
-                    "files": e.hits.iter().map(|h| h.file.replace("qmd://","")).collect::<Vec<_>>(),
+                    "files": e.hits.iter().map(|h| h.file.replace("qmd://","").replace("kmd://","")).collect::<Vec<_>>(),
                     "answered": ans.is_some(),
                     "used_ratio": used,
                 })
@@ -429,7 +430,7 @@ pub fn show(session: Option<&str>, limit: usize, all: bool, json: bool) -> Resul
             println!("      q: {}", q.chars().take(64).collect::<String>());
         }
         for h in &e.hits {
-            println!("      → {}", h.file.replace("qmd://", "").chars().take(78).collect::<String>());
+            println!("      → {}", h.file.replace("qmd://", "").replace("kmd://", "").chars().take(78).collect::<String>());
         }
     }
     println!();

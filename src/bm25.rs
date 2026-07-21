@@ -18,7 +18,7 @@ use tantivy::{Index, IndexWriter, TantivyDocument, Term, doc};
 pub struct SearchHit {
     pub docid: String,
     pub score: f32,
-    /// qmd 호환 URI: qmd://collection/relpath
+    /// kmd URI: kmd://collection/relpath
     pub file: String,
     pub title: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -165,7 +165,7 @@ pub fn search(
         hits.push(SearchHit {
             docid: format!("#{:06x}", doc_id),
             score,
-            file: format!("qmd://{}/{}", coll, get_str(f.relpath)),
+            file: format!("kmd://{}/{}", coll, get_str(f.relpath)),
             title: get_str(f.title),
             context,
             snippet: Some(make_snippet(&body, query, 300)),
