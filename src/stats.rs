@@ -90,6 +90,7 @@ pub fn print_stats(since_secs: Option<u64>) -> Result<()> {
             let coll = h
                 .file
                 .strip_prefix("qmd://")
+                .or_else(|| h.file.strip_prefix("kmd://"))
                 .and_then(|r| r.split('/').next())
                 .unwrap_or("?")
                 .to_string();

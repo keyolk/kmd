@@ -1,11 +1,17 @@
+mod ab;
+mod activity;
 mod bm25;
 mod config;
-mod ab;
 mod daemon;
 #[cfg(feature = "embed")]
 mod embed;
 mod eval;
+mod hook;
+mod journal;
+mod learnings;
+mod locality;
 mod output;
+mod pageindex;
 mod rag;
 mod scan;
 mod sim;
@@ -176,6 +182,83 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Extract historical learnings from Claude Code transcripts or snapshots
+    LearningsExtract {
+        /// Process specific session ID
+        #[arg(long)]
+        session: Option<String>,
+        /// Process last N days
+        #[arg(long, default_value_t = 0)]
+        recent: u32,
+        /// Preview without writing
+        #[arg(long)]
+        dry_run: bool,
+        /// Re-process already processed sessions
+        #[arg(long)]
+        force: bool,
+    },
+    /// Recent cross-session activity collected from live transcripts
+    Activity {
+        /// Max activity cards to show
+        #[arg(short = 'n', long, default_value_t = 10)]
+        limit: usize,
+        /// JSON output
+        #[arg(long)]
+        json: bool,
+    },
+    /// Date-oriented learnings and sessions, ranked by cwd/repo/worktree locality
+    Journal {
+        /// Number of calendar days to show
+        #[arg(long, default_value_t = 7)]
+        days: u32,
+        /// Show one date (YYYY-MM-DD or YYYYMMDD)
+        #[arg(long)]
+        date: Option<String>,
+        /// Filter by canonical repo, project, or worktree name
+        #[arg(short, long)]
+        project: Option<String>,
+        /// Spatial anchor; defaults to the current directory
+        #[arg(long)]
+        cwd: Option<String>,
+        /// JSON output
+        #[arg(long)]
+        json: bool,
+    },
+    /// Session page index (L0/L1) — browsable axes instead of pushed RAG context
+    Page {
+        /// Axis (repo name) to list sessions for. Omit for the L0 index.
+        axis: Option<String>,
+        /// Max sessions to list in L1
+        #[arg(short = 'n', long, default_value_t = 15)]
+        limit: usize,
+        /// Print the L0 block exactly as a hook would inject it (no stderr note)
+        #[arg(long)]
+        l0: bool,
+        /// Measure L0 coverage of past RAG injections (reads rag.jsonl)
+        #[arg(long)]
+        cover: bool,
+        /// SessionStart hook mode — emit additionalContext JSON
+        #[arg(long)]
+        hook: bool,
+        /// JSON output
+        #[arg(long)]
+        json: bool,
+    },
+    /// Claude Code hook entrypoints (never fail)
+    Hook {
+        #[command(subcommand)]
+        sub: HookSub,
+    },
+}
+
+#[derive(Subcommand)]
+enum HookSub {
+    /// Stop hook: refresh live activity and flush dirty collections
+    Stop,
+    /// SessionEnd hook: persist the final transcript and queue reindex
+    SessionEnd,
+    /// PostToolUse hook: mark index dirty on watched file edits
+    MarkDirty,
 }
 
 fn main() -> Result<()> {
@@ -191,7 +274,11 @@ fn main() -> Result<()> {
         Command::Rag { hook, prompt } => cmd_rag(hook, prompt.as_deref()),
         Command::Stats { hours } => stats::print_stats(hours.map(|h| h * 3600)),
         Command::Log { count, follow } => stats::print_log(count, follow),
-        Command::Sim { replay, count, hangul } => {
+        Command::Sim {
+            replay,
+            count,
+            hangul,
+        } => {
             if replay {
                 sim::replay(count, hangul)
             } else {
@@ -222,7 +309,10 @@ fn main() -> Result<()> {
                 eval::gold(&path, k, compare_qmd, json)
             } else {
                 let colls = if collection.is_empty() {
-                    rag::CLAUDE_COLLECTIONS.iter().map(|s| s.to_string()).collect()
+                    rag::CLAUDE_COLLECTIONS
+                        .iter()
+                        .map(|s| s.to_string())
+                        .collect()
                 } else {
                     collection
                 };
@@ -242,6 +332,45 @@ fn main() -> Result<()> {
             judge,
             json,
         } => ab::run(prompts.as_deref(), emit.as_deref(), judge.as_deref(), json),
+        Command::LearningsExtract {
+            session,
+            recent,
+            dry_run,
+            force,
+        } => learnings::run(session.as_deref(), recent, dry_run, force),
+        Command::Activity { limit, json } => activity::run(limit, json),
+        Command::Journal {
+            days,
+            date,
+            project,
+            cwd,
+            json,
+        } => journal::run(
+            days,
+            date.as_deref(),
+            project.as_deref(),
+            cwd.as_deref(),
+            json,
+        ),
+        Command::Page {
+            axis,
+            limit,
+            l0,
+            cover,
+            hook,
+            json,
+        } => {
+            if hook {
+                pageindex::run_hook()
+            } else {
+                pageindex::run(axis.as_deref(), limit, json, l0, cover)
+            }
+        }
+        Command::Hook { sub } => match sub {
+            HookSub::Stop => hook::stop(),
+            HookSub::SessionEnd => hook::session_end(),
+            HookSub::MarkDirty => hook::mark_dirty(),
+        },
     }
 }
 
@@ -322,7 +451,10 @@ fn cmd_embed(limit: Option<usize>) -> Result<()> {
     let mut store = store::Store::open(&config::store_path())?;
     let n = embed::embed_pending(&mut store, limit)?;
     let (vectors, pending) = embed::embedding_counts(&store)?;
-    eprintln!("embedded {} docs — {} chunks total, {} docs pending", n, vectors, pending);
+    eprintln!(
+        "embedded {} docs — {} chunks total, {} docs pending",
+        n, vectors, pending
+    );
     Ok(())
 }
 
@@ -353,15 +485,21 @@ fn cmd_query(query: &str, limit: usize, json: bool) -> Result<()> {
 
 #[cfg(not(feature = "embed"))]
 fn cmd_embed(_limit: Option<usize>) -> Result<()> {
-    anyhow::bail!("built without 'embed' feature — rebuild with: cargo build --release --features embed")
+    anyhow::bail!(
+        "built without 'embed' feature — rebuild with: cargo build --release --features embed"
+    )
 }
 
 #[cfg(not(feature = "embed"))]
 fn cmd_vsearch(_query: &str, _limit: usize, _json: bool) -> Result<()> {
-    anyhow::bail!("built without 'embed' feature — rebuild with: cargo build --release --features embed")
+    anyhow::bail!(
+        "built without 'embed' feature — rebuild with: cargo build --release --features embed"
+    )
 }
 
 #[cfg(not(feature = "embed"))]
 fn cmd_query(_query: &str, _limit: usize, _json: bool) -> Result<()> {
-    anyhow::bail!("built without 'embed' feature — rebuild with: cargo build --release --features embed")
+    anyhow::bail!(
+        "built without 'embed' feature — rebuild with: cargo build --release --features embed"
+    )
 }

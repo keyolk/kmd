@@ -90,11 +90,16 @@ fn rank_kmd(expected: &str, hits: &[String]) -> Option<usize> {
     hits.iter().position(|f| norm_path(f) == want).map(|i| i + 1)
 }
 
-/// 경로 정규화 — 공백/연속 공백을 '-'로, 소문자화. qmd/kmd 파일명 표기 차이 흡수.
+/// 경로 정규화 — 스킴 접두어(qmd://·kmd://)를 먼저 벗기고, 공백/연속 공백을 '-'로,
+/// 소문자화. qmd/kmd 파일명 표기 및 스킴 차이 모두 흡수.
 fn norm_path(uri: &str) -> String {
-    let mut out = String::with_capacity(uri.len());
+    let stripped = uri
+        .strip_prefix("qmd://")
+        .or_else(|| uri.strip_prefix("kmd://"))
+        .unwrap_or(uri);
+    let mut out = String::with_capacity(stripped.len());
     let mut prev_dash = false;
-    for c in uri.to_lowercase().chars() {
+    for c in stripped.to_lowercase().chars() {
         if c.is_whitespace() {
             if !prev_dash {
                 out.push('-');
@@ -111,7 +116,7 @@ fn norm_path(uri: &str) -> String {
 // ------------------------------------------------------- known-item 모드 ----
 
 struct DocSample {
-    file: String, // qmd://coll/relpath
+    file: String, // kmd://coll/relpath
     query: String,
     hangul: bool,
 }
@@ -188,7 +193,7 @@ fn load_samples(collections: &[String], sample: usize, hangul_only: bool) -> Res
             continue;
         }
         all.push(DocSample {
-            file: format!("qmd://{}/{}", coll, relpath),
+            file: format!("kmd://{}/{}", coll, relpath),
             query,
             hangul,
         });

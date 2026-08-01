@@ -33,8 +33,8 @@ const STOP_WORDS: &[&str] = &[
     "us", "them", "my", "your", "his", "its", "our", "their", "what", "which", "who", "whom",
     "how", "when", "where", "why", "if", "then", "so", "very", "just", "about", "also", "up",
     "out", "all", "some", "any", "each", "every", "no", "into", "through", "during", "before",
-    "after", "above", "below", "between", "there", "here", "much", "many", "more", "most",
-    "other", "like", "need", "want", "get", "make", "use", "try", "know",
+    "after", "above", "below", "between", "there", "here", "much", "many", "more", "most", "other",
+    "like", "need", "want", "get", "make", "use", "try", "know",
 ];
 
 #[derive(Debug, Deserialize)]
@@ -43,6 +43,8 @@ struct HookInput {
     prompt: String,
     #[serde(default)]
     session_id: String,
+    #[serde(default)]
+    cwd: String,
 }
 
 /// rag.jsonl 한 줄 — 파이프라인의 모든 결정을 담는다.
@@ -94,7 +96,9 @@ pub fn has_hangul(s: &str) -> bool {
 /// qmd_rag.py의 extract_keywords와 동일 로직 + 한글 인지.
 /// 한글 토큰은 조사 제거를 tantivy 쪽 형태소 분석이 하므로 그대로 통과.
 pub fn extract_keywords(prompt: &str) -> String {
-    let strip: &[char] = &['?', '.', ',', '!', ':', ';', '"', '\'', '(', ')', '[', ']', '{', '}'];
+    let strip: &[char] = &[
+        '?', '.', ',', '!', ':', ';', '"', '\'', '(', ')', '[', ']', '{', '}',
+    ];
     prompt
         .to_lowercase()
         .split_whitespace()
@@ -140,7 +144,10 @@ fn is_structural_noise(p: &str) -> bool {
         "caveat:",
     ];
     let lower_start: String = p.chars().take(24).collect::<String>().to_lowercase();
-    if NOISE_PREFIXES.iter().any(|pre| lower_start.starts_with(pre)) {
+    if NOISE_PREFIXES
+        .iter()
+        .any(|pre| lower_start.starts_with(pre))
+    {
         return true;
     }
     // 2) URL 단독 (첫 토큰이 URL이고 남는 텍스트가 거의 없음)
@@ -156,10 +163,7 @@ fn is_structural_noise(p: &str) -> bool {
         return true;
     }
     // 4) 이전에 주입된 컨텍스트를 되붙인 경우 (재귀 오염 방지)
-    if t.starts_with("<qmd-context")
-        || t.starts_with("[QMD]")
-        || t.starts_with("━━ session")
-    {
+    if t.starts_with("<qmd-context") || t.starts_with("[QMD]") || t.starts_with("━━ session") {
         return true;
     }
     false
@@ -179,19 +183,57 @@ fn collection_weight(coll: &str) -> f32 {
 }
 
 fn collection_of(file: &str) -> &str {
-    file.strip_prefix("qmd://")
+    file.strip_prefix("kmd://")
         .and_then(|r| r.split('/').next())
         .unwrap_or("")
 }
 
+/// L0 page index가 커버하는 축에 속한 learnings hit은 RAG 주입에서 skip.
+///
+/// `kmd page --cover` 실측: RAG가 주입한 learnings hit의 68%가 L0 축 안에
+/// 있다. 이 영역은 세션 시작 시 L0 인덱스로 이미 "여기 이 축에 N세션" 형태로
+/// 주입되므로, 매 프롬프트마다 다시 BM25로 밀어넣는 건 중복이자 90% 낭비의
+/// 주원인이다. L0가 담당하는 영역은 RAG에서 빼서 주입 건수를 줄인다.
+///
+/// 미커버 32%(`**Files**:` 메타에서 repo 추출 불가 세션)는 여전히 RAG가
+/// 담당한다 — page index의 근본 한계 경계를 건드리지 않는다.
+///
+/// `pageindex::repo_of`와 동일한 분해 규칙을 써서 주입과 측정이 같은 기준을
+/// 공유하게 한다. file이 `kmd://learnings/<date>-<id8>.md` 형태일 때만
+/// 검사하고, pageindex가 load한 id→축 맵에 id8이 있으면 skip.
+fn is_l0_covered(
+    file: &str,
+    id_axes: &std::collections::HashMap<String, std::collections::HashSet<String>>,
+) -> bool {
+    if !file.contains("learnings") {
+        return false;
+    }
+    let Some(stem) = file.rsplit('/').next() else {
+        return false;
+    };
+    let stem = stem.strip_suffix(".md").unwrap_or(stem);
+    let id8 = stem.rsplit('-').next().unwrap_or(stem);
+    id_axes.get(id8).is_some_and(|ax| !ax.is_empty())
+}
+
 /// 검색 결과를 claude 컬렉션으로 필터 + 파일 단위 dedupe + 컬렉션 가중 재정렬.
 pub fn filter_hits(hits: Vec<SearchHit>) -> Vec<SearchHit> {
+    // L0 page index가 커버하는 learnings hit은 주입에서 제외 — 중복 주입 비용을
+    // 줄인다. pageindex::load_sessions가 파일을 읽어야 하므로 매 호출마다 약간의
+    // I/O 비용이 있지만, 훅 1회당 한 번이고 181세션 메타 파싱은 ~10ms 수준이다.
+    let id_axes = crate::pageindex::load_session_axes().unwrap_or_default();
     let mut seen = std::collections::HashSet::new();
     let mut kept: Vec<SearchHit> = hits
         .into_iter()
         .filter(|h| {
             let coll = collection_of(&h.file);
-            CLAUDE_COLLECTIONS.contains(&coll) && seen.insert(h.file.clone())
+            if !CLAUDE_COLLECTIONS.contains(&coll) {
+                return false;
+            }
+            if coll == "learnings" && is_l0_covered(&h.file, &id_axes) {
+                return false;
+            }
+            seen.insert(h.file.clone())
         })
         .collect();
     // 컬렉션 가중을 적용한 유효 점수로 재정렬 (원 score는 표시용으로 보존).
@@ -213,8 +255,15 @@ pub fn format_context(hits: &[SearchHit]) -> Option<String> {
             if snippet.is_empty() {
                 return None;
             }
-            let display = h.file.strip_prefix("qmd://").unwrap_or(&h.file);
-            let mut header = format!("[QMD] {}", if h.title.is_empty() { display } else { &h.title });
+            let display = h.file.strip_prefix("kmd://").unwrap_or(&h.file);
+            let mut header = format!(
+                "[QMD] {}",
+                if h.title.is_empty() {
+                    display
+                } else {
+                    &h.title
+                }
+            );
             if let Some(ctx) = &h.context {
                 header.push_str(&format!(" ({})", ctx));
             }
@@ -230,6 +279,15 @@ pub fn format_context(hits: &[SearchHit]) -> Option<String> {
     ))
 }
 
+fn combine_contexts(activity: Option<&str>, rag: Option<&str>) -> Option<String> {
+    match (activity, rag) {
+        (Some(activity), Some(rag)) => Some(format!("{}\n\n{}", activity, rag)),
+        (Some(activity), None) => Some(activity.to_string()),
+        (None, Some(rag)) => Some(rag.to_string()),
+        (None, None) => None,
+    }
+}
+
 fn append_log(entry: &RagLogEntry) {
     let path = rag_log_path();
     if let Some(parent) = path.parent() {
@@ -237,7 +295,11 @@ fn append_log(entry: &RagLogEntry) {
     }
     if let Ok(line) = serde_json::to_string(entry) {
         use std::io::Write;
-        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+        {
             let _ = writeln!(f, "{}", line);
         }
     }
@@ -298,10 +360,19 @@ pub fn log_outcome(prompt: &str, session_id: &str, outcome: &RagOutcome) {
         prompt: prompt.to_string(),
         prompt_len: prompt.chars().count(),
         hangul: has_hangul(prompt),
-        stage: if outcome.gate_reason.is_some() { "gated" } else { "searched" }.into(),
+        stage: if outcome.gate_reason.is_some() {
+            "gated"
+        } else {
+            "searched"
+        }
+        .into(),
         gate_reason: outcome.gate_reason.map(String::from),
         query: outcome.query.clone(),
-        injected: outcome.context.as_ref().map(|_| outcome.hits.len()).unwrap_or(0),
+        injected: outcome
+            .context
+            .as_ref()
+            .map(|_| outcome.hits.len())
+            .unwrap_or(0),
         hits: outcome
             .hits
             .iter()
@@ -329,6 +400,12 @@ pub fn run_hook() -> Result<()> {
         return Ok(());
     }
 
+    // Live activity is independent of BM25: even gated prompts should see recent
+    // work from other sessions, while the current session is always excluded.
+    let activity = crate::activity::render_recent(&input.session_id, &input.cwd, 6)
+        .ok()
+        .flatten();
+
     // 1) 데몬 경유 시도
     if let Some(resp) = crate::daemon::try_request(&serde_json::json!({
         "cmd": "rag",
@@ -336,8 +413,9 @@ pub fn run_hook() -> Result<()> {
         "session_id": input.session_id,
     })) {
         if resp.get("ok").and_then(|v| v.as_bool()) == Some(true) {
-            if let Some(ctx) = resp.get("context").and_then(|v| v.as_str()) {
-                println!("{}", ctx);
+            let context = resp.get("context").and_then(|v| v.as_str());
+            if let Some(combined) = combine_contexts(activity.as_deref(), context) {
+                println!("{}", combined);
             }
             return Ok(());
         }
@@ -346,12 +424,17 @@ pub fn run_hook() -> Result<()> {
     // 2) 인프로세스 폴백
     let outcome = match run_pipeline(&input.prompt) {
         Ok(o) => o,
-        Err(_) => return Ok(()), // 인덱스 없음 등 — 훅은 조용히 통과
+        Err(_) => {
+            if let Some(activity) = activity {
+                println!("{}", activity);
+            }
+            return Ok(());
+        }
     };
     log_outcome(&input.prompt, &input.session_id, &outcome);
 
-    if let Some(ctx) = outcome.context {
-        println!("{}", ctx);
+    if let Some(combined) = combine_contexts(activity.as_deref(), outcome.context.as_deref()) {
+        println!("{}", combined);
     }
     Ok(())
 }
@@ -362,22 +445,51 @@ mod tests {
 
     #[test]
     fn gate_rejects_structural_noise() {
-        assert_eq!(gate("<task-notification>\n<task-id>abc</task-id> <summary>monitor done</summary>"), Err("noise"));
-        assert_eq!(gate("<command-message>clear</command-message> more text here"), Err("noise"));
-        assert_eq!(gate("<system-reminder> some long injected reminder text here"), Err("noise"));
-        assert_eq!(gate("Caveat: The messages below were generated by the user"), Err("noise"));
-        assert_eq!(gate("https://github.com/sendbird/ops-k8s/pull/7357"), Err("noise"));
-        assert_eq!(gate("❯ ccproxy: warning could not persist refreshed kiro token keychain"), Err("noise"));
-        assert_eq!(gate("━━ session cf3f0edd ━━ [KO] 그리고 지금 한시적으로 안정성을"), Err("noise"));
-        assert_eq!(gate("[QMD] Session: 8e79893a some pasted context block here"), Err("noise"));
+        assert_eq!(
+            gate("<task-notification>\n<task-id>abc</task-id> <summary>monitor done</summary>"),
+            Err("noise")
+        );
+        assert_eq!(
+            gate("<command-message>clear</command-message> more text here"),
+            Err("noise")
+        );
+        assert_eq!(
+            gate("<system-reminder> some long injected reminder text here"),
+            Err("noise")
+        );
+        assert_eq!(
+            gate("Caveat: The messages below were generated by the user"),
+            Err("noise")
+        );
+        assert_eq!(
+            gate("https://github.com/sendbird/ops-k8s/pull/7357"),
+            Err("noise")
+        );
+        assert_eq!(
+            gate("❯ ccproxy: warning could not persist refreshed kiro token keychain"),
+            Err("noise")
+        );
+        assert_eq!(
+            gate("━━ session cf3f0edd ━━ [KO] 그리고 지금 한시적으로 안정성을"),
+            Err("noise")
+        );
+        assert_eq!(
+            gate("[QMD] Session: 8e79893a some pasted context block here"),
+            Err("noise")
+        );
     }
 
     #[test]
     fn gate_accepts_real_prompts() {
-        assert!(gate("soda-cell-a 내 vs가 같은 네임스페이스로만 expose하고 있는데 뭔가 문제").is_ok());
+        assert!(
+            gate("soda-cell-a 내 vs가 같은 네임스페이스로만 expose하고 있는데 뭔가 문제").is_ok()
+        );
         assert!(gate("왜 envoy/istio 기반으로 안만들고 rust로 따로 만들었는지 알아보자").is_ok());
         // URL이 포함돼도 뒤에 실제 질의가 있으면 통과
-        assert!(gate("https://github.com/sendbird/ops-k8s/pull/7357 이 코멘트가 왜 반복되는지 봐줘").is_ok());
+        assert!(
+            gate("https://github.com/sendbird/ops-k8s/pull/7357 이 코멘트가 왜 반복되는지 봐줘")
+                .is_ok()
+        );
     }
 
     fn hit(file: &str, score: f32) -> SearchHit {
@@ -396,9 +508,9 @@ mod tests {
         // learnings가 원 BM25 점수는 약간 높아도, 정제 지식 부스트로 앞서야 한다.
         // learnings 40*0.75=30 vs skills 34*1.3=44.2 → skills 우선.
         let raw = vec![
-            hit("qmd://learnings/20260101 0-aaa.md", 40.0),
-            hit("qmd://claude-skills/sb:jira-ticket/SKILL.md", 34.0),
-            hit("qmd://learnings/20260102 0-bbb.md", 38.0),
+            hit("kmd://learnings/20260101 0-aaa.md", 40.0),
+            hit("kmd://claude-skills/sb:jira-ticket/SKILL.md", 34.0),
+            hit("kmd://learnings/20260102 0-bbb.md", 38.0),
         ];
         let out = filter_hits(raw);
         assert_eq!(collection_of(&out[0].file), "claude-skills");
@@ -408,8 +520,8 @@ mod tests {
     fn filter_hits_keeps_learnings_when_dominant() {
         // 정제 지식 후보가 없으면 learnings가 그대로 남는다.
         let raw = vec![
-            hit("qmd://learnings/a.md", 40.0),
-            hit("qmd://learnings/b.md", 30.0),
+            hit("kmd://learnings/a.md", 40.0),
+            hit("kmd://learnings/b.md", 30.0),
         ];
         let out = filter_hits(raw);
         assert_eq!(out.len(), 2);

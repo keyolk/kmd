@@ -227,7 +227,7 @@ fn draw(f: &mut Frame, app: &App) {
                     ListItem::new(format!(
                         "{:.1} {}",
                         h.score,
-                        h.file.strip_prefix("qmd://").unwrap_or(&h.file)
+                        h.file.strip_prefix("kmd://").unwrap_or(&h.file)
                     ))
                 })
                 .collect()
