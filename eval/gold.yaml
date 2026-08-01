@@ -1,0 +1,66 @@
+# kmd 검색 품질 gold set (수동 라벨)
+#
+# 각 케이스: 실제 사용자 프롬프트류 질의(prompt) → top-k 히트의 file/title에
+# expect_any substring 중 하나라도 있으면 정답으로 본다.
+# 훅과 동일하게 prompt에서 키워드를 추출(rag::gate)한 뒤 검색한다.
+#
+# 실행: kmd eval --gold eval/gold.yaml -k 5 --compare-qmd
+#
+# 앵커 문서는 인덱스에 존재함이 확인된 것만 사용한다. 문서가 이동/삭제되면
+# expect_any를 갱신할 것.
+
+# ── 한글 질의 (kmd의 핵심 가치) ──────────────────────────────
+
+- prompt: "delight common-gateway 인증서 SAN 커버리지랑 sendbird.com 갭 정리해줘"
+  expect_any:
+    - "tls-certs"
+
+- prompt: "게이트웨이 TLS 인증서가 서빙하는 SAN을 어떻게 확인하지"
+  expect_any:
+    - "tls-certs"
+
+- prompt: "TCP half close 좀비 소켓이 뭔지 설명해줘"
+  expect_any:
+    - "tcp/halfclose"
+    - "tcp/"
+
+- prompt: "TCP keepalive 동작 원리가 궁금해"
+  expect_any:
+    - "tcp/keepalive"
+    - "tcp/"
+
+- prompt: "TCP 혼잡 제어 congestion control 정리"
+  expect_any:
+    - "tcp/congestion_control"
+    - "tcp/"
+
+- prompt: "istio proxy envoy fork를 새 업스트림 릴리스로 올리는 절차"
+  expect_any:
+    - "istio-release"
+    - "istio"
+
+- prompt: "온콜 프로세스가 어떻게 되는지 알려줘"
+  expect_any:
+    - "oncall"
+    - "OnCall"
+
+# ── 영어 질의 (회귀 방지 baseline) ──────────────────────────
+
+- prompt: "how does the delight gateway handle the wildcard sendbird.com TLS cert gap"
+  expect_any:
+    - "tls-certs"
+
+- prompt: "TCP path MTU discovery pmtud behavior"
+  expect_any:
+    - "tcp/pmtud"
+    - "tcp/"
+
+- prompt: "TCP PAWS protection against wrapped sequence numbers"
+  expect_any:
+    - "tcp/paws"
+    - "tcp/"
+
+- prompt: "istio release upstream envoy patch cherry-pick workflow"
+  expect_any:
+    - "istio-release"
+    - "istio"

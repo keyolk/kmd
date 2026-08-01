@@ -71,6 +71,9 @@ pub struct RagLogEntry {
 pub struct RagHitLog {
     pub file: String,
     pub score: f32,
+    /// 주입된 스니펫 (L2 채택률 측정용 — 없으면 빈 문자열)
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub snippet: String,
 }
 
 pub fn state_dir() -> PathBuf {
@@ -108,6 +111,11 @@ pub fn gate(prompt: &str) -> std::result::Result<String, &'static str> {
     if p.chars().count() < MIN_PROMPT_LENGTH {
         return Err("too_short");
     }
+    // 사람이 실제로 물은 게 아닌 구조적 노이즈는 검색하지 않는다.
+    // (task-notification/tool-result/command 태그, 붙여넣은 터미널 출력 등)
+    if is_structural_noise(p) {
+        return Err("noise");
+    }
     let lower = p.to_lowercase();
     // "y"/"n" 단독 답변은 too_short에 이미 걸리므로 접두사만 확인
     if SKIP_PREFIXES.iter().any(|pre| lower.starts_with(pre)) {
@@ -120,20 +128,80 @@ pub fn gate(prompt: &str) -> std::result::Result<String, &'static str> {
     Ok(q)
 }
 
-/// 검색 결과를 claude 컬렉션으로 필터 + 파일 단위 dedupe.
+/// 자동 주입성/비질의 프롬프트 판별 — 사람이 타이핑한 질문이 아닌 것.
+fn is_structural_noise(p: &str) -> bool {
+    // 1) 자동 태그로 시작 (Claude Code가 주입하는 알림/커맨드/툴 결과)
+    const NOISE_PREFIXES: &[&str] = &[
+        "<task-notification",
+        "<command-",
+        "<tool-use",
+        "<local-command",
+        "<system-reminder",
+        "caveat:",
+    ];
+    let lower_start: String = p.chars().take(24).collect::<String>().to_lowercase();
+    if NOISE_PREFIXES.iter().any(|pre| lower_start.starts_with(pre)) {
+        return true;
+    }
+    // 2) URL 단독 (첫 토큰이 URL이고 남는 텍스트가 거의 없음)
+    let first = p.split_whitespace().next().unwrap_or("");
+    if (first.starts_with("http://") || first.starts_with("https://"))
+        && p.split_whitespace().count() <= 2
+    {
+        return true;
+    }
+    // 3) 붙여넣은 터미널 출력/프롬프트 (셸 프롬프트·로그 라인으로 시작)
+    let t = p.trim_start();
+    if t.starts_with('❯') || t.starts_with("$ ") || t.starts_with("> ") {
+        return true;
+    }
+    // 4) 이전에 주입된 컨텍스트를 되붙인 경우 (재귀 오염 방지)
+    if t.starts_with("<qmd-context")
+        || t.starts_with("[QMD]")
+        || t.starts_with("━━ session")
+    {
+        return true;
+    }
+    false
+}
+
+/// 컬렉션 가중치 — 정제 지식(memory/skills/agents/rules/contexts)은 답변에
+/// 직접 반영될 가치가 높아 부스트하고, learnings(과거 세션 로그)는 배경 참고
+/// 성격이라 약간 낮춘다. kmd show/util 실측에서 주입의 97%가 learnings로 쏠려
+/// 정제 지식이 묻히는 걸 완화한다. BM25 점수에 곱해 재정렬한다.
+fn collection_weight(coll: &str) -> f32 {
+    match coll {
+        "claude-memory" | "claude-skills" | "claude-agents" | "claude-rules"
+        | "claude-contexts" => 1.3,
+        "learnings" => 0.75,
+        _ => 1.0,
+    }
+}
+
+fn collection_of(file: &str) -> &str {
+    file.strip_prefix("qmd://")
+        .and_then(|r| r.split('/').next())
+        .unwrap_or("")
+}
+
+/// 검색 결과를 claude 컬렉션으로 필터 + 파일 단위 dedupe + 컬렉션 가중 재정렬.
 pub fn filter_hits(hits: Vec<SearchHit>) -> Vec<SearchHit> {
     let mut seen = std::collections::HashSet::new();
-    hits.into_iter()
+    let mut kept: Vec<SearchHit> = hits
+        .into_iter()
         .filter(|h| {
-            let coll = h
-                .file
-                .strip_prefix("qmd://")
-                .and_then(|r| r.split('/').next())
-                .unwrap_or("");
+            let coll = collection_of(&h.file);
             CLAUDE_COLLECTIONS.contains(&coll) && seen.insert(h.file.clone())
         })
-        .take(MAX_RESULTS)
-        .collect()
+        .collect();
+    // 컬렉션 가중을 적용한 유효 점수로 재정렬 (원 score는 표시용으로 보존).
+    kept.sort_by(|a, b| {
+        let wa = a.score * collection_weight(collection_of(&a.file));
+        let wb = b.score * collection_weight(collection_of(&b.file));
+        wb.partial_cmp(&wa).unwrap_or(std::cmp::Ordering::Equal)
+    });
+    kept.truncate(MAX_RESULTS);
+    kept
 }
 
 /// 주입 컨텍스트 포맷 — 기존 qmd_rag.py 출력과 동일한 <qmd-context> 형태.
@@ -208,7 +276,9 @@ pub fn run_pipeline(prompt: &str) -> Result<RagOutcome> {
         }
     };
     let cfg = config::load()?;
-    let raw = bm25::search(&config::tantivy_dir(), &cfg, &query, 10, None)?;
+    // 컬렉션 가중 재정렬이 실효를 내려면 후보를 넉넉히 가져와야 한다.
+    // (정제 지식이 원 BM25 top-3 밖이어도 부스트로 올라올 여지 확보)
+    let raw = bm25::search(&config::tantivy_dir(), &cfg, &query, 30, None)?;
     let hits = filter_hits(raw);
     let context = format_context(&hits);
     Ok(RagOutcome {
@@ -235,7 +305,11 @@ pub fn log_outcome(prompt: &str, session_id: &str, outcome: &RagOutcome) {
         hits: outcome
             .hits
             .iter()
-            .map(|h| RagHitLog { file: h.file.clone(), score: h.score })
+            .map(|h| RagHitLog {
+                file: h.file.clone(),
+                score: h.score,
+                snippet: h.snippet.clone().unwrap_or_default(),
+            })
             .collect(),
         latency_ms: outcome.latency_ms,
     });
@@ -280,4 +354,65 @@ pub fn run_hook() -> Result<()> {
         println!("{}", ctx);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gate_rejects_structural_noise() {
+        assert_eq!(gate("<task-notification>\n<task-id>abc</task-id> <summary>monitor done</summary>"), Err("noise"));
+        assert_eq!(gate("<command-message>clear</command-message> more text here"), Err("noise"));
+        assert_eq!(gate("<system-reminder> some long injected reminder text here"), Err("noise"));
+        assert_eq!(gate("Caveat: The messages below were generated by the user"), Err("noise"));
+        assert_eq!(gate("https://github.com/sendbird/ops-k8s/pull/7357"), Err("noise"));
+        assert_eq!(gate("❯ ccproxy: warning could not persist refreshed kiro token keychain"), Err("noise"));
+        assert_eq!(gate("━━ session cf3f0edd ━━ [KO] 그리고 지금 한시적으로 안정성을"), Err("noise"));
+        assert_eq!(gate("[QMD] Session: 8e79893a some pasted context block here"), Err("noise"));
+    }
+
+    #[test]
+    fn gate_accepts_real_prompts() {
+        assert!(gate("soda-cell-a 내 vs가 같은 네임스페이스로만 expose하고 있는데 뭔가 문제").is_ok());
+        assert!(gate("왜 envoy/istio 기반으로 안만들고 rust로 따로 만들었는지 알아보자").is_ok());
+        // URL이 포함돼도 뒤에 실제 질의가 있으면 통과
+        assert!(gate("https://github.com/sendbird/ops-k8s/pull/7357 이 코멘트가 왜 반복되는지 봐줘").is_ok());
+    }
+
+    fn hit(file: &str, score: f32) -> SearchHit {
+        SearchHit {
+            docid: "#0".into(),
+            score,
+            file: file.into(),
+            title: String::new(),
+            context: None,
+            snippet: Some("x".into()),
+        }
+    }
+
+    #[test]
+    fn filter_hits_boosts_curated_over_learnings() {
+        // learnings가 원 BM25 점수는 약간 높아도, 정제 지식 부스트로 앞서야 한다.
+        // learnings 40*0.75=30 vs skills 34*1.3=44.2 → skills 우선.
+        let raw = vec![
+            hit("qmd://learnings/20260101 0-aaa.md", 40.0),
+            hit("qmd://claude-skills/sb:jira-ticket/SKILL.md", 34.0),
+            hit("qmd://learnings/20260102 0-bbb.md", 38.0),
+        ];
+        let out = filter_hits(raw);
+        assert_eq!(collection_of(&out[0].file), "claude-skills");
+    }
+
+    #[test]
+    fn filter_hits_keeps_learnings_when_dominant() {
+        // 정제 지식 후보가 없으면 learnings가 그대로 남는다.
+        let raw = vec![
+            hit("qmd://learnings/a.md", 40.0),
+            hit("qmd://learnings/b.md", 30.0),
+        ];
+        let out = filter_hits(raw);
+        assert_eq!(out.len(), 2);
+        assert_eq!(collection_of(&out[0].file), "learnings");
+    }
 }

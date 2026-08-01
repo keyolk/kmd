@@ -37,9 +37,26 @@ already consume `qmd search --json`.
 - `src/tokenize.rs` — lindera ko-dic (Korean) + lowercase/stemmer (English)
 - `src/bm25.rs` — tantivy index, dual ko/en fields, search + snippets
 - `src/output.rs` — qmd-compatible JSON / CLI output
+- `src/eval.rs` — L1 retrieval eval (`kmd eval`): known-item + gold
+- `src/util.rs` — L2 injection utilization (`kmd util`)
+- `src/ab.rs` — L3 A/B blind comparison (`kmd ab`)
 
 ## Roadmap
 
-- [ ] vector search (embeddinggemma GGUF via llama-cpp-2, `embed` feature)
-- [ ] hybrid RRF (`kmd query`)
-- [ ] warm daemon (unix socket) for sub-100ms hook latency
+- [x] vector search (embeddinggemma GGUF via llama-cpp-2, `embed` feature)
+- [x] hybrid RRF (`kmd query`)
+- [x] warm daemon (unix socket) for sub-100ms hook latency
+
+## Evaluation
+
+3-layer utility eval — see [`eval/README.md`](eval/README.md).
+
+| Layer | Question | Command |
+|---|---|---|
+| L1 retrieval | found the right doc? | `kmd eval --compare-qmd` |
+| L2 utilization | did the answer use it? | `kmd util` |
+| L3 A/B | was the answer better? | `kmd ab --prompts eval/prompts.txt` |
+
+Measured (known-item, 341 queries, k=5): Korean R@5 **kmd 69% vs qmd 44%**,
+English **kmd 99% vs qmd 85%**. Blind A/B (10 pairs): **kmd 70% win**.
+Reproduce with `make eval-all`.
