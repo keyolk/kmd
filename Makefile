@@ -4,10 +4,21 @@
 
 BIN := target/release/kmd
 CARGO := cargo
+PREFIX := $(HOME)/.local
+INSTALL_BIN := $(PREFIX)/bin/kmd
 
 .PHONY: build
 build:
 	$(CARGO) build --release
+
+# Copy the binary into $(PREFIX)/bin. Real file copy, not a symlink.
+.PHONY: install
+install: build
+	@mkdir -p $(PREFIX)/bin
+	@rm -f $(INSTALL_BIN)
+	@cp $(BIN) $(INSTALL_BIN)
+	@chmod +x $(INSTALL_BIN)
+	@echo "installed -> $(INSTALL_BIN)"
 
 # ── L1: 검색 품질 (retrieval quality) ────────────────────────────────
 

@@ -1,10 +1,11 @@
-//! Claude Code hook entrypoints — kmd 바이너리가 Python 스크립트를 대체.
+//! Claude Code hook entrypoints.
 //!
-//! `kmd hook stop`     — Stop hook: 세션 learnings 추출 + 데몬에 reindex 큐잉.
-//! `kmd hook mark-dirty` — PostToolUse hook: watched collection 파일 변경 시 dirty 플래그.
+//! `kmd hook stop` refreshes the live activity card after each response.
+//! `kmd hook session-end` persists the final transcript and queues reindexing once.
+//! `kmd hook mark-dirty` records writes under configured collections.
 //!
-//! rag::run_hook와 동일한 규약: stdin JSON 읽고, 절대 실패하지 않는다(Ok(())).
-//! Claude Code 훅이 비정상 종료하면 사용자 프롬프트/세션이 차단되기 때문.
+//! Hooks consume JSON on stdin and intentionally return success when optional inputs are
+//! absent, because hook failures can block prompts or session shutdown.
 
 use anyhow::Result;
 use chrono::Local;
@@ -35,52 +36,107 @@ fn append_sync(line: &str) {
     }
 }
 
-/// Stop hook. stdin: `{"session_id": "..."}`.
-pub fn stop() -> Result<()> {
+fn read_hook_input() -> Value {
     let mut raw = String::new();
     let _ = std::io::stdin().read_to_string(&mut raw);
-    let session_id = serde_json::from_str::<Value>(&raw)
-        .ok()
-        .and_then(|v| v.get("session_id").and_then(|s| s.as_str()).map(str::to_string))
-        .unwrap_or_default();
+    serde_json::from_str(&raw).unwrap_or_default()
+}
 
-    let mut reasons: Vec<String> = Vec::new();
-    let mut exported = false;
+fn session_input(input: &Value) -> (String, Option<PathBuf>) {
+    let session_id = input
+        .get("session_id")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let transcript_path = input
+        .get("transcript_path")
+        .and_then(Value::as_str)
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from);
+    (session_id, transcript_path)
+}
+
+fn persist_dirty(reason: &str) {
+    let dir = crate::rag::state_dir();
+    let _ = fs::create_dir_all(&dir);
+    if let Ok(mut file) = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(dirty_flag())
+    {
+        use std::io::Write;
+        let _ = writeln!(file, "{}", reason);
+    }
+}
+
+fn update_accepted(response: &Value) -> bool {
+    let ok = response.get("ok").and_then(Value::as_bool).unwrap_or(false);
+    let accepted = response
+        .get("queued")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    ok && accepted
+}
+
+fn queue_update(reason: &str) -> bool {
+    let t0 = Instant::now();
+    let queued = crate::daemon::try_request(&serde_json::json!({"cmd":"update"}))
+        .as_ref()
+        .is_some_and(update_accepted);
+    let elapsed = t0.elapsed().as_secs_f32();
+    let ts = Local::now().format("%Y-%m-%dT%H:%M:%S");
+    append_sync(&format!(
+        "{} {} kmd queued in {:.1}s (ok={})",
+        ts, reason, elapsed, queued
+    ));
+    queued
+}
+
+/// Stop hook: refresh the live activity card and flush explicitly dirty collections.
+pub fn stop() -> Result<()> {
+    let input = read_hook_input();
+    let (session_id, transcript_path) = session_input(&input);
 
     if !session_id.is_empty() {
-        let id8: String = session_id.chars().take(8).collect();
-        match crate::learnings::process_session(&session_id, false) {
-            Ok(true) => {
-                exported = true;
-                reasons.push(format!("session:{}", id8));
-            }
-            _ => {}
+        if let Some(path) = transcript_path.as_deref().filter(|path| path.is_file()) {
+            let _ = crate::activity::update_from_transcript(&session_id, path);
         }
     }
 
     let flag = dirty_flag();
-    let dirty = flag.exists();
-    if dirty {
+    if flag.exists() {
+        // Remove the observed signal before queueing so a concurrent writer can create
+        // a fresh flag. Restore it when the daemon cannot accept this update.
         let _ = fs::remove_file(&flag);
-        reasons.push("dirty-files".to_string());
+        if !queue_update("dirty-files") {
+            persist_dirty("dirty-files");
+        }
+    }
+    Ok(())
+}
+
+/// SessionEnd hook: persist the final transcript as historical learning once.
+pub fn session_end() -> Result<()> {
+    let input = read_hook_input();
+    let (session_id, transcript_path) = session_input(&input);
+    if session_id.is_empty() {
+        return Ok(());
     }
 
-    if exported || dirty {
-        let t0 = Instant::now();
-        let queued_ok = crate::daemon::try_request(&serde_json::json!({"cmd":"update"}))
-            .map(|r| r.get("ok").and_then(|o| o.as_bool()).unwrap_or(false))
-            .unwrap_or(false);
-        // 데몬이 응답하지 않으면 로컬 동기 인덱싱을 스킵 — Stop 훅이 블로킹(최대 86s)하지 않도록.
-        // 다음 Stop에서 dirty/exported 신호가 남아있지 않으므로, 데몬이 살아나면 자연 복구.
-        let elapsed = t0.elapsed().as_secs_f32();
-        let ts = Local::now().format("%Y-%m-%dT%H:%M:%S");
-        let reason = reasons.join("+");
-        append_sync(&format!(
-            "{} {} kmd queued in {:.1}s (ok={})",
-            ts, reason, elapsed, queued_ok
-        ));
+    let id8: String = session_id.chars().take(8).collect();
+    let exported = if let Some(path) = transcript_path.as_deref().filter(|path| path.is_file()) {
+        let _ = crate::activity::update_from_transcript(&session_id, path);
+        crate::learnings::process_transcript(&session_id, path, false).unwrap_or(false)
+    } else {
+        crate::learnings::process_session(&session_id, false).unwrap_or(false)
+    };
+    if exported {
+        let reason = format!("session:{}", id8);
+        if !queue_update(&reason) {
+            persist_dirty(&reason);
+        }
     }
-
     Ok(())
 }
 
@@ -143,4 +199,24 @@ pub fn mark_dirty() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn update_acceptance_requires_an_accepted_queue() {
+        assert!(update_accepted(&serde_json::json!({"ok": true})));
+        assert!(update_accepted(
+            &serde_json::json!({"ok": true, "queued": true})
+        ));
+        assert!(!update_accepted(
+            &serde_json::json!({"ok": true, "queued": false})
+        ));
+        assert!(!update_accepted(
+            &serde_json::json!({"ok": false, "queued": true})
+        ));
+        assert!(!update_accepted(&serde_json::json!({})));
+    }
 }

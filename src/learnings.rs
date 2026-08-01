@@ -1,16 +1,15 @@
-//! Extract learnings from Claude Code conversation snapshots.
+//! Extract historical learnings from Claude Code transcripts and snapshots.
 //!
-//! `~/.claude/snapshots/<session_id>/*.jsonl` 의 mtime 최신 스냅샷 하나를 읽어
-//! `~/.claude/kmd-learnings/<YYYYMMDD>-<session[:8]>.md` 로 출력. 짧은 세션
-//! (message_count < 4)은 건너뛴다. 처리된 session_id는
-//! `~/.claude/.kmd-processed-snapshots` 에 append하여 dedup.
+//! SessionEnd reads the live `transcript_path` directly, while the manual command can
+//! still process the newest `~/.claude/snapshots/<session_id>/*.jsonl` fallback. Output
+//! goes to `~/.claude/kmd-learnings/<YYYYMMDD>-<session[:8]>.md`; sessions with fewer
+//! than four records are skipped.
 //!
 //! 이전 Python 구현(`extract_learnings.py`)과 동일한 추출 정책:
 ///   - content가 string이면 user/assistant 텍스트로; array면 text 블록만 대화로,
 ///     tool_use 블록은 tools_used/files_touched 메타로 추출.
 ///   - assistant 텍스트는 50자 초과만, 1500자 캡. user 프롬프트는 전문.
 ///   - tool_result(명령 출력)은 버린다.
-
 use anyhow::Result;
 use regex::Regex;
 use serde_json::Value;
@@ -41,6 +40,7 @@ struct Extracted {
     conversation: Vec<(String, String)>, // (role, text)
     tools_used: BTreeSet<String>,
     files_touched: BTreeSet<String>,
+    cwd: String,
     message_count: usize,
 }
 
@@ -51,6 +51,7 @@ fn extract_from_snapshot(path: &Path) -> Option<Extracted> {
     let mut conversation = Vec::new();
     let mut tools_used = BTreeSet::new();
     let mut files_touched = BTreeSet::new();
+    let mut cwd = String::new();
     let mut message_count = 0;
 
     for line in reader.lines() {
@@ -67,6 +68,11 @@ fn extract_from_snapshot(path: &Path) -> Option<Extracted> {
             Err(_) => continue,
         };
         message_count += 1;
+        if let Some(value) = entry.get("cwd").and_then(Value::as_str) {
+            if !value.is_empty() {
+                cwd = value.to_string();
+            }
+        }
 
         let msg = entry.get("message").unwrap_or(&entry);
         let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("");
@@ -116,6 +122,7 @@ fn extract_from_snapshot(path: &Path) -> Option<Extracted> {
         conversation,
         tools_used,
         files_touched,
+        cwd,
         message_count,
     })
 }
@@ -129,11 +136,40 @@ fn timestamp_from_stem(path: &Path) -> String {
     taken.replace('T', " ")
 }
 
+fn timestamp_from_transcript(path: &Path) -> String {
+    let latest = fs::File::open(path)
+        .ok()
+        .map(BufReader::new)
+        .into_iter()
+        .flat_map(|reader| reader.lines().map_while(Result::ok))
+        .filter_map(|line| serde_json::from_str::<Value>(&line).ok())
+        .filter_map(|entry| {
+            entry
+                .get("timestamp")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .max();
+
+    latest
+        .and_then(|value| chrono::DateTime::parse_from_rfc3339(&value).ok())
+        .map(|value| {
+            value
+                .with_timezone(&chrono::Local)
+                .format("%Y%m%d %H%M%S")
+                .to_string()
+        })
+        .unwrap_or_else(|| chrono::Local::now().format("%Y%m%d %H%M%S").to_string())
+}
+
 fn generate_md(session_id: &str, data: &Extracted, timestamp: &str) -> String {
     let id8: String = session_id.chars().take(8).collect();
     let mut lines: Vec<String> = Vec::new();
     lines.push(format!("# Session: {}", id8));
     lines.push(format!("Date: {}", timestamp));
+    if !data.cwd.is_empty() {
+        lines.push(format!("Cwd: `{}`", data.cwd));
+    }
     lines.push(String::new());
 
     let tools: Vec<String> = data.tools_used.iter().take(15).cloned().collect();
@@ -258,7 +294,40 @@ fn process_session_dir(dir: &Path, session_id: &str, dry_run: bool) -> Result<bo
     Ok(true)
 }
 
-/// Process a single session by id. Returns whether a learning file was produced.
+/// Process a live Claude Code transcript without waiting for compaction.
+pub fn process_transcript(session_id: &str, path: &Path, dry_run: bool) -> Result<bool> {
+    let data = match extract_from_snapshot(path) {
+        Some(data) => data,
+        None => return Ok(false),
+    };
+    if data.message_count < 4 {
+        return Ok(false);
+    }
+
+    let timestamp = timestamp_from_transcript(path);
+    let md = generate_md(session_id, &data, &timestamp);
+    if dry_run {
+        println!("\n{}", "=".repeat(60));
+        println!("Session: {}", session_id);
+        println!("{}", "=".repeat(60));
+        println!("{}", md);
+        return Ok(true);
+    }
+
+    let date_prefix = timestamp.get(..8).unwrap_or(&timestamp);
+    let id8: String = session_id.chars().take(8).collect();
+    fs::create_dir_all(learnings_dir())?;
+    let out = learnings_dir().join(format!("{}-{}.md", date_prefix, id8));
+    fs::write(&out, md)?;
+    println!(
+        "  Extracted live transcript: {} ({} messages)",
+        out.file_name().unwrap().to_string_lossy(),
+        data.message_count
+    );
+    Ok(true)
+}
+
+/// Process a single compacted session snapshot by id.
 pub fn process_session(session_id: &str, dry_run: bool) -> Result<bool> {
     let dir = snapshots_dir().join(session_id);
     if !dir.is_dir() {
@@ -293,8 +362,7 @@ pub fn run(session: Option<&str>, recent: u32, dry_run: bool, force: bool) -> Re
         }
     } else {
         let cutoff = if recent > 0 {
-            SystemTime::now()
-                .checked_sub(std::time::Duration::from_secs(u64::from(recent) * 86400))
+            SystemTime::now().checked_sub(std::time::Duration::from_secs(u64::from(recent) * 86400))
         } else {
             None
         };
@@ -325,7 +393,11 @@ pub fn run(session: Option<&str>, recent: u32, dry_run: bool, force: bool) -> Re
         }
     }
 
-    let action = if dry_run { "Would extract" } else { "Extracted" };
+    let action = if dry_run {
+        "Would extract"
+    } else {
+        "Extracted"
+    };
     println!("\n{} learnings from {} sessions", action, count);
     Ok(())
 }

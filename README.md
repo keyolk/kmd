@@ -20,10 +20,22 @@ Measured on 60 real Korean prompts (Claude Code RAG hook simulation):
 ## Usage
 
 ```sh
-kmd update              # index collections from ~/.config/qmd/index.yml
+kmd update              # index collections from ~/.config/kmd/index.yml
 kmd search "인증서 SAN" -n 5 --json
 kmd status
+
+# Date → project → session/learning view. The current directory is the locality anchor.
+kmd journal
+kmd journal --date 2026-08-01
+kmd journal --project platform-tools
+kmd journal --cwd ~/src/sendbird/soda-k8s/.worktree/cohome --days 14
+kmd journal --json
 ```
+
+`kmd journal` combines historical learnings with live session activity. Entries are
+ordered by date and then by spatial locality: exact cwd, same worktree, same canonical
+Git repository, and touched-file overlap. New learnings persist their creation `Cwd:`;
+older learnings recover it from the original transcript or infer it from touched files.
 
 Reads qmd's `index.yml` as-is; emits qmd-compatible `--json` output
 (docid/score/file/title/context/snippet), so it drops into scripts that
