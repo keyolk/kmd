@@ -7,6 +7,7 @@ mod daemon;
 mod embed;
 mod eval;
 mod hook;
+mod hook_config;
 mod journal;
 mod learnings;
 mod locality;
@@ -244,7 +245,7 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Claude Code hook entrypoints (never fail)
+    /// Install, inspect, and run Claude Code hooks
     Hook {
         #[command(subcommand)]
         sub: HookSub,
@@ -253,6 +254,16 @@ enum Command {
 
 #[derive(Subcommand)]
 enum HookSub {
+    /// Install kmd hooks into ~/.claude/settings.json
+    Install {
+        /// kmd executable path; defaults to the currently running binary
+        #[arg(long)]
+        binary: Option<std::path::PathBuf>,
+    },
+    /// Check whether all kmd Claude Code hooks are installed
+    Status,
+    /// Remove only kmd-owned hooks from ~/.claude/settings.json
+    Uninstall,
     /// Stop hook: refresh live activity and flush dirty collections
     Stop,
     /// SessionEnd hook: persist the final transcript and queue reindex
@@ -367,6 +378,9 @@ fn main() -> Result<()> {
             }
         }
         Command::Hook { sub } => match sub {
+            HookSub::Install { binary } => hook_config::install(binary.as_deref()),
+            HookSub::Status => hook_config::status(),
+            HookSub::Uninstall => hook_config::uninstall(),
             HookSub::Stop => hook::stop(),
             HookSub::SessionEnd => hook::session_end(),
             HookSub::MarkDirty => hook::mark_dirty(),
