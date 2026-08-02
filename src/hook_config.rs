@@ -220,6 +220,12 @@ pub fn install(binary: Option<&Path>) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn status_summary() -> Result<(usize, usize, PathBuf)> {
+    let path = settings_path()?;
+    let settings = load(&path)?;
+    Ok((installed(&settings).len(), HOOKS.len(), path))
+}
+
 pub fn status() -> Result<()> {
     let path = settings_path()?;
     let settings = load(&path)?;

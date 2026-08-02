@@ -247,18 +247,23 @@ fn proxy_report(pairs: &[BlindPair], json: bool) -> Result<()> {
         }
     }
     let n = pairs.len();
+    let metrics = serde_json::json!({
+        "pairs": n,
+        "kmd_win": kmd_win, "qmd_win": qmd_win, "tie": tie,
+        "kmd_win_pct": pct(kmd_win, n), "qmd_win_pct": pct(qmd_win, n),
+        "korean": {"kmd_win": k_ko, "qmd_win": q_ko, "tie": t_ko},
+        "kmd_coverage": kmd_cov, "qmd_coverage": qmd_cov,
+        "kmd_avg_relevance": if n > 0 { kmd_rel / n as f64 } else { 0.0 },
+        "qmd_avg_relevance": if n > 0 { qmd_rel / n as f64 } else { 0.0 },
+        "judge": "built-in proxy (prompt-keyword coverage in context)",
+    });
+    crate::evaluation_log::record(
+        "ab-proxy",
+        format!("{n} pairs · kmd {kmd_win} / qmd {qmd_win} / tie {tie}"),
+        metrics.clone(),
+    );
     if json {
-        let out = serde_json::json!({
-            "pairs": n,
-            "kmd_win": kmd_win, "qmd_win": qmd_win, "tie": tie,
-            "kmd_win_pct": pct(kmd_win, n), "qmd_win_pct": pct(qmd_win, n),
-            "korean": {"kmd_win": k_ko, "qmd_win": q_ko, "tie": t_ko},
-            "kmd_coverage": kmd_cov, "qmd_coverage": qmd_cov,
-            "kmd_avg_relevance": kmd_rel / n as f64,
-            "qmd_avg_relevance": qmd_rel / n as f64,
-            "judge": "built-in proxy (prompt-keyword coverage in context)",
-        });
-        println!("{}", serde_json::to_string_pretty(&out)?);
+        println!("{}", serde_json::to_string_pretty(&metrics)?);
     } else {
         println!("kmd ab — A/B 비교 (L3, 내장 프록시 판정)\n");
         println!("페어: {}", n);
@@ -328,15 +333,18 @@ fn tally(vpath: &Path, prompts_path: Option<&Path>, json: bool) -> Result<()> {
         }
     }
     let n = kmd_win + qmd_win + tie;
+    let metrics = serde_json::json!({
+        "pairs_judged": n, "kmd_win": kmd_win, "qmd_win": qmd_win, "tie": tie,
+        "kmd_win_pct": pct(kmd_win, n), "qmd_win_pct": pct(qmd_win, n),
+        "judge": "external blind verdicts",
+    });
+    crate::evaluation_log::record(
+        "ab-external",
+        format!("{n} judged · kmd {kmd_win} / qmd {qmd_win} / tie {tie}"),
+        metrics.clone(),
+    );
     if json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
-                "pairs_judged": n, "kmd_win": kmd_win, "qmd_win": qmd_win, "tie": tie,
-                "kmd_win_pct": pct(kmd_win, n), "qmd_win_pct": pct(qmd_win, n),
-                "judge": "external blind verdicts",
-            }))?
-        );
+        println!("{}", serde_json::to_string_pretty(&metrics)?);
     } else {
         println!("kmd ab — 외부 블라인드 판정 취합\n");
         println!("판정된 페어: {}", n);

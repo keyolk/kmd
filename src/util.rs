@@ -271,19 +271,27 @@ pub fn print_utilization(since_secs: Option<u64>, json: bool) -> Result<()> {
 
     examples.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
 
+    let utilization_rate = pct(utilized, matched);
+    let avg_overlap = if matched > 0 { 100.0 * overlap_sum / matched as f64 } else { 0.0 };
+    let metrics = serde_json::json!({
+        "injected_total": injected_total,
+        "matched_to_answer": matched,
+        "utilized": utilized,
+        "utilization_rate_pct": utilization_rate,
+        "avg_overlap_pct": avg_overlap,
+        "korean_injected": korean_inj,
+        "korean_utilized": korean_util,
+        "injected_by_collection": &coll_count,
+        "note": "overlap approximates utilization via query-token reuse in the following answer; add snippet logging for precision",
+    });
+    crate::evaluation_log::record(
+        "utilization",
+        format!("{utilized}/{matched} utilized · {utilization_rate:.0}% · {injected_total} injected"),
+        metrics.clone(),
+    );
+
     if json {
-        let out = serde_json::json!({
-            "injected_total": injected_total,
-            "matched_to_answer": matched,
-            "utilized": utilized,
-            "utilization_rate_pct": pct(utilized, matched),
-            "avg_overlap_pct": if matched>0 { 100.0*overlap_sum/matched as f64 } else {0.0},
-            "korean_injected": korean_inj,
-            "korean_utilized": korean_util,
-            "injected_by_collection": coll_count,
-            "note": "overlap approximates utilization via query-token reuse in the following answer; add snippet logging for precision",
-        });
-        println!("{}", serde_json::to_string_pretty(&out)?);
+        println!("{}", serde_json::to_string_pretty(&metrics)?);
     } else {
         println!("kmd util — 주입 채택률 (L2)\n");
         println!("주입 엔트리:        {}", injected_total);

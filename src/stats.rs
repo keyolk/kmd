@@ -4,7 +4,7 @@ use crate::rag::{RagLogEntry, rag_log_path};
 use anyhow::Result;
 use std::collections::BTreeMap;
 
-fn load_entries(since_secs: Option<u64>) -> Result<Vec<RagLogEntry>> {
+pub(crate) fn load_entries(since_secs: Option<u64>) -> Result<Vec<RagLogEntry>> {
     let path = rag_log_path();
     let raw = match std::fs::read_to_string(&path) {
         Ok(r) => r,

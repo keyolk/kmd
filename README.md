@@ -24,6 +24,11 @@ kmd update              # index collections from ~/.config/kmd/index.yml
 kmd search "인증서 SAN" -n 5 --json
 kmd status
 
+# Track runtime, sessions, RAG history, and persisted self-checks.
+kmd dashboard
+kmd dashboard --json
+kmd dashboard --check
+
 # Install Claude Code integration without overwriting other hooks.
 kmd hook install
 kmd hook status
@@ -36,6 +41,14 @@ kmd journal --project platform-tools
 kmd journal --cwd ~/src/sendbird/soda-k8s/.worktree/cohome --days 14
 kmd journal --json
 ```
+
+`kmd dashboard` provides Overview, Activity, Journal, RAG, Evaluations, and Checks
+tabs. Use `←`/`→` or `1`–`6` to switch tabs, `↑`/`↓` to scroll, `r` to refresh, and
+`t` to run self-checks. The latest 500 check results are kept in
+`~/.local/state/kmd/checks.jsonl`. Successful `eval`, `util`, and `ab` runs are kept
+in `~/.local/state/kmd/evaluations.jsonl`. The same state is available
+non-interactively through `--json`; `--check` validates config, store, Tantivy,
+daemon, Claude hooks, RAG/evaluation logs, search, activity, and journal.
 
 `kmd hook install` idempotently adds `SessionStart`, `UserPromptSubmit`, `Stop`,
 `SessionEnd`, and write-oriented `PostToolUse` entries to `~/.claude/settings.json`.
@@ -59,6 +72,8 @@ already consume `qmd search --json`.
 - `src/tokenize.rs` — lindera ko-dic (Korean) + lowercase/stemmer (English)
 - `src/bm25.rs` — tantivy index, dual ko/en fields, search + snippets
 - `src/output.rs` — qmd-compatible JSON / CLI output
+- `src/dashboard.rs` — operations TUI, JSON snapshot, checks and evaluation history
+- `src/evaluation_log.rs` — bounded history for successful L1/L2/L3 evaluation runs
 - `src/eval.rs` — L1 retrieval eval (`kmd eval`): known-item + gold
 - `src/util.rs` — L2 injection utilization (`kmd util`)
 - `src/ab.rs` — L3 A/B blind comparison (`kmd ab`)

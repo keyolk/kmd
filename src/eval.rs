@@ -280,6 +280,21 @@ pub fn known_item(
     } else {
         vec![&kmd]
     };
+    crate::evaluation_log::record(
+        "eval-known-item",
+        format!(
+            "{} queries · R@5 {:.0}% · MRR {:.3}",
+            kmd.all.queries,
+            Metrics::pct(kmd.all.recall_at_5, kmd.all.queries),
+            kmd.all.mrr()
+        ),
+        serde_json::json!({
+            "mode": "known-item",
+            "collections": &collections,
+            "k": k,
+            "reports": &reports,
+        }),
+    );
 
     if json {
         #[derive(Serialize)]
@@ -371,6 +386,21 @@ pub fn gold(path: &Path, k: usize, compare_qmd: bool, json: bool) -> Result<()> 
     } else {
         vec![&kmd]
     };
+    crate::evaluation_log::record(
+        "eval-gold",
+        format!(
+            "{} cases · R@5 {:.0}% · MRR {:.3}",
+            kmd.all.queries,
+            Metrics::pct(kmd.all.recall_at_5, kmd.all.queries),
+            kmd.all.mrr()
+        ),
+        serde_json::json!({
+            "mode": "gold",
+            "path": path,
+            "k": k,
+            "reports": &reports,
+        }),
+    );
     if json {
         println!("{}", serde_json::to_string_pretty(&reports)?);
     } else {
