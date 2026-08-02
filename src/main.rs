@@ -3,9 +3,11 @@ mod activity;
 mod bm25;
 mod config;
 mod daemon;
+mod dashboard;
 #[cfg(feature = "embed")]
 mod embed;
 mod eval;
+mod evaluation_log;
 mod hook;
 mod hook_config;
 mod journal;
@@ -121,6 +123,15 @@ enum Command {
     },
     /// Index/collection status
     Status,
+    /// Operations dashboard for runtime, sessions, RAG, evaluations, and checks
+    Dashboard {
+        /// Print the current dashboard snapshot as JSON instead of opening the TUI
+        #[arg(long)]
+        json: bool,
+        /// Run self-checks, persist the result, and exit
+        #[arg(long)]
+        check: bool,
+    },
     /// Retrieval quality eval (L1): known-item self-supervised or gold-labeled
     Eval {
         /// Path to a gold YAML (prompt/expect_any). Omit for known-item mode.
@@ -307,6 +318,7 @@ fn main() -> Result<()> {
             }
         }
         Command::Status => cmd_status(),
+        Command::Dashboard { json, check } => dashboard::run(json, check),
         Command::Eval {
             gold,
             collection,
