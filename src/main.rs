@@ -4,6 +4,7 @@ mod bm25;
 mod config;
 mod daemon;
 mod dashboard;
+mod dashboard_simulator;
 #[cfg(feature = "embed")]
 mod embed;
 mod eval;

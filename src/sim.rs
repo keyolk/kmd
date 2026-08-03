@@ -4,11 +4,95 @@
 //! 게이팅/추출 쿼리/히트/주입 컨텍스트를 실시간으로 보여준다.
 //! 재생: ~/.claude/history.jsonl의 실제 프롬프트를 일괄 시뮬레이션해 주입률 리포트.
 
+use crate::bm25::SearchHit;
 use crate::rag::{self, RagOutcome};
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Wrap};
+use std::time::Instant;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SimulatorMode {
+    Rag,
+    Search,
+}
+
+impl SimulatorMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Rag => "RAG pipeline",
+            Self::Search => "BM25 search",
+        }
+    }
+
+    pub fn toggle(self) -> Self {
+        match self {
+            Self::Rag => Self::Search,
+            Self::Search => Self::Rag,
+        }
+    }
+}
+
+pub struct SimulatorResult {
+    pub mode: SimulatorMode,
+    pub query: String,
+    pub gate_reason: Option<String>,
+    pub hits: Vec<SearchHit>,
+    pub context: Option<String>,
+    pub latency_ms: u64,
+}
+
+/// Execute the same retrieval paths exposed by the CLI without writing RAG logs.
+/// Dashboard workers and the standalone simulator share this entry point.
+pub fn execute(mode: SimulatorMode, input: &str, limit: usize) -> Result<SimulatorResult> {
+    match mode {
+        SimulatorMode::Rag => {
+            let outcome = rag::run_pipeline(input)?;
+            Ok(SimulatorResult {
+                mode,
+                query: outcome.query.unwrap_or_default(),
+                gate_reason: outcome.gate_reason.map(str::to_string),
+                hits: outcome.hits,
+                context: outcome.context,
+                latency_ms: outcome.latency_ms,
+            })
+        }
+        SimulatorMode::Search => {
+            let started = Instant::now();
+            let config = crate::config::load()?;
+            let hits =
+                crate::bm25::search(&crate::config::tantivy_dir(), &config, input, limit, None)?;
+            Ok(SimulatorResult {
+                mode,
+                query: input.to_string(),
+                gate_reason: None,
+                hits,
+                context: None,
+                latency_ms: started.elapsed().as_millis() as u64,
+            })
+        }
+    }
+}
+
+pub fn prompt_history() -> Vec<String> {
+    std::env::var("HOME")
+        .ok()
+        .map(|home| std::path::PathBuf::from(home).join(".claude/history.jsonl"))
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .map(|raw| {
+            raw.lines()
+                .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                .filter_map(|value| {
+                    value
+                        .get("display")
+                        .and_then(|display| display.as_str())
+                        .map(String::from)
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
 
 // ---------------------------------------------------------------- replay ----
 
@@ -49,7 +133,13 @@ pub fn replay(count: usize, hangul_only: bool) -> Result<()> {
                     injected += 1;
                     chunk_sum += o.hits.len();
                     let top = o.hits.first().map(|h| h.file.as_str()).unwrap_or("");
-                    println!("  INJ {} {:>4}ms {:?}\n      -> {}", o.hits.len(), o.latency_ms, short, top);
+                    println!(
+                        "  INJ {} {:>4}ms {:?}\n      -> {}",
+                        o.hits.len(),
+                        o.latency_ms,
+                        short,
+                        top
+                    );
                 } else {
                     println!("  MISS  {:>4}ms {:?}", o.latency_ms, short);
                 }
@@ -67,13 +157,21 @@ pub fn replay(count: usize, hangul_only: bool) -> Result<()> {
         injected,
         searched,
         pct(injected, searched),
-        if searched > 0 { chunk_sum as f64 / searched as f64 } else { 0.0 }
+        if searched > 0 {
+            chunk_sum as f64 / searched as f64
+        } else {
+            0.0
+        }
     );
     Ok(())
 }
 
 fn pct(n: usize, d: usize) -> f64 {
-    if d == 0 { 0.0 } else { 100.0 * n as f64 / d as f64 }
+    if d == 0 {
+        0.0
+    } else {
+        100.0 * n as f64 / d as f64
+    }
 }
 
 // ------------------------------------------------------------------- tui ----
@@ -89,17 +187,7 @@ struct App {
 
 pub fn tui() -> Result<()> {
     // 과거 프롬프트를 위/아래 키로 불러올 수 있게 로드
-    let history: Vec<String> = std::env::var("HOME")
-        .ok()
-        .map(|h| std::path::PathBuf::from(h).join(".claude/history.jsonl"))
-        .and_then(|p| std::fs::read_to_string(p).ok())
-        .map(|raw| {
-            raw.lines()
-                .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
-                .filter_map(|v| v.get("display").and_then(|d| d.as_str()).map(String::from))
-                .collect()
-        })
-        .unwrap_or_default();
+    let history = prompt_history();
 
     let mut terminal = ratatui::init();
     let result = run_app(
@@ -187,8 +275,11 @@ fn draw(f: &mut Frame, app: &App) {
         .split(f.area());
 
     // 입력창
-    let input = Paragraph::new(app.input.as_str())
-        .block(Block::default().borders(Borders::ALL).title(" prompt (Enter=run) "));
+    let input = Paragraph::new(app.input.as_str()).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(" prompt (Enter=run) "),
+    );
     f.render_widget(input, chunks[0]);
 
     // 파이프라인 상태
@@ -233,8 +324,11 @@ fn draw(f: &mut Frame, app: &App) {
                 .collect()
         })
         .unwrap_or_default();
-    let hits = List::new(hit_items)
-        .block(Block::default().borders(Borders::ALL).title(" hits (claude collections) "));
+    let hits = List::new(hit_items).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(" hits (claude collections) "),
+    );
     f.render_widget(hits, body_chunks[0]);
 
     let ctx_text = app
@@ -242,9 +336,11 @@ fn draw(f: &mut Frame, app: &App) {
         .as_ref()
         .and_then(|o| o.context.clone())
         .unwrap_or_else(|| "(주입될 컨텍스트 없음)".into());
-    let ctx = Paragraph::new(ctx_text)
-        .wrap(Wrap { trim: false })
-        .block(Block::default().borders(Borders::ALL).title(" injected <qmd-context> "));
+    let ctx = Paragraph::new(ctx_text).wrap(Wrap { trim: false }).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(" injected <qmd-context> "),
+    );
     f.render_widget(ctx, body_chunks[1]);
 
     // 도움말
