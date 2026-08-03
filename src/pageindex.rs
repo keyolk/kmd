@@ -673,27 +673,40 @@ pub fn run(axis: Option<&str>, limit: usize, json: bool, l0: bool, cover: bool) 
     Ok(())
 }
 
-/// SessionStart 훅용 — `<session-index>` 블록을 `additionalContext` JSON으로.
+/// SessionStart hook — emits the `<session-index>` block as additional context.
 ///
-/// 훅 규약: stdout에 `{"hookSpecificOutput":{"additionalContext":"..."}}`을 내면
-/// Claude Code가 세션 시작 컨텍스트에 주입한다. `kmd page --l0`와 동일한
-/// 렌더를 쓰되 훅 JSON 래핑만 더한다. 실패해도 조용히 빈 JSON을 내놓아
-/// 세션 시작을 차단하지 않는다.
+/// Claude Code validates `hookEventName` even when the hook only injects context.
+/// Build failures intentionally produce empty context instead of blocking startup.
+fn hook_payload(additional_context: String) -> serde_json::Value {
+    serde_json::json!({
+        "hookSpecificOutput": {
+            "hookEventName": "SessionStart",
+            "additionalContext": additional_context,
+        }
+    })
+}
+
 pub fn run_hook() -> Result<()> {
     let out = match build() {
         Ok(idx) => render_l0(&idx),
         Err(_) => String::new(),
     };
-    let payload = serde_json::json!({
-        "hookSpecificOutput": { "additionalContext": out }
-    });
-    println!("{}", serde_json::to_string(&payload)?);
+    println!("{}", serde_json::to_string(&hook_payload(out))?);
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hook_payload_declares_session_start_event() {
+        let payload = hook_payload("context".to_string());
+        let output = &payload["hookSpecificOutput"];
+
+        assert_eq!(output["hookEventName"], "SessionStart");
+        assert_eq!(output["additionalContext"], "context");
+    }
 
     #[test]
     fn repo_of_extracts_sendbird_org_repos() {
