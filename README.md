@@ -55,12 +55,45 @@ its purpose, data source, and primary action:
 | Checks | Operational verification history for all local dependencies |
 | Simulator | Real RAG pipeline or raw BM25 queries against the local index |
 
-Use `←`/`→`, `h`/`l`, or `1`–`7` to switch tabs; `j`/`k` or arrow keys to scroll;
-`r` to refresh; and `t` to run self-checks. In Simulator, type a prompt and press
-`Enter`; `Alt-m` switches between the production RAG path (gate → extracted query →
-filtered hits → injected context) and raw BM25 search, `↑`/`↓` recalls prompt
-history, `Alt-j`/`Alt-k` selects a hit, and `PgUp`/`PgDn` scrolls details. Simulator
-runs do not write `rag.jsonl`.
+### Keys
+
+No binding uses `Ctrl`, `Alt`, or `Cmd` — those chords stay with the terminal and
+the tmux prefix, and the dashboard passes them through untouched. Press `?` for
+the full keymap.
+
+| Key | Action |
+|---|---|
+| `1`–`7`, `Tab`/`Shift-Tab`, `h`/`l`, `←`/`→` | switch tab |
+| `j`/`k`, `↑`/`↓`, `PgUp`/`PgDn`, `g`/`G` | scroll |
+| `r` | refresh the snapshot |
+| `t` | run the self-check suite |
+| `?` | toggle the keymap overlay |
+| `q`, `Esc` | quit |
+
+The Simulator tab splits input into a command mode and a typing mode, so plain
+letters stay usable as commands:
+
+| Mode | Key | Action |
+|---|---|---|
+| command | `i` or `/` | start typing a query |
+| command | `Enter` | run the query |
+| command | `m` | RAG pipeline ⇄ BM25 search |
+| command | `j`/`k` | select a hit |
+| command | `J`/`K` | scroll the result detail |
+| command | `n`/`p` | next / previous prompt history |
+| command | `x` | clear the query |
+| typing | `Esc` | back to command mode |
+| typing | `Enter` | run the query |
+| typing | `↑`/`↓` | recall prompt history |
+
+RAG mode shows the production path (gate → extracted query → filtered hits →
+injected context); BM25 mode shows raw retrieval. Simulator runs never write
+`rag.jsonl`.
+
+Colors are semantic tokens defined once in `src/palette.rs`: green for healthy
+state, yellow for gated or slow, red for failures, cyan for labels, magenta for
+categories, and dim for metadata. Every colored state is also carried by a word
+or symbol, so `NO_COLOR=1` stays fully readable.
 
 The latest 500 check results are kept in `~/.local/state/kmd/checks.jsonl`.
 Successful `eval`, `util`, and `ab` runs are kept in
@@ -91,6 +124,8 @@ already consume `qmd search --json`.
 - `src/bm25.rs` — tantivy index, dual ko/en fields, search + snippets
 - `src/output.rs` — qmd-compatible JSON / CLI output
 - `src/dashboard.rs` — operations TUI, JSON snapshot, checks and evaluation history
+- `src/dashboard_simulator.rs` — Simulator tab: query input, worker thread, result panes
+- `src/palette.rs` — semantic color tokens shared by the TUI (honors `NO_COLOR`)
 - `src/evaluation_log.rs` — bounded history for successful L1/L2/L3 evaluation runs
 - `src/eval.rs` — L1 retrieval eval (`kmd eval`): known-item + gold
 - `src/util.rs` — L2 injection utilization (`kmd util`)

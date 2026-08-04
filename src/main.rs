@@ -16,6 +16,7 @@ mod learnings;
 mod locality;
 mod output;
 mod pageindex;
+mod palette;
 mod rag;
 mod scan;
 mod sim;
