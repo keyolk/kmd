@@ -1,10 +1,11 @@
 //! Operations dashboard for kmd runtime state, activity, journal, RAG, and checks.
 
+use crate::palette;
 use anyhow::{Context, Result};
 use chrono::{Local, Utc};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use ratatui::prelude::*;
-use ratatui::widgets::{Block, Borders, Paragraph, Tabs, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph, Tabs, Wrap};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::Write;
@@ -64,7 +65,7 @@ const TAB_GUIDES: &[TabGuide] = &[
     TabGuide {
         purpose: "Run real queries against the local index without writing logs.",
         source: "RAG gate/filter/context pipeline or raw BM25 retrieval",
-        action: "Enter runs · Alt-m changes mode · ↑/↓ recalls prompt history",
+        action: "i types · Enter runs · m switches mode · ? lists every key",
     },
 ];
 
@@ -489,18 +490,30 @@ struct App {
     simulator: crate::dashboard_simulator::SimulatorState,
     last_refresh: Instant,
     message: String,
+    message_style: Style,
+    show_help: bool,
 }
 
 impl App {
     fn refresh(&mut self) {
         match snapshot() {
             Ok(snapshot) => {
+                let errors = snapshot.errors.len();
                 self.snapshot = snapshot;
                 self.last_refresh = Instant::now();
-                self.message = "refreshed".to_string();
+                if errors == 0 {
+                    self.set_message("refreshed".to_string(), palette::muted());
+                } else {
+                    self.set_message(format!("refreshed with {errors} error(s)"), palette::warn());
+                }
             }
-            Err(error) => self.message = format!("refresh failed: {error}"),
+            Err(error) => self.set_message(format!("refresh failed: {error}"), palette::failure()),
         }
+    }
+
+    fn set_message(&mut self, message: String, style: Style) {
+        self.message = message;
+        self.message_style = style;
     }
 
     fn select_tab(&mut self, tab: usize) {
@@ -509,85 +522,216 @@ impl App {
     }
 }
 
-fn state_badge(ok: bool) -> &'static str {
-    if ok { "● OK" } else { "● FAIL" }
+/// `● OK` / `● FAIL` — the word carries the state so monochrome stays readable.
+fn state_badge(ok: bool) -> Span<'static> {
+    Span::styled(
+        if ok { "● OK" } else { "● FAIL" }.to_string(),
+        palette::state(ok),
+    )
 }
 
-fn overview_text(snapshot: &DashboardSnapshot) -> String {
+fn section(title: &str) -> Line<'static> {
+    Line::from(Span::styled(title.to_string(), palette::heading()))
+}
+
+fn field(name: &str, mut spans: Vec<Span<'static>>) -> Line<'static> {
+    let mut line = vec![
+        Span::raw("  "),
+        Span::styled(format!("{name:<12}"), palette::label()),
+    ];
+    line.append(&mut spans);
+    Line::from(line)
+}
+
+/// Injection rate thresholds mirror how the operator reads the RAG tab: above
+/// half the searched prompts is healthy, a quarter is worth a look, below that
+/// means retrieval is mostly wasted work.
+fn rate_style(pct: f64) -> Style {
+    if pct >= 50.0 {
+        palette::success()
+    } else if pct >= 25.0 {
+        palette::warn()
+    } else {
+        palette::failure()
+    }
+}
+
+fn latency_style(ms: u64) -> Style {
+    if ms <= 300 {
+        palette::success()
+    } else if ms <= 1000 {
+        palette::warn()
+    } else {
+        palette::failure()
+    }
+}
+
+fn overview_lines(snapshot: &DashboardSnapshot) -> Vec<Line<'static>> {
     let runtime = &snapshot.runtime;
+    let hooks_ok = runtime.hooks_installed == runtime.hooks_total;
     let passing_streak = snapshot
         .checks
         .iter()
         .take_while(|run| run.passed == run.total)
         .count();
-    let check_status = snapshot
-        .checks
-        .first()
-        .map(|run| {
-            format!(
-                "{} {}/{} · {} · streak {}",
-                state_badge(run.passed == run.total),
-                run.passed,
-                run.total,
-                run.timestamp,
-                passing_streak
-            )
-        })
-        .unwrap_or_else(|| "not run (press t)".to_string());
-    let evaluation_status = snapshot
-        .evaluations
-        .first()
-        .map(|run| format!("{} · {} · {}", run.kind, run.summary, run.timestamp))
-        .unwrap_or_else(|| "not run".to_string());
-    let mut output = format!(
-        "Runtime\n  {:<12} {}\n  {:<12} {}/{} installed\n  {:<12} {} active / {} dirty\n  {:<12} {}\n  {:<12} {}\n\nKnowledge\n  {:<12} {} sessions / {} projects (7d)\n  {:<12} {} live cards (24h)\n  {:<12} {} prompts / {:.0}% injection (7d)\n  {:<12} median {}ms / p95 {}ms\n  {:<12} {}\n",
-        "daemon",
-        state_badge(runtime.daemon_online),
+
+    let mut lines = vec![section("Runtime")];
+    lines.push(field("daemon", vec![state_badge(runtime.daemon_online)]));
+    lines.push(field(
         "hooks",
-        runtime.hooks_installed,
-        runtime.hooks_total,
+        vec![
+            Span::styled(
+                format!("{}/{}", runtime.hooks_installed, runtime.hooks_total),
+                palette::state(hooks_ok),
+            ),
+            Span::styled(" installed".to_string(), palette::muted()),
+        ],
+    ));
+    lines.push(field(
         "documents",
-        runtime.documents,
-        runtime.dirty_documents,
+        vec![
+            Span::styled(runtime.documents.to_string(), palette::strong()),
+            Span::styled(" active / ".to_string(), palette::muted()),
+            Span::styled(
+                runtime.dirty_documents.to_string(),
+                palette::state(runtime.dirty_documents == 0),
+            ),
+            Span::styled(" dirty".to_string(), palette::muted()),
+        ],
+    ));
+    lines.push(field(
         "socket",
-        runtime.daemon_socket,
-        "self-check",
-        check_status,
-        "journal",
-        snapshot.journal.session_count,
-        snapshot.journal.project_count,
-        "activity",
-        snapshot.activity.len(),
-        "RAG",
-        snapshot.rag.total,
-        snapshot.rag.injection_rate_pct,
-        "latency",
-        snapshot.rag.median_latency_ms,
-        snapshot.rag.p95_latency_ms,
-        "evaluation",
-        evaluation_status,
-    );
-    output.push_str("\nCollections\n");
-    for collection in &runtime.collections {
-        output.push_str(&format!(
-            "  {:<20} {:>6}  {}\n",
-            collection.name, collection.documents, collection.path
-        ));
+        vec![Span::styled(
+            runtime.daemon_socket.clone(),
+            palette::muted(),
+        )],
+    ));
+    match snapshot.checks.first() {
+        Some(run) => lines.push(field(
+            "self-check",
+            vec![
+                state_badge(run.passed == run.total),
+                Span::raw(" "),
+                Span::styled(
+                    format!("{}/{}", run.passed, run.total),
+                    palette::state(run.passed == run.total),
+                ),
+                Span::styled(format!(" · {} · ", run.timestamp), palette::muted()),
+                Span::styled(format!("streak {passing_streak}"), palette::value()),
+            ],
+        )),
+        None => lines.push(field(
+            "self-check",
+            vec![Span::styled(
+                "not run (press t)".to_string(),
+                palette::warn(),
+            )],
+        )),
     }
+
+    lines.push(Line::default());
+    lines.push(section("Knowledge"));
+    lines.push(field(
+        "journal",
+        vec![
+            Span::styled(
+                snapshot.journal.session_count.to_string(),
+                palette::strong(),
+            ),
+            Span::styled(" sessions / ".to_string(), palette::muted()),
+            Span::styled(
+                snapshot.journal.project_count.to_string(),
+                palette::strong(),
+            ),
+            Span::styled(" projects (7d)".to_string(), palette::muted()),
+        ],
+    ));
+    lines.push(field(
+        "activity",
+        vec![
+            Span::styled(snapshot.activity.len().to_string(), palette::strong()),
+            Span::styled(" live cards (24h)".to_string(), palette::muted()),
+        ],
+    ));
+    lines.push(field(
+        "RAG",
+        vec![
+            Span::styled(snapshot.rag.total.to_string(), palette::strong()),
+            Span::styled(" prompts / ".to_string(), palette::muted()),
+            Span::styled(
+                format!("{:.0}%", snapshot.rag.injection_rate_pct),
+                rate_style(snapshot.rag.injection_rate_pct),
+            ),
+            Span::styled(" injection (7d)".to_string(), palette::muted()),
+        ],
+    ));
+    lines.push(field(
+        "latency",
+        vec![
+            Span::styled("median ".to_string(), palette::muted()),
+            Span::styled(
+                format!("{}ms", snapshot.rag.median_latency_ms),
+                latency_style(snapshot.rag.median_latency_ms),
+            ),
+            Span::styled(" · p95 ".to_string(), palette::muted()),
+            Span::styled(
+                format!("{}ms", snapshot.rag.p95_latency_ms),
+                latency_style(snapshot.rag.p95_latency_ms),
+            ),
+        ],
+    ));
+    match snapshot.evaluations.first() {
+        Some(run) => lines.push(field(
+            "evaluation",
+            vec![
+                Span::styled(run.kind.clone(), palette::accent()),
+                Span::styled(" · ".to_string(), palette::muted()),
+                Span::styled(run.summary.clone(), palette::value()),
+                Span::styled(format!(" · {}", run.timestamp), palette::muted()),
+            ],
+        )),
+        None => lines.push(field(
+            "evaluation",
+            vec![Span::styled("not run".to_string(), palette::warn())],
+        )),
+    }
+
+    lines.push(Line::default());
+    lines.push(section("Collections"));
+    for collection in &runtime.collections {
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(format!("{:<20}", collection.name), palette::label()),
+            Span::styled(format!("{:>6}", collection.documents), palette::strong()),
+            Span::raw("  "),
+            Span::styled(collection.path.clone(), palette::muted()),
+        ]));
+    }
+
     if !snapshot.errors.is_empty() {
-        output.push_str("\nErrors\n");
+        lines.push(Line::default());
+        lines.push(Line::from(Span::styled(
+            "Errors".to_string(),
+            palette::failure().add_modifier(Modifier::BOLD),
+        )));
         for error in &snapshot.errors {
-            output.push_str(&format!("  • {error}\n"));
+            lines.push(Line::from(vec![
+                Span::styled("  • ".to_string(), palette::failure()),
+                Span::styled(error.clone(), palette::failure()),
+            ]));
         }
     }
-    output
+    lines
 }
 
-fn activity_text(snapshot: &DashboardSnapshot) -> String {
+fn activity_lines(snapshot: &DashboardSnapshot) -> Vec<Line<'static>> {
     if snapshot.activity.is_empty() {
-        return "최근 24시간 activity가 없습니다.".to_string();
+        return vec![Line::from(Span::styled(
+            "최근 24시간 activity가 없습니다.".to_string(),
+            palette::muted(),
+        ))];
     }
-    let mut output = String::new();
+    let mut lines = Vec::new();
     for card in &snapshot.activity {
         let time = chrono::DateTime::parse_from_rfc3339(&card.updated_at)
             .map(|value| {
@@ -598,65 +742,123 @@ fn activity_text(snapshot: &DashboardSnapshot) -> String {
             })
             .unwrap_or_else(|_| card.updated_at.clone());
         let id: String = card.session_id.chars().take(8).collect();
-        output.push_str(&format!(
-            "● {}  {:<16} {}\n  {}\n",
-            time,
-            card.repo.as_deref().unwrap_or("(no repo)"),
-            id,
-            card.summary
-        ));
+        lines.push(Line::from(vec![
+            Span::styled("● ".to_string(), palette::success()),
+            Span::styled(time, palette::label()),
+            Span::raw("  "),
+            Span::styled(
+                format!("{:<16}", card.repo.as_deref().unwrap_or("(no repo)")),
+                palette::accent(),
+            ),
+            Span::styled(id, palette::muted()),
+        ]));
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(card.summary.clone(), palette::value()),
+        ]));
         if card.latest_user != card.summary {
-            output.push_str(&format!("  현재: {}\n", card.latest_user));
+            lines.push(Line::from(vec![
+                Span::styled("  현재: ".to_string(), palette::label()),
+                Span::styled(card.latest_user.clone(), palette::value()),
+            ]));
         }
         if !card.latest_assistant.is_empty() {
-            output.push_str(&format!("  결과: {}\n", card.latest_assistant));
+            lines.push(Line::from(vec![
+                Span::styled("  결과: ".to_string(), palette::label()),
+                Span::styled(card.latest_assistant.clone(), palette::value()),
+            ]));
         }
-        output.push_str(&format!("  cwd: {}\n\n", card.cwd));
+        lines.push(Line::from(vec![
+            Span::styled("  cwd: ".to_string(), palette::muted()),
+            Span::styled(card.cwd.clone(), palette::muted()),
+        ]));
+        lines.push(Line::default());
     }
-    output
+    lines
 }
 
-fn rag_text(snapshot: &DashboardSnapshot) -> String {
+fn rag_lines(snapshot: &DashboardSnapshot) -> Vec<Line<'static>> {
     let rag = &snapshot.rag;
-    let mut output = format!(
-        "Last 7 days\n  total {} · searched {} · gated {} · injected {} ({:.0}%)\n  latency median {}ms · p95 {}ms\n\nRecent prompts\n",
-        rag.total,
-        rag.searched,
-        rag.gated,
-        rag.injected,
-        rag.injection_rate_pct,
-        rag.median_latency_ms,
-        rag.p95_latency_ms
-    );
+    let mut lines = vec![
+        section("Last 7 days"),
+        Line::from(vec![
+            Span::styled("  total ".to_string(), palette::muted()),
+            Span::styled(rag.total.to_string(), palette::strong()),
+            Span::styled(" · searched ".to_string(), palette::muted()),
+            Span::styled(rag.searched.to_string(), palette::value()),
+            Span::styled(" · gated ".to_string(), palette::muted()),
+            Span::styled(rag.gated.to_string(), palette::warn()),
+            Span::styled(" · injected ".to_string(), palette::muted()),
+            Span::styled(rag.injected.to_string(), palette::success()),
+            Span::raw(" "),
+            Span::styled(
+                format!("({:.0}%)", rag.injection_rate_pct),
+                rate_style(rag.injection_rate_pct),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("  latency median ".to_string(), palette::muted()),
+            Span::styled(
+                format!("{}ms", rag.median_latency_ms),
+                latency_style(rag.median_latency_ms),
+            ),
+            Span::styled(" · p95 ".to_string(), palette::muted()),
+            Span::styled(
+                format!("{}ms", rag.p95_latency_ms),
+                latency_style(rag.p95_latency_ms),
+            ),
+        ]),
+        Line::default(),
+        section("Recent prompts"),
+    ];
     for entry in &rag.recent {
-        let status = if entry.stage == "gated" {
-            format!("GATED:{}", entry.gate_reason.as_deref().unwrap_or("?"))
+        let (status, status_style) = if entry.stage == "gated" {
+            (
+                format!("GATED:{}", entry.gate_reason.as_deref().unwrap_or("?")),
+                palette::warn(),
+            )
         } else if entry.injected > 0 {
-            format!("INJ:{}", entry.injected)
+            (format!("INJ:{}", entry.injected), palette::success())
         } else {
-            "MISS".to_string()
+            ("MISS".to_string(), palette::muted())
         };
         let prompt: String = entry.prompt.chars().take(100).collect();
-        output.push_str(&format!(
-            "  {:<16} {:>5}ms  {}\n    {}\n",
-            status, entry.latency_ms, entry.ts, prompt
-        ));
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(format!("{status:<16}"), status_style),
+            Span::styled(
+                format!("{:>5}ms", entry.latency_ms),
+                latency_style(entry.latency_ms),
+            ),
+            Span::styled(format!("  {}", entry.ts), palette::muted()),
+        ]));
+        lines.push(Line::from(vec![
+            Span::raw("    "),
+            Span::styled(prompt, palette::value()),
+        ]));
     }
-    output
+    lines
 }
 
-fn evaluations_text(snapshot: &DashboardSnapshot) -> String {
+fn evaluations_lines(snapshot: &DashboardSnapshot) -> Vec<Line<'static>> {
     if snapshot.evaluations.is_empty() {
-        return "아직 평가 기록이 없습니다. kmd eval, kmd util, 또는 kmd ab를 실행하세요."
-            .to_string();
+        return vec![Line::from(Span::styled(
+            "아직 평가 기록이 없습니다. kmd eval, kmd util, 또는 kmd ab를 실행하세요.".to_string(),
+            palette::warn(),
+        ))];
     }
-    let mut output =
-        String::from("Successful L1 retrieval, L2 utilization, and L3 A/B runs · latest first\n\n");
+    let mut lines = vec![
+        section("Successful L1 retrieval, L2 utilization, and L3 A/B runs · latest first"),
+        Line::default(),
+    ];
     for run in &snapshot.evaluations {
-        output.push_str(&format!(
-            "● {}  {:<18} {}\n",
-            run.timestamp, run.kind, run.summary
-        ));
+        lines.push(Line::from(vec![
+            Span::styled("● ".to_string(), palette::accent()),
+            Span::styled(run.timestamp.clone(), palette::muted()),
+            Span::raw("  "),
+            Span::styled(format!("{:<18}", run.kind), palette::accent()),
+            Span::styled(run.summary.clone(), palette::value()),
+        ]));
         if let Some(object) = run.metrics.as_object() {
             let details = object
                 .iter()
@@ -665,55 +867,159 @@ fn evaluations_text(snapshot: &DashboardSnapshot) -> String {
                 .map(|(key, value)| format!("{key}={value}"))
                 .collect::<Vec<_>>();
             if !details.is_empty() {
-                output.push_str(&format!("  {}\n", details.join(" · ")));
+                lines.push(Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled(details.join(" · "), palette::muted()),
+                ]));
             }
         }
-        output.push('\n');
+        lines.push(Line::default());
     }
-    output
+    lines
 }
 
-fn checks_text(snapshot: &DashboardSnapshot) -> String {
+fn checks_lines(snapshot: &DashboardSnapshot) -> Vec<Line<'static>> {
     if snapshot.checks.is_empty() {
-        return "아직 self-check 기록이 없습니다. t를 눌러 실행하세요.".to_string();
+        return vec![Line::from(Span::styled(
+            "아직 self-check 기록이 없습니다. t를 눌러 실행하세요.".to_string(),
+            palette::warn(),
+        ))];
     }
-    let mut output = String::new();
+    let mut lines = Vec::new();
     for run in &snapshot.checks {
-        output.push_str(&format!(
-            "{}  {}/{} passed  {}ms\n",
-            run.timestamp, run.passed, run.total, run.duration_ms
-        ));
+        let ok = run.passed == run.total;
+        lines.push(Line::from(vec![
+            Span::styled(run.timestamp.clone(), palette::muted()),
+            Span::raw("  "),
+            Span::styled(
+                format!("{}/{} passed", run.passed, run.total),
+                palette::state(ok),
+            ),
+            Span::styled(format!("  {}ms", run.duration_ms), palette::muted()),
+        ]));
         for item in &run.checks {
-            output.push_str(&format!(
-                "  {} {:<16} {}\n",
-                if item.ok { "✓" } else { "✗" },
-                item.name,
-                item.detail
-            ));
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(
+                    if item.ok { "✓" } else { "✗" }.to_string(),
+                    palette::state(item.ok),
+                ),
+                Span::raw(" "),
+                Span::styled(format!("{:<16}", item.name), palette::label()),
+                Span::styled(
+                    item.detail.clone(),
+                    if item.ok {
+                        palette::value()
+                    } else {
+                        palette::failure()
+                    },
+                ),
+            ]));
         }
-        output.push('\n');
+        lines.push(Line::default());
     }
-    output
+    lines
 }
 
-fn body_text(app: &App) -> String {
+/// Colorize `journal::render` output by structural prefix so the journal tab
+/// gains hierarchy without duplicating the renderer.
+fn journal_lines(rendered: &str) -> Vec<Line<'static>> {
+    rendered
+        .lines()
+        .map(|raw| {
+            let trimmed = raw.trim_start();
+            let indent = raw.len() - trimmed.len();
+            let style = if raw.starts_with("kmd journal") {
+                palette::heading()
+            } else if raw.starts_with("anchor:") {
+                palette::muted()
+            } else if indent == 0 && !trimmed.is_empty() {
+                palette::heading()
+            } else if indent == 2 {
+                palette::accent()
+            } else if trimmed.starts_with('●') {
+                palette::success()
+            } else if trimmed.starts_with('○') {
+                palette::value()
+            } else if trimmed.starts_with("cwd:")
+                || trimmed.starts_with("worktree:")
+                || trimmed.starts_with("workspace:")
+            {
+                palette::muted()
+            } else if trimmed.starts_with("현재:") {
+                palette::label()
+            } else {
+                palette::value()
+            };
+            Line::from(Span::styled(raw.to_string(), style))
+        })
+        .collect()
+}
+
+fn body_lines(app: &App) -> Vec<Line<'static>> {
     match app.tab {
-        0 => overview_text(&app.snapshot),
-        1 => activity_text(&app.snapshot),
-        2 => crate::journal::render(&app.snapshot.journal),
-        3 => rag_text(&app.snapshot),
-        4 => evaluations_text(&app.snapshot),
-        5 => checks_text(&app.snapshot),
-        _ => String::new(),
+        0 => overview_lines(&app.snapshot),
+        1 => activity_lines(&app.snapshot),
+        2 => journal_lines(&crate::journal::render(&app.snapshot.journal)),
+        3 => rag_lines(&app.snapshot),
+        4 => evaluations_lines(&app.snapshot),
+        5 => checks_lines(&app.snapshot),
+        _ => Vec::new(),
     }
 }
 
-fn color_style(color: Color) -> Style {
-    if std::env::var_os("NO_COLOR").is_some() {
-        Style::default()
-    } else {
-        Style::default().fg(color)
-    }
+const HELP_ROWS: &[(&str, &str)] = &[
+    ("1-7", "jump to a tab"),
+    ("Tab / Shift-Tab", "next / previous tab"),
+    ("h l  ← →", "previous / next tab"),
+    ("j k  ↑ ↓", "scroll (Simulator: select hit)"),
+    ("J K", "Simulator: scroll result detail"),
+    ("PgUp PgDn", "scroll a page"),
+    ("g G", "jump to top / bottom"),
+    ("r", "refresh the snapshot"),
+    ("t", "run the self-check suite"),
+    ("i or /", "Simulator: start typing a query"),
+    ("Esc", "Simulator: stop typing · otherwise quit"),
+    ("Enter", "Simulator: run the query"),
+    ("m", "Simulator: RAG pipeline ⇄ BM25 search"),
+    ("x", "Simulator: clear the query"),
+    ("n p", "Simulator: next / previous prompt history"),
+    ("?", "toggle this help"),
+    ("q", "quit"),
+];
+
+fn draw_help(frame: &mut Frame, area: Rect) {
+    let width = area.width.saturating_sub(4).min(64).max(20);
+    let height = (HELP_ROWS.len() as u16 + 2).min(area.height.saturating_sub(2).max(3));
+    let popup = Rect {
+        x: area.x + (area.width.saturating_sub(width)) / 2,
+        y: area.y + (area.height.saturating_sub(height)) / 2,
+        width,
+        height,
+    };
+    let rows = HELP_ROWS
+        .iter()
+        .map(|(keys, description)| {
+            Line::from(vec![
+                Span::raw(" "),
+                Span::styled(format!("{keys:<16}"), palette::label()),
+                Span::styled((*description).to_string(), palette::value()),
+            ])
+        })
+        .collect::<Vec<_>>();
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Paragraph::new(rows).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(palette::border_focus())
+                .title(Span::styled(
+                    " keys · ? or Esc closes ".to_string(),
+                    palette::heading(),
+                )),
+        ),
+        popup,
+    );
 }
 
 fn draw(frame: &mut Frame, app: &App) {
@@ -727,31 +1033,44 @@ fn draw(frame: &mut Frame, app: &App) {
     let titles = TABS
         .iter()
         .enumerate()
-        .map(|(index, title)| Line::from(format!(" {}:{} ", index + 1, title)))
+        .map(|(index, title)| {
+            Line::from(vec![
+                Span::styled(format!(" {}:", index + 1), palette::muted()),
+                Span::raw(format!("{title} ")),
+            ])
+        })
         .collect::<Vec<_>>();
     let tabs = Tabs::new(titles)
         .select(app.tab)
-        .highlight_style(color_style(Color::Cyan).bold())
+        .style(palette::value())
+        .highlight_style(palette::heading().add_modifier(Modifier::REVERSED))
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(format!(" kmd dashboard · {} ", app.snapshot.generated_at)),
+                .border_style(palette::border())
+                .title(Line::from(vec![
+                    Span::styled(" kmd dashboard ".to_string(), palette::heading()),
+                    Span::styled(
+                        format!("· {} ", app.snapshot.generated_at),
+                        palette::muted(),
+                    ),
+                ])),
         );
     frame.render_widget(tabs, areas[0]);
 
     let guide = &TAB_GUIDES[app.tab];
     let guide_text = Text::from(vec![
         Line::from(vec![
-            Span::styled("Purpose  ", color_style(Color::Cyan).bold()),
-            Span::raw(guide.purpose),
+            Span::styled("Purpose  ", palette::heading()),
+            Span::styled(guide.purpose.to_string(), palette::value()),
         ]),
         Line::from(vec![
-            Span::styled("Data     ", color_style(Color::DarkGray)),
-            Span::raw(guide.source),
+            Span::styled("Data     ", palette::label()),
+            Span::styled(guide.source.to_string(), palette::muted()),
         ]),
         Line::from(vec![
-            Span::styled("Action   ", color_style(Color::DarkGray)),
-            Span::raw(guide.action),
+            Span::styled("Action   ", palette::label()),
+            Span::styled(guide.action.to_string(), palette::muted()),
         ]),
     ]);
     frame.render_widget(
@@ -760,76 +1079,91 @@ fn draw(frame: &mut Frame, app: &App) {
     );
 
     if app.tab == SIMULATOR_TAB {
-        crate::dashboard_simulator::draw(
-            frame,
-            areas[2],
-            &app.simulator,
-            color_style(Color::DarkGray),
-        );
+        crate::dashboard_simulator::draw(frame, areas[2], &app.simulator);
     } else {
-        let body = Paragraph::new(body_text(app))
+        let body = Paragraph::new(body_lines(app))
             .scroll((app.scroll, 0))
             .wrap(Wrap { trim: false })
             .block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .title(format!(" {} · scroll {} ", TABS[app.tab], app.scroll)),
+                    .border_style(palette::border_focus())
+                    .title(Line::from(vec![
+                        Span::styled(format!(" {} ", TABS[app.tab]), palette::heading()),
+                        Span::styled(format!("· scroll {} ", app.scroll), palette::muted()),
+                    ])),
             );
         frame.render_widget(body, areas[2]);
     }
 
-    let help_text = if app.tab == SIMULATOR_TAB {
-        format!(
-            "Tab: next  Shift-Tab/Esc: leave  Enter: run  Alt-m: mode  ↑/↓: history  Alt-j/k: hit  PgUp/PgDn: detail  {}",
-            app.message
-        )
+    let hints = if app.tab == SIMULATOR_TAB {
+        if app.simulator.typing() {
+            "typing · Esc: stop  Enter: run  ↑/↓: history"
+        } else {
+            "i: type  Enter: run  m: mode  j/k: hit  J/K: detail  x: clear  ?: keys"
+        }
     } else {
-        format!(
-            "←/→ or 1-7: tab  j/k ↑/↓ PgUp/PgDn: scroll  r: refresh  t: self-check  q/Esc: quit  {}",
-            app.message
-        )
+        "1-7/Tab: tab  j/k: scroll  g/G: top/bottom  r: refresh  t: self-check  ?: keys  q: quit"
     };
-    frame.render_widget(
-        Paragraph::new(help_text).style(color_style(Color::DarkGray)),
-        areas[3],
-    );
+    let mut footer = vec![Span::styled(hints.to_string(), palette::muted())];
+    if !app.message.is_empty() {
+        footer.push(Span::styled("  ·  ".to_string(), palette::muted()));
+        footer.push(Span::styled(app.message.clone(), app.message_style));
+    }
+    frame.render_widget(Paragraph::new(Line::from(footer)), areas[3]);
+
+    if app.show_help {
+        draw_help(frame, frame.area());
+    }
 }
 
 fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) -> Result<bool> {
-    if app.tab == SIMULATOR_TAB {
-        match (key.code, key.modifiers) {
-            (KeyCode::Tab, _) => app.select_tab(app.tab + 1),
-            (KeyCode::BackTab, _) | (KeyCode::Esc, _) => app.select_tab(0),
-            _ => {
-                app.simulator.handle_key(key);
-            }
-        }
+    // Terminal-reserved chords (Ctrl/Alt) are deliberately unbound: the
+    // Simulator uses a command/typing mode split instead, so plain letters stay
+    // available as commands without stealing keys the terminal owns.
+    if crate::dashboard_simulator::is_reserved_chord(&key) {
+        return Ok(false);
+    }
+    if app.show_help {
+        app.show_help = false;
+        return Ok(false);
+    }
+    if app.tab == SIMULATOR_TAB && app.simulator.typing() {
+        app.simulator.handle_typing_key(key);
         return Ok(false);
     }
 
-    match (key.code, key.modifiers) {
-        (KeyCode::Char('q'), _) | (KeyCode::Esc, _) => return Ok(true),
-        (KeyCode::Right, _) | (KeyCode::Char('l'), _) | (KeyCode::Tab, _) => {
-            app.select_tab(app.tab + 1)
-        }
-        (KeyCode::Left, _) | (KeyCode::Char('h'), _) | (KeyCode::BackTab, _) => {
+    match key.code {
+        KeyCode::Char('q') | KeyCode::Esc => return Ok(true),
+        KeyCode::Char('?') => app.show_help = true,
+        KeyCode::Right | KeyCode::Char('l') | KeyCode::Tab => app.select_tab(app.tab + 1),
+        KeyCode::Left | KeyCode::Char('h') | KeyCode::BackTab => {
             app.select_tab((app.tab + TABS.len() - 1) % TABS.len())
         }
-        (KeyCode::Char(value @ '1'..='7'), _) => app.select_tab((value as usize) - ('1' as usize)),
-        (KeyCode::Down, _) | (KeyCode::Char('j'), _) => app.scroll = app.scroll.saturating_add(1),
-        (KeyCode::Up, _) | (KeyCode::Char('k'), _) => app.scroll = app.scroll.saturating_sub(1),
-        (KeyCode::PageDown, _) => app.scroll = app.scroll.saturating_add(10),
-        (KeyCode::PageUp, _) => app.scroll = app.scroll.saturating_sub(10),
-        (KeyCode::Home, _) => app.scroll = 0,
-        (KeyCode::Char('r'), _) => app.refresh(),
-        (KeyCode::Char('t'), _) => match run_checks() {
+        KeyCode::Char(value @ '1'..='7') => app.select_tab((value as usize) - ('1' as usize)),
+        KeyCode::Char('r') => app.refresh(),
+        KeyCode::Char('t') => match run_checks() {
             Ok(run) => {
                 app.refresh();
-                app.message = format!("self-check: {}/{} passed", run.passed, run.total);
+                app.set_message(
+                    format!("self-check: {}/{} passed", run.passed, run.total),
+                    palette::state(run.passed == run.total),
+                );
                 app.select_tab(5);
             }
-            Err(error) => app.message = format!("self-check failed: {error}"),
+            Err(error) => {
+                app.set_message(format!("self-check failed: {error}"), palette::failure())
+            }
         },
+        _ if app.tab == SIMULATOR_TAB => {
+            app.simulator.handle_command_key(key);
+        }
+        KeyCode::Down | KeyCode::Char('j') => app.scroll = app.scroll.saturating_add(1),
+        KeyCode::Up | KeyCode::Char('k') => app.scroll = app.scroll.saturating_sub(1),
+        KeyCode::PageDown => app.scroll = app.scroll.saturating_add(10),
+        KeyCode::PageUp => app.scroll = app.scroll.saturating_sub(10),
+        KeyCode::Char('g') | KeyCode::Home => app.scroll = 0,
+        KeyCode::Char('G') | KeyCode::End => app.scroll = u16::MAX / 2,
         _ => {}
     }
     Ok(false)
@@ -914,12 +1248,15 @@ pub fn run(json: bool, check_only: bool) -> Result<()> {
         simulator: crate::dashboard_simulator::SimulatorState::new(),
         last_refresh: Instant::now(),
         message: "auto-refresh 5s".to_string(),
+        message_style: palette::muted(),
+        show_help: false,
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crossterm::event::{KeyEvent, KeyModifiers};
 
     #[test]
     fn rag_summary_handles_empty_log() {
@@ -977,9 +1314,21 @@ mod tests {
         assert!(error.to_string().contains("line 1"));
     }
 
-    #[test]
-    fn renders_dashboard_tabs_and_checks() {
-        let snapshot = DashboardSnapshot {
+    fn test_app() -> App {
+        App {
+            tab: 0,
+            scroll: 0,
+            snapshot: sample_snapshot(),
+            simulator: crate::dashboard_simulator::SimulatorState::new(),
+            last_refresh: Instant::now(),
+            message: "ready".into(),
+            message_style: palette::muted(),
+            show_help: false,
+        }
+    }
+
+    fn sample_snapshot() -> DashboardSnapshot {
+        DashboardSnapshot {
             generated_at: "2026-08-01T00:00:00Z".into(),
             cwd: "/repo".into(),
             runtime: RuntimeStatus {
@@ -1026,15 +1375,12 @@ mod tests {
             }],
             checks: vec![check_run()],
             errors: Vec::new(),
-        };
-        let mut app = App {
-            tab: 0,
-            scroll: 0,
-            snapshot,
-            simulator: crate::dashboard_simulator::SimulatorState::new(),
-            last_refresh: Instant::now(),
-            message: "ready".into(),
-        };
+        }
+    }
+
+    #[test]
+    fn renders_dashboard_tabs_and_checks() {
+        let mut app = test_app();
         let backend = ratatui::backend::TestBackend::new(120, 40);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|frame| draw(frame, &app)).unwrap();
@@ -1075,5 +1421,105 @@ mod tests {
             .collect::<String>();
         assert!(checks.contains("1/1 passed"));
         assert!(checks.contains("42 active, 0 dirty"));
+    }
+
+    #[test]
+    fn overview_colors_state_and_thresholds() {
+        let lines = overview_lines(&sample_snapshot());
+        let styles: Vec<Style> = lines
+            .iter()
+            .flat_map(|line| line.spans.iter().map(|span| span.style))
+            .collect();
+
+        assert!(
+            styles.contains(&palette::success()),
+            "healthy state should use the success token"
+        );
+        assert!(
+            styles.contains(&palette::heading()),
+            "sections should use the heading token"
+        );
+        assert!(
+            styles.contains(&palette::muted()),
+            "metadata should use the muted token"
+        );
+    }
+
+    #[test]
+    fn rate_and_latency_thresholds_map_to_tokens() {
+        assert_eq!(rate_style(80.0), palette::success());
+        assert_eq!(rate_style(30.0), palette::warn());
+        assert_eq!(rate_style(5.0), palette::failure());
+
+        assert_eq!(latency_style(120), palette::success());
+        assert_eq!(latency_style(700), palette::warn());
+        assert_eq!(latency_style(2500), palette::failure());
+    }
+
+    #[test]
+    fn failing_check_uses_failure_token() {
+        let mut snapshot = sample_snapshot();
+        snapshot.checks[0].passed = 0;
+        snapshot.checks[0].checks[0].ok = false;
+
+        let styles: Vec<Style> = checks_lines(&snapshot)
+            .iter()
+            .flat_map(|line| line.spans.iter().map(|span| span.style))
+            .collect();
+        assert!(styles.contains(&palette::failure()));
+    }
+
+    /// Ctrl/Alt chords collide with the terminal and the tmux prefix, so the
+    /// dashboard must never consume them.
+    #[test]
+    fn reserved_chords_are_not_bound() {
+        for (code, modifiers) in [
+            (KeyCode::Char('c'), KeyModifiers::CONTROL),
+            (KeyCode::Char('u'), KeyModifiers::CONTROL),
+            (KeyCode::Char('m'), KeyModifiers::ALT),
+            (KeyCode::Char('j'), KeyModifiers::ALT),
+        ] {
+            let mut app = test_app();
+            app.select_tab(SIMULATOR_TAB);
+            app.simulator
+                .handle_command_key(KeyEvent::new(code, modifiers));
+
+            assert_eq!(
+                app.simulator.mode,
+                crate::sim::SimulatorMode::Rag,
+                "{code:?}+{modifiers:?} must not change the retrieval mode"
+            );
+            assert!(
+                !app.simulator.typing(),
+                "{code:?}+{modifiers:?} must not start typing"
+            );
+        }
+    }
+
+    #[test]
+    fn help_overlay_toggles_and_absorbs_the_next_key() {
+        let mut app = test_app();
+        assert!(!handle_key(&mut app, KeyEvent::from(KeyCode::Char('?'))).unwrap());
+        assert!(app.show_help);
+
+        // The next key closes the overlay instead of acting, so `q` cannot quit
+        // while the operator is still reading the keymap.
+        assert!(!handle_key(&mut app, KeyEvent::from(KeyCode::Char('q'))).unwrap());
+        assert!(!app.show_help);
+    }
+
+    #[test]
+    fn typing_mode_keeps_q_out_of_the_quit_path() {
+        let mut app = test_app();
+        app.select_tab(SIMULATOR_TAB);
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('i'))).unwrap();
+        assert!(app.simulator.typing());
+
+        assert!(!handle_key(&mut app, KeyEvent::from(KeyCode::Char('q'))).unwrap());
+        assert_eq!(app.simulator.input, "q");
+
+        handle_key(&mut app, KeyEvent::from(KeyCode::Esc)).unwrap();
+        assert!(!app.simulator.typing());
+        assert!(handle_key(&mut app, KeyEvent::from(KeyCode::Char('q'))).unwrap());
     }
 }
