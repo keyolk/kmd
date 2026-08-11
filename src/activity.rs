@@ -15,14 +15,6 @@ const WINDOW_HOURS: i64 = 24;
 const DEFAULT_LIMIT: usize = 6;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ActivityTurn {
-    pub timestamp: String,
-    pub user: String,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub assistant: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ActivityCard {
     pub session_id: String,
     pub updated_at: String,
@@ -34,8 +26,6 @@ pub struct ActivityCard {
     pub latest_user: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub latest_assistant: String,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub turns: Vec<ActivityTurn>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub files: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -122,26 +112,10 @@ fn collect_text_and_tools(content: &Value, files: &mut Vec<String>) -> Vec<Strin
     }
 }
 
-fn turn_text(text: &str) -> String {
-    text.replace("\r\n", "\n").trim().to_string()
-}
-
-fn append_assistant(turn: &mut ActivityTurn, text: &str) {
-    let text = turn_text(text);
-    if text.is_empty() {
-        return;
-    }
-    if !turn.assistant.is_empty() {
-        turn.assistant.push_str("\n\n");
-    }
-    turn.assistant.push_str(&text);
-}
-
 fn parse_transcript(raw: &str, session_id: &str) -> Option<ActivityCard> {
     let url_re = Regex::new(r#"https?://[^\s<>\)\]\}"']+"#).ok()?;
     let mut users = Vec::new();
     let mut assistants = Vec::new();
-    let mut turns = Vec::new();
     let mut files = Vec::new();
     let mut cwd = String::new();
     let mut latest: Option<DateTime<chrono::FixedOffset>> = None;
@@ -180,11 +154,6 @@ fn parse_transcript(raw: &str, session_id: &str) -> Option<ActivityCard> {
                     .join("\n\n");
                 if !text.is_empty() {
                     users.push(normalize(&text, 280));
-                    turns.push(ActivityTurn {
-                        timestamp: timestamp.to_string(),
-                        user: turn_text(&text),
-                        assistant: String::new(),
-                    });
                 }
             }
             "assistant" => {
@@ -195,9 +164,6 @@ fn parse_transcript(raw: &str, session_id: &str) -> Option<ActivityCard> {
                     .join("\n\n");
                 if !text.is_empty() {
                     assistants.push(normalize(&text, 240));
-                    if let Some(turn) = turns.last_mut() {
-                        append_assistant(turn, &text);
-                    }
                 }
             }
             _ => {}
@@ -236,7 +202,6 @@ fn parse_transcript(raw: &str, session_id: &str) -> Option<ActivityCard> {
         summary,
         latest_user,
         latest_assistant: assistants.last().cloned().unwrap_or_default(),
-        turns,
         files: files
             .into_iter()
             .rev()
@@ -282,36 +247,6 @@ pub fn update_from_transcript(session_id: &str, transcript_path: &Path) -> Resul
         return Ok(false);
     };
     persist_card(&card)
-}
-
-fn transcript_path(session_id: &str) -> Option<PathBuf> {
-    let root = PathBuf::from(std::env::var_os("HOME")?).join(".claude/projects");
-    for project in fs::read_dir(root).ok()?.flatten() {
-        let path = project.path().join(format!("{session_id}.jsonl"));
-        if path.is_file() {
-            return Some(path);
-        }
-    }
-    None
-}
-
-/// Upgrade pre-turn activity cards from their original transcript once. Persisting the
-/// enriched card keeps dashboard refreshes and UserPromptSubmit reads inexpensive.
-pub fn backfill_turns(cards: &mut [ActivityCard]) -> Result<usize> {
-    let mut updated = 0;
-    for card in cards.iter_mut().filter(|card| card.turns.is_empty()) {
-        let Some(path) = transcript_path(&card.session_id) else {
-            continue;
-        };
-        let raw = fs::read_to_string(path)?;
-        let Some(enriched) = parse_transcript(&raw, &card.session_id) else {
-            continue;
-        };
-        persist_card(&enriched)?;
-        *card = enriched;
-        updated += 1;
-    }
-    Ok(updated)
 }
 
 pub fn recent(current_session: &str, current_cwd: &str, limit: usize) -> Result<Vec<ActivityCard>> {
@@ -435,49 +370,6 @@ mod tests {
             vec!["/Users/x/src/sendbird/platform-tools/main.go"]
         );
         assert!(card.latest_assistant.contains("테스트도 통과"));
-        assert_eq!(card.turns.len(), 1);
-        assert_eq!(card.turns[0].user, "Delight region 지원을 마저 구현하자");
-        assert!(card.turns[0].assistant.contains("product 차원을 추가"));
-    }
-
-    #[test]
-    fn associates_each_response_with_its_user_turn() {
-        let raw = r#"
-{"type":"user","sessionId":"abc","cwd":"/repo","timestamp":"2026-08-01T01:00:00Z","message":{"role":"user","content":"첫 번째 요청을 처리해줘"}}
-{"type":"assistant","sessionId":"abc","cwd":"/repo","timestamp":"2026-08-01T01:01:00Z","message":{"role":"assistant","content":[{"type":"text","text":"첫 번째 중간 응답"},{"type":"tool_use","name":"Read","input":{"file_path":"/repo/a.rs"}}]}}
-{"type":"user","sessionId":"abc","cwd":"/repo","timestamp":"2026-08-01T01:01:30Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tool","content":"file body"}]}}
-{"type":"assistant","sessionId":"abc","cwd":"/repo","timestamp":"2026-08-01T01:02:00Z","message":{"role":"assistant","content":"첫 번째 최종 응답"}}
-{"type":"user","sessionId":"abc","cwd":"/repo","timestamp":"2026-08-01T01:03:00Z","message":{"role":"user","content":"두 번째 요청을 처리해줘"}}
-{"type":"assistant","sessionId":"abc","cwd":"/repo","timestamp":"2026-08-01T01:04:00Z","message":{"role":"assistant","content":"두 번째 응답"}}
-"#;
-
-        let card = parse_transcript(raw, "abc").expect("card");
-        assert_eq!(card.turns.len(), 2);
-        assert_eq!(card.turns[0].user, "첫 번째 요청을 처리해줘");
-        assert_eq!(
-            card.turns[0].assistant,
-            "첫 번째 중간 응답\n\n첫 번째 최종 응답"
-        );
-        assert_eq!(card.turns[1].user, "두 번째 요청을 처리해줘");
-        assert_eq!(card.turns[1].assistant, "두 번째 응답");
-    }
-
-    #[test]
-    fn reads_legacy_activity_cards_without_turns() {
-        let raw = r#"{
-            "session_id":"abc",
-            "updated_at":"2026-08-01T01:00:00Z",
-            "updated_epoch":1754010000,
-            "cwd":"/repo",
-            "summary":"요약",
-            "latest_user":"요청",
-            "latest_assistant":"응답"
-        }"#;
-
-        let card: ActivityCard = serde_json::from_str(raw).expect("legacy card");
-        assert!(card.turns.is_empty());
-        assert_eq!(card.latest_user, "요청");
-        assert_eq!(card.latest_assistant, "응답");
     }
 
     #[test]

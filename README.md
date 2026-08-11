@@ -46,9 +46,13 @@ kmd journal --json
 
 | View | Function |
 |---|---|
-| Sessions | Live Claude sessions with the complete user request → Claude response timeline |
+| Sessions | Extracted kmd queries and retrieval results grouped by Claude session |
 | Operations | Runtime, retrieval, evaluation, and self-check health in one scrollable view |
 | Simulator | Real RAG pipeline or raw BM25 queries against the local index |
+
+Sessions reads only `searched` entries from the last seven days of `rag.jsonl`. It shows
+the extracted query, latency/injection metadata, and each hit's path, score, and snippet;
+it does not read or display Claude conversation transcripts.
 
 ### Keys
 
@@ -59,8 +63,8 @@ the full keymap.
 | Key | Action |
 |---|---|
 | `1`–`3`, `Tab`/`Shift-Tab`, `h`/`l`, `←`/`→` | switch view |
-| `j`/`k`, `↑`/`↓` | select a session or scroll Operations |
-| `PgUp`/`PgDn`, `g`/`G` | scroll the current timeline/view |
+| `j`/`k`, `↑`/`↓` | select a query session or scroll Operations |
+| `PgUp`/`PgDn`, `g`/`G` | scroll query results or the current view |
 | `r` | refresh the snapshot |
 | `t` | run the self-check suite |
 | `?` | toggle the keymap overlay |

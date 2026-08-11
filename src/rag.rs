@@ -69,7 +69,7 @@ pub struct RagLogEntry {
     pub latency_ms: u64,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RagHitLog {
     pub file: String,
     pub score: f32,
