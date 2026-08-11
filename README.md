@@ -42,25 +42,22 @@ kmd journal --cwd ~/src/sendbird/soda-k8s/.worktree/cohome --days 14
 kmd journal --json
 ```
 
-`kmd dashboard` provides seven tabs. Every tab includes an in-product summary of
-its purpose, data source, and primary action:
+`kmd dashboard` uses three focused views instead of separate tabs for each data source:
 
-| Tab | Function |
+| View | Function |
 |---|---|
-| Overview | Runtime, hook, index, collection, check, and evaluation health |
-| Activity | Live Claude sessions observed during the last 24 hours |
-| Journal | Date-oriented sessions/learnings ranked by repository locality |
-| RAG | Seven-day gate, injection, miss, and latency history |
-| Evaluations | Persisted L1 retrieval, L2 utilization, and L3 A/B results |
-| Checks | Operational verification history for all local dependencies |
+| Sessions | Live Claude sessions with the complete user request → Claude response timeline |
+| Operations | Runtime, retrieval, evaluation, and self-check health in one scrollable view |
 | Simulator | Real RAG pipeline or raw BM25 queries against the local index |
 
-Use `←`/`→`, `h`/`l`, or `1`–`7` to switch tabs; `j`/`k` or arrow keys to scroll;
-`r` to refresh; and `t` to run self-checks. In Simulator, type a prompt and press
+Use `←`/`→`, `h`/`l`, or `1`–`3` to switch views. In Sessions, use `j`/`k` or
+`↑`/`↓` to select a session and `PgUp`/`PgDn` to scroll its timeline. Use `r` to
+refresh and `t` to run self-checks. In Simulator, type a prompt and press
 `Enter`; `Alt-m` switches between the production RAG path (gate → extracted query →
 filtered hits → injected context) and raw BM25 search, `↑`/`↓` recalls prompt
 history, `Alt-j`/`Alt-k` selects a hit, and `PgUp`/`PgDn` scrolls details. Simulator
-runs do not write `rag.jsonl`.
+runs do not write `rag.jsonl`. The dashboard uses terminal-native semantic colors for
+status and navigation; set `NO_COLOR=1` to keep the same layout without colors.
 
 The latest 500 check results are kept in `~/.local/state/kmd/checks.jsonl`.
 Successful `eval`, `util`, and `ab` runs are kept in

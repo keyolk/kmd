@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use chrono::{Local, Utc};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use ratatui::prelude::*;
-use ratatui::widgets::{Block, Borders, Paragraph, Tabs, Wrap};
+use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Tabs, Wrap};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::Write;
@@ -13,16 +13,10 @@ use std::time::{Duration, Instant};
 
 const REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 const CHECK_HISTORY_LIMIT: usize = 500;
-const TABS: &[&str] = &[
-    "Overview",
-    "Activity",
-    "Journal",
-    "RAG",
-    "Evaluations",
-    "Checks",
-    "Simulator",
-];
-const SIMULATOR_TAB: usize = 6;
+const TABS: &[&str] = &["Sessions", "Operations", "Simulator"];
+const SESSIONS_TAB: usize = 0;
+const OPERATIONS_TAB: usize = 1;
+const SIMULATOR_TAB: usize = 2;
 
 struct TabGuide {
     purpose: &'static str,
@@ -32,34 +26,14 @@ struct TabGuide {
 
 const TAB_GUIDES: &[TabGuide] = &[
     TabGuide {
-        purpose: "Runtime and knowledge health at a glance.",
-        source: "daemon, hooks, store, collections, recent checks/evaluations",
-        action: "r refreshes · t runs the complete self-check suite",
-    },
-    TabGuide {
-        purpose: "What active Claude sessions are currently doing.",
+        purpose: "Inspect each Claude session as a transparent request → response timeline.",
         source: "live transcripts observed during the last 24 hours",
-        action: "use cwd and session prefix to locate the source session",
+        action: "j/k selects a session · PgUp/PgDn scrolls its complete timeline",
     },
     TabGuide {
-        purpose: "Recent work grouped by date and ranked by repository locality.",
-        source: "persisted learnings plus live session activity",
-        action: "compare current cwd with nearby project/session entries",
-    },
-    TabGuide {
-        purpose: "How UserPromptSubmit retrieval behaves in real usage.",
-        source: "7-day rag.jsonl gate, injection, miss, and latency history",
-        action: "inspect recent prompts, then reproduce one in Simulator",
-    },
-    TabGuide {
-        purpose: "Whether retrieval improves finding, use, and final answers.",
-        source: "persisted L1 eval, L2 utilization, and L3 A/B runs",
-        action: "run kmd eval/util/ab to append comparable measurements",
-    },
-    TabGuide {
-        purpose: "Operational verification of every local kmd dependency.",
-        source: "config, store, index, daemon, hooks, logs, search, activity, journal",
-        action: "t executes checks and keeps the latest 500 runs",
+        purpose: "Monitor runtime, retrieval quality, evaluations, and self-checks together.",
+        source: "daemon, hooks, store, rag.jsonl, evaluations, and check history",
+        action: "r refreshes · t runs the complete self-check suite",
     },
     TabGuide {
         purpose: "Run real queries against the local index without writing logs.",
@@ -317,10 +291,13 @@ pub fn snapshot() -> Result<DashboardSnapshot> {
     let cwd = std::env::current_dir()?.display().to_string();
     let mut errors = Vec::new();
     let runtime = runtime_status(&mut errors);
-    let activity = crate::activity::recent("", &cwd, 30).unwrap_or_else(|error| {
+    let mut activity = crate::activity::recent("", &cwd, 30).unwrap_or_else(|error| {
         errors.push(format!("activity: {error}"));
         Vec::new()
     });
+    if let Err(error) = crate::activity::backfill_turns(&mut activity) {
+        errors.push(format!("activity turn backfill: {error}"));
+    }
     let journal = crate::journal::build(7, None, None, &cwd).unwrap_or_else(|error| {
         errors.push(format!("journal: {error}"));
         crate::journal::JournalView {
@@ -485,17 +462,32 @@ pub fn run_checks() -> Result<CheckRun> {
 struct App {
     tab: usize,
     scroll: u16,
+    selected_session: usize,
     snapshot: DashboardSnapshot,
     simulator: crate::dashboard_simulator::SimulatorState,
+    theme: crate::dashboard_theme::Theme,
     last_refresh: Instant,
     message: String,
 }
 
 impl App {
     fn refresh(&mut self) {
+        let selected_id = self
+            .snapshot
+            .activity
+            .get(self.selected_session)
+            .map(|card| card.session_id.clone());
         match snapshot() {
             Ok(snapshot) => {
                 self.snapshot = snapshot;
+                self.selected_session = selected_id
+                    .and_then(|id| {
+                        self.snapshot
+                            .activity
+                            .iter()
+                            .position(|card| card.session_id == id)
+                    })
+                    .unwrap_or(0);
                 self.last_refresh = Instant::now();
                 self.message = "refreshed".to_string();
             }
@@ -507,10 +499,21 @@ impl App {
         self.tab = tab % TABS.len();
         self.scroll = 0;
     }
+
+    fn select_session(&mut self, next: usize) {
+        if !self.snapshot.activity.is_empty() {
+            self.selected_session = next.min(self.snapshot.activity.len() - 1);
+            self.scroll = 0;
+        }
+    }
 }
 
 fn state_badge(ok: bool) -> &'static str {
-    if ok { "● OK" } else { "● FAIL" }
+    if ok {
+        crate::dashboard_theme::BADGE_OK
+    } else {
+        crate::dashboard_theme::BADGE_FAIL
+    }
 }
 
 fn overview_text(snapshot: &DashboardSnapshot) -> String {
@@ -539,16 +542,21 @@ fn overview_text(snapshot: &DashboardSnapshot) -> String {
         .first()
         .map(|run| format!("{} · {} · {}", run.kind, run.summary, run.timestamp))
         .unwrap_or_else(|| "not run".to_string());
+    let hooks_warning =
+        crate::dashboard_theme::warning_suffix(runtime.hooks_installed < runtime.hooks_total);
+    let documents_warning = crate::dashboard_theme::warning_suffix(runtime.dirty_documents > 0);
     let mut output = format!(
-        "Runtime\n  {:<12} {}\n  {:<12} {}/{} installed\n  {:<12} {} active / {} dirty\n  {:<12} {}\n  {:<12} {}\n\nKnowledge\n  {:<12} {} sessions / {} projects (7d)\n  {:<12} {} live cards (24h)\n  {:<12} {} prompts / {:.0}% injection (7d)\n  {:<12} median {}ms / p95 {}ms\n  {:<12} {}\n",
+        "Runtime\n  {:<12} {}\n  {:<12} {}/{} installed{}\n  {:<12} {} active / {} dirty{}\n  {:<12} {}\n  {:<12} {}\n\nKnowledge\n  {:<12} {} sessions / {} projects (7d)\n  {:<12} {} live cards (24h)\n  {:<12} {} prompts / {:.0}% injection (7d)\n  {:<12} median {}ms / p95 {}ms\n  {:<12} {}\n",
         "daemon",
         state_badge(runtime.daemon_online),
         "hooks",
         runtime.hooks_installed,
         runtime.hooks_total,
+        hooks_warning,
         "documents",
         runtime.documents,
         runtime.dirty_documents,
+        documents_warning,
         "socket",
         runtime.daemon_socket,
         "self-check",
@@ -583,36 +591,66 @@ fn overview_text(snapshot: &DashboardSnapshot) -> String {
     output
 }
 
-fn activity_text(snapshot: &DashboardSnapshot) -> String {
-    if snapshot.activity.is_empty() {
-        return "최근 24시간 activity가 없습니다.".to_string();
+fn session_time(timestamp: &str) -> String {
+    chrono::DateTime::parse_from_rfc3339(timestamp)
+        .map(|value| value.with_timezone(&Local).format("%H:%M:%S").to_string())
+        .unwrap_or_else(|_| "--:--:--".to_string())
+}
+
+fn session_timeline(card: &crate::activity::ActivityCard) -> String {
+    let id: String = card.session_id.chars().take(8).collect();
+    let mut output = format!(
+        "Session {id}\nrepo: {}\ncwd: {}\nupdated: {}\nturns: {}\n",
+        card.repo.as_deref().unwrap_or("(no repo)"),
+        card.cwd,
+        card.updated_at,
+        card.turns.len()
+    );
+    if !card.files.is_empty() {
+        output.push_str(&format!("files: {}\n", card.files.join(", ")));
     }
-    let mut output = String::new();
-    for card in &snapshot.activity {
-        let time = chrono::DateTime::parse_from_rfc3339(&card.updated_at)
-            .map(|value| {
-                value
-                    .with_timezone(&Local)
-                    .format("%m-%d %H:%M")
-                    .to_string()
-            })
-            .unwrap_or_else(|_| card.updated_at.clone());
-        let id: String = card.session_id.chars().take(8).collect();
+    output.push('\n');
+
+    if card.turns.is_empty() {
+        output
+            .push_str("이 카드는 이전 저장 형식으로 생성되어 마지막 요청과 응답만 표시합니다.\n\n");
+        output.push_str("USER\n");
+        output.push_str(&card.latest_user);
+        output.push_str("\n\nCLAUDE\n");
+        if card.latest_assistant.is_empty() {
+            output.push_str("(텍스트 응답 없음)\n");
+        } else {
+            output.push_str(&card.latest_assistant);
+            output.push('\n');
+        }
+        return output;
+    }
+
+    for (index, turn) in card.turns.iter().enumerate() {
         output.push_str(&format!(
-            "● {}  {:<16} {}\n  {}\n",
-            time,
-            card.repo.as_deref().unwrap_or("(no repo)"),
-            id,
-            card.summary
+            "── Turn {} · {} ──\nUSER\n{}\n\nCLAUDE\n",
+            index + 1,
+            session_time(&turn.timestamp),
+            turn.user
         ));
-        if card.latest_user != card.summary {
-            output.push_str(&format!("  현재: {}\n", card.latest_user));
+        if turn.assistant.is_empty() {
+            output.push_str("(텍스트 응답 없음 또는 응답 대기 중)");
+        } else {
+            output.push_str(&turn.assistant);
         }
-        if !card.latest_assistant.is_empty() {
-            output.push_str(&format!("  결과: {}\n", card.latest_assistant));
-        }
-        output.push_str(&format!("  cwd: {}\n\n", card.cwd));
+        output.push_str("\n\n");
     }
+    output
+}
+
+fn operations_text(snapshot: &DashboardSnapshot) -> String {
+    let mut output = overview_text(snapshot);
+    output.push_str("\nRetrieval\n");
+    output.push_str(&rag_text(snapshot));
+    output.push_str("\nEvaluations\n");
+    output.push_str(&evaluations_text(snapshot));
+    output.push_str("\nSelf-checks\n");
+    output.push_str(&checks_text(snapshot));
     output
 }
 
@@ -636,7 +674,14 @@ fn rag_text(snapshot: &DashboardSnapshot) -> String {
         } else {
             "MISS".to_string()
         };
-        let prompt: String = entry.prompt.chars().take(100).collect();
+        // Keep every entry on its two-line layout; embedded newlines would also mimic status rows.
+        let prompt: String = entry
+            .prompt
+            .replace(['\r', '\n'], " ")
+            .chars()
+            .take(100)
+            .collect();
+        // dashboard_theme recognizes status rows by this two-space indent; prompt rows use four.
         output.push_str(&format!(
             "  {:<16} {:>5}ms  {}\n    {}\n",
             status, entry.latency_ms, entry.ts, prompt
@@ -680,8 +725,12 @@ fn checks_text(snapshot: &DashboardSnapshot) -> String {
     let mut output = String::new();
     for run in &snapshot.checks {
         output.push_str(&format!(
-            "{}  {}/{} passed  {}ms\n",
-            run.timestamp, run.passed, run.total, run.duration_ms
+            "{}  {}  {}/{} passed  {}ms\n",
+            run.timestamp,
+            state_badge(run.passed == run.total),
+            run.passed,
+            run.total,
+            run.duration_ms
         ));
         for item in &run.checks {
             output.push_str(&format!(
@@ -696,27 +745,109 @@ fn checks_text(snapshot: &DashboardSnapshot) -> String {
     output
 }
 
-fn body_text(app: &App) -> String {
+fn body_content(app: &App) -> Option<(crate::dashboard_theme::BodyKind, String)> {
     match app.tab {
-        0 => overview_text(&app.snapshot),
-        1 => activity_text(&app.snapshot),
-        2 => crate::journal::render(&app.snapshot.journal),
-        3 => rag_text(&app.snapshot),
-        4 => evaluations_text(&app.snapshot),
-        5 => checks_text(&app.snapshot),
-        _ => String::new(),
+        OPERATIONS_TAB => Some((
+            crate::dashboard_theme::BodyKind::Operations,
+            operations_text(&app.snapshot),
+        )),
+        _ => None,
     }
 }
 
-fn color_style(color: Color) -> Style {
-    if std::env::var_os("NO_COLOR").is_some() {
-        Style::default()
+fn short_summary(value: &str, limit: usize) -> String {
+    if value.chars().count() <= limit {
+        value.to_string()
     } else {
-        Style::default().fg(color)
+        format!("{}…", value.chars().take(limit).collect::<String>())
     }
+}
+
+fn draw_sessions(frame: &mut Frame, area: Rect, app: &App) {
+    let theme = app.theme;
+    if app.snapshot.activity.is_empty() {
+        frame.render_widget(
+            Paragraph::new(
+                "최근 24시간의 session activity가 없습니다.\nClaude 세션에서 Stop hook이 실행되면 요청과 응답 timeline이 여기에 나타납니다.",
+            )
+            .wrap(Wrap { trim: false })
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(theme.border())
+                    .title_style(theme.heading())
+                    .title(" Sessions "),
+            ),
+            area,
+        );
+        return;
+    }
+
+    let columns =
+        Layout::horizontal([Constraint::Percentage(34), Constraint::Percentage(66)]).split(area);
+    let items = app
+        .snapshot
+        .activity
+        .iter()
+        .map(|card| {
+            let id: String = card.session_id.chars().take(8).collect();
+            let updated = chrono::DateTime::parse_from_rfc3339(&card.updated_at)
+                .map(|value| {
+                    value
+                        .with_timezone(&Local)
+                        .format("%m-%d %H:%M")
+                        .to_string()
+                })
+                .unwrap_or_else(|_| card.updated_at.clone());
+            ListItem::new(vec![
+                Line::from(vec![
+                    Span::styled(format!("{id} "), theme.accent()),
+                    Span::raw(card.repo.as_deref().unwrap_or("(no repo)").to_string()),
+                    Span::styled(format!("  {updated}"), theme.muted()),
+                ]),
+                Line::raw(format!("  {}", short_summary(&card.latest_user, 72))),
+            ])
+        })
+        .collect::<Vec<_>>();
+    let mut state = ListState::default().with_selected(Some(app.selected_session));
+    let sessions = List::new(items)
+        .highlight_symbol("> ")
+        .highlight_style(theme.selected())
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(theme.border())
+                .title_style(theme.heading())
+                .title(format!(" Sessions · {} live ", app.snapshot.activity.len())),
+        );
+    frame.render_stateful_widget(sessions, columns[0], &mut state);
+
+    let card = &app.snapshot.activity[app.selected_session];
+    let timeline = crate::dashboard_theme::style_body(
+        crate::dashboard_theme::BodyKind::Sessions,
+        session_timeline(card),
+        theme,
+    );
+    frame.render_widget(
+        Paragraph::new(timeline)
+            .scroll((app.scroll, 0))
+            .wrap(Wrap { trim: false })
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(theme.border())
+                    .title_style(theme.heading())
+                    .title(format!(
+                        " Request → Claude response · scroll {} ",
+                        app.scroll
+                    )),
+            ),
+        columns[1],
+    );
 }
 
 fn draw(frame: &mut Frame, app: &App) {
+    let theme = app.theme;
     let areas = Layout::vertical([
         Constraint::Length(3),
         Constraint::Length(4),
@@ -731,10 +862,12 @@ fn draw(frame: &mut Frame, app: &App) {
         .collect::<Vec<_>>();
     let tabs = Tabs::new(titles)
         .select(app.tab)
-        .highlight_style(color_style(Color::Cyan).bold())
+        .highlight_style(theme.selected())
         .block(
             Block::default()
                 .borders(Borders::ALL)
+                .border_style(theme.border())
+                .title_style(theme.heading())
                 .title(format!(" kmd dashboard · {} ", app.snapshot.generated_at)),
         );
     frame.render_widget(tabs, areas[0]);
@@ -742,15 +875,15 @@ fn draw(frame: &mut Frame, app: &App) {
     let guide = &TAB_GUIDES[app.tab];
     let guide_text = Text::from(vec![
         Line::from(vec![
-            Span::styled("Purpose  ", color_style(Color::Cyan).bold()),
+            Span::styled("Purpose  ", theme.heading()),
             Span::raw(guide.purpose),
         ]),
         Line::from(vec![
-            Span::styled("Data     ", color_style(Color::DarkGray)),
+            Span::styled("Data     ", theme.muted()),
             Span::raw(guide.source),
         ]),
         Line::from(vec![
-            Span::styled("Action   ", color_style(Color::DarkGray)),
+            Span::styled("Action   ", theme.muted()),
             Span::raw(guide.action),
         ]),
     ]);
@@ -759,20 +892,19 @@ fn draw(frame: &mut Frame, app: &App) {
         areas[1],
     );
 
-    if app.tab == SIMULATOR_TAB {
-        crate::dashboard_simulator::draw(
-            frame,
-            areas[2],
-            &app.simulator,
-            color_style(Color::DarkGray),
-        );
-    } else {
-        let body = Paragraph::new(body_text(app))
+    if app.tab == SESSIONS_TAB {
+        draw_sessions(frame, areas[2], app);
+    } else if app.tab == SIMULATOR_TAB {
+        crate::dashboard_simulator::draw(frame, areas[2], &app.simulator, theme);
+    } else if let Some((kind, content)) = body_content(app) {
+        let body = Paragraph::new(crate::dashboard_theme::style_body(kind, content, theme))
             .scroll((app.scroll, 0))
             .wrap(Wrap { trim: false })
             .block(
                 Block::default()
                     .borders(Borders::ALL)
+                    .border_style(theme.border())
+                    .title_style(theme.heading())
                     .title(format!(" {} · scroll {} ", TABS[app.tab], app.scroll)),
             );
         frame.render_widget(body, areas[2]);
@@ -783,16 +915,18 @@ fn draw(frame: &mut Frame, app: &App) {
             "Tab: next  Shift-Tab/Esc: leave  Enter: run  Alt-m: mode  ↑/↓: history  Alt-j/k: hit  PgUp/PgDn: detail  {}",
             app.message
         )
+    } else if app.tab == SESSIONS_TAB {
+        format!(
+            "←/→ or 1-3: view  j/k ↑/↓: session  PgUp/PgDn: timeline  r: refresh  t: self-check  q/Esc: quit  {}",
+            app.message
+        )
     } else {
         format!(
-            "←/→ or 1-7: tab  j/k ↑/↓ PgUp/PgDn: scroll  r: refresh  t: self-check  q/Esc: quit  {}",
+            "←/→ or 1-3: view  j/k ↑/↓ PgUp/PgDn: scroll  r: refresh  t: self-check  q/Esc: quit  {}",
             app.message
         )
     };
-    frame.render_widget(
-        Paragraph::new(help_text).style(color_style(Color::DarkGray)),
-        areas[3],
-    );
+    frame.render_widget(Paragraph::new(help_text).style(theme.muted()), areas[3]);
 }
 
 fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) -> Result<bool> {
@@ -815,7 +949,13 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) -> Result<bool> {
         (KeyCode::Left, _) | (KeyCode::Char('h'), _) | (KeyCode::BackTab, _) => {
             app.select_tab((app.tab + TABS.len() - 1) % TABS.len())
         }
-        (KeyCode::Char(value @ '1'..='7'), _) => app.select_tab((value as usize) - ('1' as usize)),
+        (KeyCode::Char(value @ '1'..='3'), _) => app.select_tab((value as usize) - ('1' as usize)),
+        (KeyCode::Down, _) | (KeyCode::Char('j'), _) if app.tab == SESSIONS_TAB => {
+            app.select_session(app.selected_session.saturating_add(1));
+        }
+        (KeyCode::Up, _) | (KeyCode::Char('k'), _) if app.tab == SESSIONS_TAB => {
+            app.select_session(app.selected_session.saturating_sub(1));
+        }
         (KeyCode::Down, _) | (KeyCode::Char('j'), _) => app.scroll = app.scroll.saturating_add(1),
         (KeyCode::Up, _) | (KeyCode::Char('k'), _) => app.scroll = app.scroll.saturating_sub(1),
         (KeyCode::PageDown, _) => app.scroll = app.scroll.saturating_add(10),
@@ -826,7 +966,7 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) -> Result<bool> {
             Ok(run) => {
                 app.refresh();
                 app.message = format!("self-check: {}/{} passed", run.passed, run.total);
-                app.select_tab(5);
+                app.select_tab(OPERATIONS_TAB);
             }
             Err(error) => app.message = format!("self-check failed: {error}"),
         },
@@ -908,10 +1048,12 @@ pub fn run(json: bool, check_only: bool) -> Result<()> {
         return Ok(());
     }
     run_tui(App {
-        tab: 0,
+        tab: SESSIONS_TAB,
         scroll: 0,
+        selected_session: 0,
         snapshot,
         simulator: crate::dashboard_simulator::SimulatorState::new(),
+        theme: crate::dashboard_theme::Theme::from_env(),
         last_refresh: Instant::now(),
         message: "auto-refresh 5s".to_string(),
     })
@@ -996,7 +1138,23 @@ mod tests {
                     path: "/knowledge".into(),
                 }],
             },
-            activity: Vec::new(),
+            activity: vec![crate::activity::ActivityCard {
+                session_id: "12345678-session".into(),
+                updated_at: "2026-08-01T01:02:00Z".into(),
+                updated_epoch: 1_754_011_320,
+                cwd: "/repo".into(),
+                repo: Some("kmd".into()),
+                summary: "대시보드 세션 흐름을 개선한다".into(),
+                latest_user: "질의와 응답을 세션별로 보여줘".into(),
+                latest_assistant: "세션 중심 화면으로 변경했습니다.".into(),
+                turns: vec![crate::activity::ActivityTurn {
+                    timestamp: "2026-08-01T01:01:00Z".into(),
+                    user: "질의와 응답을 세션별로 보여줘".into(),
+                    assistant: "세션 중심 화면으로 변경했습니다.".into(),
+                }],
+                files: vec!["/repo/src/dashboard.rs".into()],
+                links: Vec::new(),
+            }],
             journal: crate::journal::JournalView {
                 from: "20260801".into(),
                 to: "20260801".into(),
@@ -1016,7 +1174,21 @@ mod tests {
                 injection_rate_pct: 50.0,
                 median_latency_ms: 80,
                 p95_latency_ms: 120,
-                recent: Vec::new(),
+                recent: vec![crate::rag::RagLogEntry {
+                    ts: "2026-08-01T00:00:00Z".into(),
+                    session_id: "session".into(),
+                    prompt: "MISS should remain prompt text\nafter normalization".into(),
+                    prompt_len: "MISS should remain prompt text\nafter normalization"
+                        .chars()
+                        .count(),
+                    hangul: false,
+                    stage: "gated".into(),
+                    gate_reason: Some("too_short".into()),
+                    query: None,
+                    injected: 0,
+                    hits: Vec::new(),
+                    latency_ms: 0,
+                }],
             },
             evaluations: vec![crate::evaluation_log::EvaluationRun {
                 timestamp: "2026-08-01T00:00:00Z".into(),
@@ -1028,17 +1200,19 @@ mod tests {
             errors: Vec::new(),
         };
         let mut app = App {
-            tab: 0,
+            tab: SESSIONS_TAB,
             scroll: 0,
+            selected_session: 0,
             snapshot,
             simulator: crate::dashboard_simulator::SimulatorState::new(),
+            theme: crate::dashboard_theme::Theme::colored(),
             last_refresh: Instant::now(),
             message: "ready".into(),
         };
         let backend = ratatui::backend::TestBackend::new(120, 40);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|frame| draw(frame, &app)).unwrap();
-        let overview = terminal
+        let sessions = terminal
             .backend()
             .buffer()
             .content()
@@ -1046,34 +1220,77 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
         for label in TABS {
-            assert!(overview.contains(label), "missing tab {label}");
+            assert!(sessions.contains(label), "missing view {label}");
         }
-        assert!(overview.contains("42 active / 0 dirty"));
-        assert!(overview.contains("1/1"));
-        assert!(overview.contains("streak 1"));
+        assert!(sessions.contains("12345678"));
+        assert!(sessions.contains("USER"));
+        assert!(sessions.contains("CLAUDE"));
+        let timeline = session_timeline(&app.snapshot.activity[0]);
+        assert!(timeline.contains("질의와 응답을 세션별로 보여줘"));
+        assert!(timeline.contains("세션 중심 화면으로 변경했습니다."));
 
-        app.select_tab(4);
+        app.theme = crate::dashboard_theme::Theme::plain();
         terminal.draw(|frame| draw(frame, &app)).unwrap();
-        let evaluations = terminal
-            .backend()
-            .buffer()
-            .content()
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect::<String>();
-        assert!(evaluations.contains("eval-known-item"));
-        assert!(evaluations.contains("R@5 90%"));
+        assert!(
+            terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .all(|cell| cell.fg == Color::Reset)
+        );
+        app.theme = crate::dashboard_theme::Theme::colored();
 
-        app.select_tab(5);
+        let mut second = app.snapshot.activity[0].clone();
+        second.session_id = "87654321-session".into();
+        app.snapshot.activity.push(second);
+        handle_key(
+            &mut app,
+            crossterm::event::KeyEvent::new(
+                KeyCode::Char('j'),
+                crossterm::event::KeyModifiers::NONE,
+            ),
+        )
+        .unwrap();
+        assert_eq!(app.selected_session, 1);
+        assert_eq!(app.scroll, 0);
+        handle_key(
+            &mut app,
+            crossterm::event::KeyEvent::new(
+                KeyCode::PageDown,
+                crossterm::event::KeyModifiers::NONE,
+            ),
+        )
+        .unwrap();
+        assert_eq!(app.selected_session, 1);
+        assert_eq!(app.scroll, 10);
+
+        let operations = operations_text(&app.snapshot);
+        assert!(operations.contains("42 active / 0 dirty"));
+        assert!(operations.contains("1/1 passed"));
+        assert!(operations.contains("MISS should remain prompt text after normalization"));
+        assert!(operations.contains("eval-known-item"));
+        assert!(operations.contains("R@5 90%"));
+
+        app.select_tab(OPERATIONS_TAB);
+        app.snapshot.runtime.hooks_installed = 4;
+        app.snapshot.runtime.dirty_documents = 1;
         terminal.draw(|frame| draw(frame, &app)).unwrap();
-        let checks = terminal
-            .backend()
-            .buffer()
-            .content()
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect::<String>();
-        assert!(checks.contains("1/1 passed"));
-        assert!(checks.contains("42 active, 0 dirty"));
+        assert!(
+            terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .any(|cell| cell.symbol() == "!" && cell.fg == Color::Yellow)
+        );
+        assert!(
+            terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .any(|cell| cell.symbol() == "●" && cell.fg == Color::Green)
+        );
     }
 }

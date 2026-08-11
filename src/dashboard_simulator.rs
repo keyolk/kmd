@@ -163,7 +163,12 @@ impl SimulatorState {
     }
 }
 
-pub fn draw(frame: &mut Frame, area: Rect, state: &SimulatorState, dim_style: Style) {
+pub fn draw(
+    frame: &mut Frame,
+    area: Rect,
+    state: &SimulatorState,
+    theme: crate::dashboard_theme::Theme,
+) {
     if area.width < MIN_WIDTH || area.height < MIN_HEIGHT {
         let message = Paragraph::new(format!(
             "Simulator needs at least {MIN_WIDTH}x{MIN_HEIGHT}. Current area: {}x{}",
@@ -173,6 +178,8 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &SimulatorState, dim_style: St
         .block(
             Block::default()
                 .borders(Borders::ALL)
+                .border_style(theme.border())
+                .title_style(theme.warning())
                 .title(" terminal too small "),
         );
         frame.render_widget(message, area);
@@ -191,48 +198,82 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &SimulatorState, dim_style: St
         state.mode.label(),
         if state.running { " · RUNNING" } else { "" }
     );
-    let input = Paragraph::new(state.input.as_str())
-        .block(Block::default().borders(Borders::ALL).title(input_title));
+    let input_title_style = if state.running {
+        theme.warning().add_modifier(Modifier::BOLD)
+    } else {
+        theme.heading()
+    };
+    let input = Paragraph::new(state.input.as_str()).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(theme.border())
+            .title_style(input_title_style)
+            .title(input_title),
+    );
     frame.render_widget(input, rows[0]);
 
-    let status_text = match (&state.error, &state.result, state.running) {
-        (_, _, true) => "Running against the local kmd index…".to_string(),
-        (Some(error), _, _) => format!("ERROR · {error}"),
-        (_, Some(result), _) if result.gate_reason.is_some() => format!(
-            "GATED · {} · no search or context injection",
-            result.gate_reason.as_deref().unwrap_or("unknown")
+    let (status_text, status_style) = match (&state.error, &state.result, state.running) {
+        (_, _, true) => (
+            "Running against the local kmd index…".to_string(),
+            theme.warning(),
         ),
-        (_, Some(result), _) => format!(
-            "{} · query: {}\nhits {} · context {} · {}ms",
-            result.mode.label(),
-            result.query,
-            result.hits.len(),
-            if result.context.is_some() { "yes" } else { "no" },
-            result.latency_ms
+        (Some(error), _, _) => (format!("ERROR · {error}"), theme.error()),
+        (_, Some(result), _) if result.gate_reason.is_some() => (
+            format!(
+                "GATED · {} · no search or context injection",
+                result.gate_reason.as_deref().unwrap_or("unknown")
+            ),
+            theme.warning(),
         ),
-        _ => "Type a real prompt or keyword query. RAG shows gate → extraction → filtered hits → injected context; BM25 shows raw retrieval.".to_string(),
+        (_, Some(result), _) => (
+            format!(
+                "{} · query: {}\nhits {} · context {} · {}ms",
+                result.mode.label(),
+                result.query,
+                result.hits.len(),
+                if result.context.is_some() { "yes" } else { "no" },
+                result.latency_ms
+            ),
+            Style::default(),
+        ),
+        _ => (
+            "Type a real prompt or keyword query. RAG shows gate → extraction → filtered hits → injected context; BM25 shows raw retrieval.".to_string(),
+            Style::default(),
+        ),
     };
     frame.render_widget(
         Paragraph::new(status_text)
+            .style(status_style)
             .wrap(Wrap { trim: false })
-            .block(Block::default().borders(Borders::ALL).title(" execution ")),
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(theme.border())
+                    .title_style(theme.heading())
+                    .title(" execution "),
+            ),
         rows[1],
     );
 
     if area.width >= WIDE_WIDTH {
         let columns = Layout::horizontal([Constraint::Percentage(42), Constraint::Percentage(58)])
             .split(rows[2]);
-        draw_hits(frame, columns[0], state, dim_style);
-        draw_detail(frame, columns[1], state);
+        draw_hits(frame, columns[0], state, theme);
+        draw_detail(frame, columns[1], state, theme);
     } else {
         let body = Layout::vertical([Constraint::Percentage(45), Constraint::Percentage(55)])
             .split(rows[2]);
-        draw_hits(frame, body[0], state, dim_style);
-        draw_detail(frame, body[1], state);
+        draw_hits(frame, body[0], state, theme);
+        draw_detail(frame, body[1], state, theme);
     }
 }
 
-fn draw_hits(frame: &mut Frame, area: Rect, state: &SimulatorState, dim_style: Style) {
+fn draw_hits(
+    frame: &mut Frame,
+    area: Rect,
+    state: &SimulatorState,
+    theme: crate::dashboard_theme::Theme,
+) {
     let items = state
         .result
         .as_ref()
@@ -244,7 +285,7 @@ fn draw_hits(frame: &mut Frame, area: Rect, state: &SimulatorState, dim_style: S
                 .map(|(index, hit)| {
                     let path = hit.file.strip_prefix("kmd://").unwrap_or(&hit.file);
                     ListItem::new(Line::from(vec![
-                        Span::styled(format!("{:>2}. ", index + 1), dim_style),
+                        Span::styled(format!("{:>2}. ", index + 1), theme.muted()),
                         Span::raw(format!("{:.2} {path}", hit.score)),
                     ]))
                 })
@@ -257,16 +298,23 @@ fn draw_hits(frame: &mut Frame, area: Rect, state: &SimulatorState, dim_style: S
     }
     let list = List::new(items)
         .highlight_symbol("> ")
-        .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
+        .highlight_style(theme.selected())
         .block(
             Block::default()
                 .borders(Borders::ALL)
+                .border_style(theme.border())
+                .title_style(theme.heading())
                 .title(" hits · Alt-j/k selects "),
         );
     frame.render_stateful_widget(list, area, &mut list_state);
 }
 
-fn draw_detail(frame: &mut Frame, area: Rect, state: &SimulatorState) {
+fn draw_detail(
+    frame: &mut Frame,
+    area: Rect,
+    state: &SimulatorState,
+    theme: crate::dashboard_theme::Theme,
+) {
     let (title, content) = match state.result.as_ref() {
         Some(result) if result.mode == SimulatorMode::Rag => (
             " injected context · PgUp/PgDn scroll ",
@@ -301,7 +349,13 @@ fn draw_detail(frame: &mut Frame, area: Rect, state: &SimulatorState) {
         Paragraph::new(content)
             .scroll((state.detail_scroll, 0))
             .wrap(Wrap { trim: false })
-            .block(Block::default().borders(Borders::ALL).title(title)),
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(theme.border())
+                    .title_style(theme.heading())
+                    .title(title),
+            ),
         area,
     );
 }
@@ -322,7 +376,14 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
         let state = SimulatorState::new();
         terminal
-            .draw(|frame| draw(frame, frame.area(), &state, Style::default()))
+            .draw(|frame| {
+                draw(
+                    frame,
+                    frame.area(),
+                    &state,
+                    crate::dashboard_theme::Theme::plain(),
+                )
+            })
             .unwrap();
         let output = terminal
             .backend()
@@ -332,5 +393,33 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
         assert!(output.contains("needs at least"));
+    }
+
+    #[test]
+    fn error_status_renders_in_red() {
+        let backend = ratatui::backend::TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut state = SimulatorState::new();
+        state.error = Some("search failed".to_string());
+
+        terminal
+            .draw(|frame| {
+                draw(
+                    frame,
+                    frame.area(),
+                    &state,
+                    crate::dashboard_theme::Theme::colored(),
+                )
+            })
+            .unwrap();
+
+        assert!(
+            terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .any(|cell| cell.symbol() == "E" && cell.fg == Color::Red)
+        );
     }
 }

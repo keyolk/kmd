@@ -5,6 +5,7 @@ mod config;
 mod daemon;
 mod dashboard;
 mod dashboard_simulator;
+mod dashboard_theme;
 #[cfg(feature = "embed")]
 mod embed;
 mod eval;

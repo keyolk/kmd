@@ -15,6 +15,14 @@ const WINDOW_HOURS: i64 = 24;
 const DEFAULT_LIMIT: usize = 6;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActivityTurn {
+    pub timestamp: String,
+    pub user: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub assistant: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ActivityCard {
     pub session_id: String,
     pub updated_at: String,
@@ -26,6 +34,8 @@ pub struct ActivityCard {
     pub latest_user: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub latest_assistant: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub turns: Vec<ActivityTurn>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub files: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -82,50 +92,56 @@ fn push_unique(values: &mut Vec<String>, value: String) {
     }
 }
 
-fn collect_text_and_tools(
-    role: &str,
-    content: &Value,
-    users: &mut Vec<String>,
-    assistants: &mut Vec<String>,
-    files: &mut Vec<String>,
-) {
+fn collect_text_and_tools(content: &Value, files: &mut Vec<String>) -> Vec<String> {
     match content {
-        Value::String(text) => {
-            if role == "user" && meaningful_user_text(text) {
-                users.push(normalize(text, 280));
-            } else if role == "assistant" && !text.trim().is_empty() {
-                assistants.push(normalize(text, 240));
-            }
-        }
+        Value::String(text) => vec![text.to_string()],
         Value::Array(blocks) => {
+            let mut texts = Vec::new();
             for block in blocks {
-                let kind = block.get("type").and_then(Value::as_str).unwrap_or("");
-                if kind == "text" {
-                    let text = block.get("text").and_then(Value::as_str).unwrap_or("");
-                    if role == "user" && meaningful_user_text(text) {
-                        users.push(normalize(text, 280));
-                    } else if role == "assistant" && !text.trim().is_empty() {
-                        assistants.push(normalize(text, 240));
+                match block.get("type").and_then(Value::as_str).unwrap_or("") {
+                    "text" => {
+                        if let Some(text) = block.get("text").and_then(Value::as_str) {
+                            texts.push(text.to_string());
+                        }
                     }
-                } else if kind == "tool_use" {
-                    let input = block.get("input").and_then(Value::as_object);
-                    if let Some(file) = input
-                        .and_then(|i| i.get("file_path"))
-                        .and_then(Value::as_str)
-                    {
-                        push_unique(files, file.to_string());
+                    "tool_use" => {
+                        let input = block.get("input").and_then(Value::as_object);
+                        if let Some(file) = input
+                            .and_then(|value| value.get("file_path"))
+                            .and_then(Value::as_str)
+                        {
+                            push_unique(files, file.to_string());
+                        }
                     }
+                    _ => {}
                 }
             }
+            texts
         }
-        _ => {}
+        _ => Vec::new(),
     }
+}
+
+fn turn_text(text: &str) -> String {
+    text.replace("\r\n", "\n").trim().to_string()
+}
+
+fn append_assistant(turn: &mut ActivityTurn, text: &str) {
+    let text = turn_text(text);
+    if text.is_empty() {
+        return;
+    }
+    if !turn.assistant.is_empty() {
+        turn.assistant.push_str("\n\n");
+    }
+    turn.assistant.push_str(&text);
 }
 
 fn parse_transcript(raw: &str, session_id: &str) -> Option<ActivityCard> {
     let url_re = Regex::new(r#"https?://[^\s<>\)\]\}"']+"#).ok()?;
     let mut users = Vec::new();
     let mut assistants = Vec::new();
+    let mut turns = Vec::new();
     let mut files = Vec::new();
     let mut cwd = String::new();
     let mut latest: Option<DateTime<chrono::FixedOffset>> = None;
@@ -134,17 +150,19 @@ fn parse_transcript(raw: &str, session_id: &str) -> Option<ActivityCard> {
         let Ok(entry) = serde_json::from_str::<Value>(line) else {
             continue;
         };
-        if let Some(value) = entry.get("cwd").and_then(Value::as_str) {
-            if !value.is_empty() {
-                cwd = value.to_string();
-            }
+        if let Some(value) = entry.get("cwd").and_then(Value::as_str)
+            && !value.is_empty()
+        {
+            cwd = value.to_string();
         }
-        if let Some(value) = entry.get("timestamp").and_then(Value::as_str) {
-            if let Ok(parsed) = DateTime::parse_from_rfc3339(value) {
-                if latest.as_ref().is_none_or(|current| parsed > *current) {
-                    latest = Some(parsed);
-                }
-            }
+        let timestamp = entry
+            .get("timestamp")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if let Ok(parsed) = DateTime::parse_from_rfc3339(timestamp)
+            && latest.as_ref().is_none_or(|current| parsed > *current)
+        {
+            latest = Some(parsed);
         }
 
         let message = entry.get("message").unwrap_or(&entry);
@@ -152,7 +170,38 @@ fn parse_transcript(raw: &str, session_id: &str) -> Option<ActivityCard> {
         let Some(content) = message.get("content") else {
             continue;
         };
-        collect_text_and_tools(role, content, &mut users, &mut assistants, &mut files);
+        let texts = collect_text_and_tools(content, &mut files);
+        match role {
+            "user" => {
+                let text = texts
+                    .into_iter()
+                    .filter(|text| meaningful_user_text(text))
+                    .collect::<Vec<_>>()
+                    .join("\n\n");
+                if !text.is_empty() {
+                    users.push(normalize(&text, 280));
+                    turns.push(ActivityTurn {
+                        timestamp: timestamp.to_string(),
+                        user: turn_text(&text),
+                        assistant: String::new(),
+                    });
+                }
+            }
+            "assistant" => {
+                let text = texts
+                    .into_iter()
+                    .filter(|text| !text.trim().is_empty())
+                    .collect::<Vec<_>>()
+                    .join("\n\n");
+                if !text.is_empty() {
+                    assistants.push(normalize(&text, 240));
+                    if let Some(turn) = turns.last_mut() {
+                        append_assistant(turn, &text);
+                    }
+                }
+            }
+            _ => {}
+        }
     }
 
     let latest_user = users.last()?.clone();
@@ -187,6 +236,7 @@ fn parse_transcript(raw: &str, session_id: &str) -> Option<ActivityCard> {
         summary,
         latest_user,
         latest_assistant: assistants.last().cloned().unwrap_or_default(),
+        turns,
         files: files
             .into_iter()
             .rev()
@@ -206,24 +256,62 @@ fn parse_transcript(raw: &str, session_id: &str) -> Option<ActivityCard> {
     })
 }
 
+fn persist_card(card: &ActivityCard) -> Result<bool> {
+    let dir = activity_dir();
+    fs::create_dir_all(&dir)?;
+    let path = dir.join(format!("{}.json", card.session_id));
+    let body = serde_json::to_string_pretty(card)? + "\n";
+    if fs::read_to_string(&path).ok().as_deref() == Some(body.as_str()) {
+        return Ok(false);
+    }
+
+    // Stop hooks and dashboard migration can overlap, so each process needs its own atomic temp file.
+    let pending = dir.join(format!(
+        ".{}.{}.pending",
+        card.session_id,
+        std::process::id()
+    ));
+    fs::write(&pending, body)?;
+    fs::rename(pending, path)?;
+    Ok(true)
+}
+
 pub fn update_from_transcript(session_id: &str, transcript_path: &Path) -> Result<bool> {
     let raw = fs::read_to_string(transcript_path)?;
     let Some(card) = parse_transcript(&raw, session_id) else {
         return Ok(false);
     };
+    persist_card(&card)
+}
 
-    let dir = activity_dir();
-    fs::create_dir_all(&dir)?;
-    let path = dir.join(format!("{}.json", session_id));
-    let body = serde_json::to_string_pretty(&card)? + "\n";
-    if fs::read_to_string(&path).ok().as_deref() == Some(body.as_str()) {
-        return Ok(false);
+fn transcript_path(session_id: &str) -> Option<PathBuf> {
+    let root = PathBuf::from(std::env::var_os("HOME")?).join(".claude/projects");
+    for project in fs::read_dir(root).ok()?.flatten() {
+        let path = project.path().join(format!("{session_id}.jsonl"));
+        if path.is_file() {
+            return Some(path);
+        }
     }
+    None
+}
 
-    let pending = dir.join(format!(".{}.pending", session_id));
-    fs::write(&pending, body)?;
-    fs::rename(pending, path)?;
-    Ok(true)
+/// Upgrade pre-turn activity cards from their original transcript once. Persisting the
+/// enriched card keeps dashboard refreshes and UserPromptSubmit reads inexpensive.
+pub fn backfill_turns(cards: &mut [ActivityCard]) -> Result<usize> {
+    let mut updated = 0;
+    for card in cards.iter_mut().filter(|card| card.turns.is_empty()) {
+        let Some(path) = transcript_path(&card.session_id) else {
+            continue;
+        };
+        let raw = fs::read_to_string(path)?;
+        let Some(enriched) = parse_transcript(&raw, &card.session_id) else {
+            continue;
+        };
+        persist_card(&enriched)?;
+        *card = enriched;
+        updated += 1;
+    }
+    Ok(updated)
 }
 
 pub fn recent(current_session: &str, current_cwd: &str, limit: usize) -> Result<Vec<ActivityCard>> {
@@ -347,6 +435,49 @@ mod tests {
             vec!["/Users/x/src/sendbird/platform-tools/main.go"]
         );
         assert!(card.latest_assistant.contains("테스트도 통과"));
+        assert_eq!(card.turns.len(), 1);
+        assert_eq!(card.turns[0].user, "Delight region 지원을 마저 구현하자");
+        assert!(card.turns[0].assistant.contains("product 차원을 추가"));
+    }
+
+    #[test]
+    fn associates_each_response_with_its_user_turn() {
+        let raw = r#"
+{"type":"user","sessionId":"abc","cwd":"/repo","timestamp":"2026-08-01T01:00:00Z","message":{"role":"user","content":"첫 번째 요청을 처리해줘"}}
+{"type":"assistant","sessionId":"abc","cwd":"/repo","timestamp":"2026-08-01T01:01:00Z","message":{"role":"assistant","content":[{"type":"text","text":"첫 번째 중간 응답"},{"type":"tool_use","name":"Read","input":{"file_path":"/repo/a.rs"}}]}}
+{"type":"user","sessionId":"abc","cwd":"/repo","timestamp":"2026-08-01T01:01:30Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tool","content":"file body"}]}}
+{"type":"assistant","sessionId":"abc","cwd":"/repo","timestamp":"2026-08-01T01:02:00Z","message":{"role":"assistant","content":"첫 번째 최종 응답"}}
+{"type":"user","sessionId":"abc","cwd":"/repo","timestamp":"2026-08-01T01:03:00Z","message":{"role":"user","content":"두 번째 요청을 처리해줘"}}
+{"type":"assistant","sessionId":"abc","cwd":"/repo","timestamp":"2026-08-01T01:04:00Z","message":{"role":"assistant","content":"두 번째 응답"}}
+"#;
+
+        let card = parse_transcript(raw, "abc").expect("card");
+        assert_eq!(card.turns.len(), 2);
+        assert_eq!(card.turns[0].user, "첫 번째 요청을 처리해줘");
+        assert_eq!(
+            card.turns[0].assistant,
+            "첫 번째 중간 응답\n\n첫 번째 최종 응답"
+        );
+        assert_eq!(card.turns[1].user, "두 번째 요청을 처리해줘");
+        assert_eq!(card.turns[1].assistant, "두 번째 응답");
+    }
+
+    #[test]
+    fn reads_legacy_activity_cards_without_turns() {
+        let raw = r#"{
+            "session_id":"abc",
+            "updated_at":"2026-08-01T01:00:00Z",
+            "updated_epoch":1754010000,
+            "cwd":"/repo",
+            "summary":"요약",
+            "latest_user":"요청",
+            "latest_assistant":"응답"
+        }"#;
+
+        let card: ActivityCard = serde_json::from_str(raw).expect("legacy card");
+        assert!(card.turns.is_empty());
+        assert_eq!(card.latest_user, "요청");
+        assert_eq!(card.latest_assistant, "응답");
     }
 
     #[test]
