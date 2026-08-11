@@ -111,6 +111,7 @@ fn is_heading(kind: BodyKind, line: &str) -> bool {
             line.starts_with("Session ")
                 || line.starts_with("── Query ")
                 || line == "QUERY"
+                || line == "LIVE ACTIVITY"
                 || line.starts_with("RESULTS ·")
         }
         BodyKind::Operations => {
@@ -151,10 +152,17 @@ fn style_overview_line(line: &str, theme: Theme) -> Line<'static> {
 }
 
 fn style_session_line(line: &str, theme: Theme) -> Line<'static> {
-    if line.starts_with("queries:") || line.starts_with("latest:") {
+    if line.starts_with("queries:")
+        || line.starts_with("latest query:")
+        || line.starts_with("origin:")
+        || line.starts_with("repo:")
+        || line.starts_with("cwd:")
+        || line.starts_with("updated:")
+    {
         return Line::styled(line.to_string(), theme.muted());
     }
-    if line.trim_start().starts_with("(no hits)") {
+    let trimmed = line.trim_start();
+    if trimmed.starts_with("(no hits)") || trimmed.starts_with("(no kmd retrieval ran") {
         return Line::styled(line.to_string(), theme.warning());
     }
     Line::raw(line.to_string())

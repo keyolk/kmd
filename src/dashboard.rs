@@ -26,9 +26,9 @@ struct TabGuide {
 
 const TAB_GUIDES: &[TabGuide] = &[
     TabGuide {
-        purpose: "Inspect the kmd queries and retrieval results produced in each Claude session.",
-        source: "searched entries in rag.jsonl from the last 7 days",
-        action: "j/k selects a session · PgUp/PgDn scrolls its query/result history",
+        purpose: "See which Claude sessions are active and what kmd retrieved for each one.",
+        source: "live activity cards (24h) merged with searched rag.jsonl entries (7d)",
+        action: "j/k selects a session · PgUp/PgDn scrolls its activity and query history",
     },
     TabGuide {
         purpose: "Monitor runtime, retrieval quality, evaluations, and self-checks together.",
@@ -111,6 +111,9 @@ pub struct DashboardSnapshot {
     pub generated_at: String,
     pub cwd: String,
     pub runtime: RuntimeStatus,
+    /// Live Claude sessions observed in the last 24h. Kept beside the RAG log so the
+    /// Sessions view can also surface sessions that ran without any kmd retrieval.
+    pub activity: Vec<crate::activity::ActivityCard>,
     pub journal: crate::journal::JournalView,
     pub rag: RagSummary,
     pub evaluations: Vec<crate::evaluation_log::EvaluationRun>,
@@ -271,6 +274,74 @@ fn group_rag_sessions(entries: &[crate::rag::RagLogEntry], limit: usize) -> Vec<
     sessions
 }
 
+/// One row in the Sessions view. A session can appear because it ran kmd queries,
+/// because it is a live Claude session observed in the last 24h, or both.
+struct SessionEntry<'a> {
+    session_id: String,
+    sort_epoch: i64,
+    rag: Option<&'a RagSession>,
+    live: Option<&'a crate::activity::ActivityCard>,
+}
+
+impl SessionEntry<'_> {
+    fn origin(&self) -> &'static str {
+        match (self.rag.is_some(), self.live.is_some()) {
+            (true, true) => "live+rag",
+            (true, false) => "rag",
+            _ => "live",
+        }
+    }
+
+    fn query_count(&self) -> usize {
+        self.rag.map_or(0, |session| session.queries.len())
+    }
+}
+
+fn merge_session_entries<'a>(
+    rag_sessions: &'a [RagSession],
+    activity: &'a [crate::activity::ActivityCard],
+) -> Vec<SessionEntry<'a>> {
+    let mut entries: Vec<SessionEntry<'a>> = Vec::new();
+
+    for session in rag_sessions {
+        entries.push(SessionEntry {
+            sort_epoch: session.latest_ts.parse::<i64>().unwrap_or(0),
+            session_id: session.session_id.clone(),
+            rag: Some(session),
+            live: None,
+        });
+    }
+
+    for card in activity {
+        // rag.jsonl stores the full session id while activity cards may already be
+        // truncated, so match on the shared 8-character prefix.
+        let matched = entries.iter_mut().find(|entry| {
+            let existing: String = entry.session_id.chars().take(8).collect();
+            let candidate: String = card.session_id.chars().take(8).collect();
+            existing == candidate
+        });
+        match matched {
+            Some(entry) => {
+                entry.live = Some(card);
+                entry.sort_epoch = entry.sort_epoch.max(card.updated_epoch);
+            }
+            None => entries.push(SessionEntry {
+                session_id: card.session_id.clone(),
+                sort_epoch: card.updated_epoch,
+                rag: None,
+                live: Some(card),
+            }),
+        }
+    }
+
+    entries.sort_by(|a, b| {
+        b.sort_epoch
+            .cmp(&a.sort_epoch)
+            .then(a.session_id.cmp(&b.session_id))
+    });
+    entries
+}
+
 fn parse_check_history(raw: &str) -> Result<Vec<CheckRun>> {
     raw.lines()
         .enumerate()
@@ -350,6 +421,10 @@ pub fn snapshot() -> Result<DashboardSnapshot> {
     let cwd = std::env::current_dir()?.display().to_string();
     let mut errors = Vec::new();
     let runtime = runtime_status(&mut errors);
+    let activity = crate::activity::recent("", &cwd, 30).unwrap_or_else(|error| {
+        errors.push(format!("activity: {error}"));
+        Vec::new()
+    });
     let journal = crate::journal::build(7, None, None, &cwd).unwrap_or_else(|error| {
         errors.push(format!("journal: {error}"));
         crate::journal::JournalView {
@@ -374,6 +449,7 @@ pub fn snapshot() -> Result<DashboardSnapshot> {
         generated_at: Local::now().to_rfc3339(),
         cwd,
         runtime,
+        activity,
         journal,
         rag,
         evaluations,
@@ -523,23 +599,23 @@ struct App {
 }
 
 impl App {
+    fn session_ids(&self) -> Vec<String> {
+        merge_session_entries(&self.snapshot.rag.sessions, &self.snapshot.activity)
+            .into_iter()
+            .map(|entry| entry.session_id)
+            .collect()
+    }
+
     fn refresh(&mut self) {
-        let selected_id = self
-            .snapshot
-            .rag
-            .sessions
-            .get(self.selected_session)
-            .map(|session| session.session_id.clone());
+        let selected_id = self.session_ids().get(self.selected_session).cloned();
         match snapshot() {
             Ok(snapshot) => {
                 self.snapshot = snapshot;
                 self.selected_session = selected_id
                     .and_then(|id| {
-                        self.snapshot
-                            .rag
-                            .sessions
+                        self.session_ids()
                             .iter()
-                            .position(|session| session.session_id == id)
+                            .position(|candidate| candidate == &id)
                     })
                     .unwrap_or(0);
                 self.last_refresh = Instant::now();
@@ -555,8 +631,9 @@ impl App {
     }
 
     fn select_session(&mut self, next: usize) {
-        if !self.snapshot.rag.sessions.is_empty() {
-            self.selected_session = next.min(self.snapshot.rag.sessions.len() - 1);
+        let count = self.session_ids().len();
+        if count > 0 {
+            self.selected_session = next.min(count - 1);
             self.scroll = 0;
         }
     }
@@ -600,7 +677,7 @@ fn overview_text(snapshot: &DashboardSnapshot) -> String {
         crate::dashboard_theme::warning_suffix(runtime.hooks_installed < runtime.hooks_total);
     let documents_warning = crate::dashboard_theme::warning_suffix(runtime.dirty_documents > 0);
     let mut output = format!(
-        "Runtime\n  {:<12} {}\n  {:<12} {}/{} installed{}\n  {:<12} {} active / {} dirty{}\n  {:<12} {}\n  {:<12} {}\n\nKnowledge\n  {:<12} {} sessions / {} projects (7d)\n  {:<12} {} query sessions (7d)\n  {:<12} {} prompts / {:.0}% injection (7d)\n  {:<12} median {}ms / p95 {}ms\n  {:<12} {}\n",
+        "Runtime\n  {:<12} {}\n  {:<12} {}/{} installed{}\n  {:<12} {} active / {} dirty{}\n  {:<12} {}\n  {:<12} {}\n\nKnowledge\n  {:<12} {} sessions / {} projects (7d)\n  {:<12} {} query (7d) / {} live (24h)\n  {:<12} {} prompts / {:.0}% injection (7d)\n  {:<12} median {}ms / p95 {}ms\n  {:<12} {}\n",
         "daemon",
         state_badge(runtime.daemon_online),
         "hooks",
@@ -618,8 +695,9 @@ fn overview_text(snapshot: &DashboardSnapshot) -> String {
         "journal",
         snapshot.journal.session_count,
         snapshot.journal.project_count,
-        "query sessions",
+        "sessions",
         snapshot.rag.sessions.len(),
+        snapshot.activity.len(),
         "RAG",
         snapshot.rag.total,
         snapshot.rag.injection_rate_pct,
@@ -659,13 +737,59 @@ fn rag_time(timestamp: &str) -> String {
         .unwrap_or_else(|| timestamp.to_string())
 }
 
-fn query_results(session: &RagSession) -> String {
-    let id: String = session.session_id.chars().take(8).collect();
-    let mut output = format!(
-        "Session {id}\nqueries: {}\nlatest: {}\n\n",
-        session.queries.len(),
-        rag_time(&session.latest_ts)
-    );
+fn local_time(timestamp: &str) -> String {
+    chrono::DateTime::parse_from_rfc3339(timestamp)
+        .map(|value| {
+            value
+                .with_timezone(&Local)
+                .format("%m-%d %H:%M:%S")
+                .to_string()
+        })
+        .unwrap_or_else(|_| timestamp.to_string())
+}
+
+fn session_details(entry: &SessionEntry<'_>) -> String {
+    let id: String = entry.session_id.chars().take(8).collect();
+    let mut output = format!("Session {id}\norigin: {}\n", entry.origin());
+
+    if let Some(card) = entry.live {
+        output.push_str(&format!(
+            "repo: {}\ncwd: {}\nupdated: {}\n",
+            card.repo.as_deref().unwrap_or("(no repo)"),
+            card.cwd,
+            local_time(&card.updated_at)
+        ));
+    }
+
+    match entry.rag {
+        Some(session) => output.push_str(&format!(
+            "queries: {}\nlatest query: {}\n",
+            session.queries.len(),
+            rag_time(&session.latest_ts)
+        )),
+        None => output.push_str("queries: 0\n"),
+    }
+    output.push('\n');
+
+    if let Some(card) = entry.live {
+        output.push_str("LIVE ACTIVITY\n");
+        output.push_str(&format!("  summary: {}\n", card.summary));
+        if card.latest_user != card.summary {
+            output.push_str(&format!("  latest request: {}\n", card.latest_user));
+        }
+        if !card.latest_assistant.is_empty() {
+            output.push_str(&format!("  latest result: {}\n", card.latest_assistant));
+        }
+        if !card.files.is_empty() {
+            output.push_str(&format!("  files: {}\n", card.files.join(", ")));
+        }
+        output.push('\n');
+    }
+
+    let Some(session) = entry.rag else {
+        output.push_str("(no kmd retrieval ran in this session)\n");
+        return output;
+    };
 
     for (index, entry) in session.queries.iter().enumerate() {
         output.push_str(&format!(
@@ -823,10 +947,11 @@ fn short_summary(value: &str, limit: usize) -> String {
 
 fn draw_sessions(frame: &mut Frame, area: Rect, app: &App) {
     let theme = app.theme;
-    if app.snapshot.rag.sessions.is_empty() {
+    let entries = merge_session_entries(&app.snapshot.rag.sessions, &app.snapshot.activity);
+    if entries.is_empty() {
         frame.render_widget(
             Paragraph::new(
-                "최근 7일간 검색이 실행된 kmd query session이 없습니다.\nUserPromptSubmit hook이 검색을 실행하면 query와 retrieval results가 여기에 나타납니다.",
+                "표시할 session이 없습니다.\n최근 7일간 kmd 검색이 실행되었거나 최근 24시간 내 live Claude session이 있으면 여기에 나타납니다.",
             )
             .wrap(Wrap { trim: false })
             .block(
@@ -834,38 +959,43 @@ fn draw_sessions(frame: &mut Frame, area: Rect, app: &App) {
                     .borders(Borders::ALL)
                     .border_style(theme.border())
                     .title_style(theme.heading())
-                    .title(" Query sessions "),
+                    .title(" Sessions "),
             ),
             area,
         );
         return;
     }
 
+    let live_count = entries.iter().filter(|entry| entry.live.is_some()).count();
     let columns =
         Layout::horizontal([Constraint::Percentage(34), Constraint::Percentage(66)]).split(area);
-    let items = app
-        .snapshot
-        .rag
-        .sessions
+    let items = entries
         .iter()
-        .map(|session| {
-            let id: String = session.session_id.chars().take(8).collect();
-            let latest_query = session
-                .queries
-                .last()
-                .map(|entry| entry.query.as_str())
-                .unwrap_or("(missing query)");
+        .map(|entry| {
+            let id: String = entry.session_id.chars().take(8).collect();
+            let origin_style = if entry.live.is_some() {
+                theme.success()
+            } else {
+                theme.muted()
+            };
+            let summary = entry
+                .rag
+                .and_then(|session| session.queries.last())
+                .map(|query| query.query.as_str())
+                .or_else(|| entry.live.map(|card| card.latest_user.as_str()))
+                .unwrap_or("(no activity)");
             ListItem::new(vec![
                 Line::from(vec![
                     Span::styled(format!("{id} "), theme.accent()),
-                    Span::styled(format!("{} queries", session.queries.len()), theme.muted()),
-                    Span::styled(format!("  {}", rag_time(&session.latest_ts)), theme.muted()),
+                    Span::styled(format!("{:<8}", entry.origin()), origin_style),
+                    Span::styled(format!(" {} queries", entry.query_count()), theme.muted()),
                 ]),
-                Line::raw(format!("  {}", short_summary(latest_query, 72))),
+                Line::raw(format!("  {}", short_summary(summary, 72))),
             ])
         })
         .collect::<Vec<_>>();
-    let mut state = ListState::default().with_selected(Some(app.selected_session));
+    let selected = app.selected_session.min(entries.len() - 1);
+    let mut state = ListState::default().with_selected(Some(selected));
     let sessions = List::new(items)
         .highlight_symbol("> ")
         .highlight_style(theme.selected())
@@ -875,16 +1005,16 @@ fn draw_sessions(frame: &mut Frame, area: Rect, app: &App) {
                 .border_style(theme.border())
                 .title_style(theme.heading())
                 .title(format!(
-                    " Query sessions · {} ",
-                    app.snapshot.rag.sessions.len()
+                    " Sessions · {} total · {} live ",
+                    entries.len(),
+                    live_count
                 )),
         );
     frame.render_stateful_widget(sessions, columns[0], &mut state);
 
-    let session = &app.snapshot.rag.sessions[app.selected_session];
     let detail = crate::dashboard_theme::style_body(
         crate::dashboard_theme::BodyKind::Sessions,
-        query_results(session),
+        session_details(&entries[selected]),
         theme,
     );
     frame.render_widget(
@@ -1284,6 +1414,44 @@ mod tests {
     }
 
     #[test]
+    fn merges_live_activity_with_matching_rag_session() {
+        let rag_sessions = vec![RagSession {
+            session_id: "12345678-9abc-def0".into(),
+            latest_ts: "1754010120".into(),
+            queries: vec![RagQueryRecord {
+                ts: "1754010120".into(),
+                query: "merged query".into(),
+                injected: 1,
+                hits: Vec::new(),
+                latency_ms: 12,
+            }],
+        }];
+        let activity = vec![crate::activity::ActivityCard {
+            // Activity cards may carry a truncated id, so merging keys on the 8-char prefix.
+            session_id: "12345678".into(),
+            updated_at: "2026-08-01T01:10:00Z".into(),
+            updated_epoch: 1_754_010_600,
+            cwd: "/repo".into(),
+            repo: Some("kmd".into()),
+            summary: "same session live card".into(),
+            latest_user: "same session request".into(),
+            latest_assistant: String::new(),
+            files: Vec::new(),
+            links: Vec::new(),
+        }];
+
+        let merged = merge_session_entries(&rag_sessions, &activity);
+
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].origin(), "live+rag");
+        assert_eq!(merged[0].query_count(), 1);
+        let details = session_details(&merged[0]);
+        assert!(details.contains("origin: live+rag"));
+        assert!(details.contains("same session request"));
+        assert!(details.contains("merged query"));
+    }
+
+    #[test]
     fn renders_dashboard_tabs_and_checks() {
         let snapshot = DashboardSnapshot {
             generated_at: "2026-08-01T00:00:00Z".into(),
@@ -1302,6 +1470,18 @@ mod tests {
                     path: "/knowledge".into(),
                 }],
             },
+            activity: vec![crate::activity::ActivityCard {
+                session_id: "abcdef12-live".into(),
+                updated_at: "2026-08-01T02:00:00Z".into(),
+                updated_epoch: 1_754_013_600,
+                cwd: "/repo".into(),
+                repo: Some("kmd".into()),
+                summary: "live session without kmd retrieval".into(),
+                latest_user: "live session latest request".into(),
+                latest_assistant: "live session latest result".into(),
+                files: vec!["/repo/src/dashboard.rs".into()],
+                links: Vec::new(),
+            }],
             journal: crate::journal::JournalView {
                 from: "20260801".into(),
                 to: "20260801".into(),
@@ -1385,11 +1565,24 @@ mod tests {
         for label in TABS {
             assert!(sessions.contains(label), "missing view {label}");
         }
+        assert!(sessions.contains("abcdef12"));
         assert!(sessions.contains("12345678"));
-        assert!(sessions.contains("QUERY"));
-        assert!(sessions.contains("RESULTS"));
+        assert!(sessions.contains("live"));
+        assert!(sessions.contains("rag"));
         assert!(!sessions.contains("대화 원문은 화면에 표시하지 않는다"));
-        let results = query_results(&app.snapshot.rag.sessions[0]);
+
+        let merged = merge_session_entries(&app.snapshot.rag.sessions, &app.snapshot.activity);
+        assert_eq!(merged.len(), 2);
+        // The live-only session is newer, so it sorts ahead of the retrieval session.
+        assert_eq!(merged[0].origin(), "live");
+        assert_eq!(merged[1].origin(), "rag");
+
+        let live_only = session_details(&merged[0]);
+        assert!(live_only.contains("LIVE ACTIVITY"));
+        assert!(live_only.contains("live session latest request"));
+        assert!(live_only.contains("(no kmd retrieval ran in this session)"));
+
+        let results = session_details(&merged[1]);
         assert!(results.contains("dashboard session query results"));
         assert!(results.contains("12.500 kmd://learnings/dashboard.md"));
         assert!(results.contains("session별 retrieval 결과"));
