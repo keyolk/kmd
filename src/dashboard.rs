@@ -1,11 +1,10 @@
 //! Operations dashboard for kmd runtime state, activity, journal, RAG, and checks.
 
-use crate::palette;
 use anyhow::{Context, Result};
 use chrono::{Local, Utc};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use ratatui::prelude::*;
-use ratatui::widgets::{Block, Borders, Clear, Paragraph, Tabs, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Tabs, Wrap};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::Write;
@@ -14,16 +13,10 @@ use std::time::{Duration, Instant};
 
 const REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 const CHECK_HISTORY_LIMIT: usize = 500;
-const TABS: &[&str] = &[
-    "Overview",
-    "Activity",
-    "Journal",
-    "RAG",
-    "Evaluations",
-    "Checks",
-    "Simulator",
-];
-const SIMULATOR_TAB: usize = 6;
+const TABS: &[&str] = &["Sessions", "Operations", "Simulator"];
+const SESSIONS_TAB: usize = 0;
+const OPERATIONS_TAB: usize = 1;
+const SIMULATOR_TAB: usize = 2;
 
 struct TabGuide {
     purpose: &'static str,
@@ -33,34 +26,14 @@ struct TabGuide {
 
 const TAB_GUIDES: &[TabGuide] = &[
     TabGuide {
-        purpose: "Runtime and knowledge health at a glance.",
-        source: "daemon, hooks, store, collections, recent checks/evaluations",
-        action: "r refreshes · t runs the complete self-check suite",
-    },
-    TabGuide {
-        purpose: "What active Claude sessions are currently doing.",
+        purpose: "Inspect each Claude session as a transparent request → response timeline.",
         source: "live transcripts observed during the last 24 hours",
-        action: "use cwd and session prefix to locate the source session",
+        action: "j/k selects a session · PgUp/PgDn scrolls its complete timeline",
     },
     TabGuide {
-        purpose: "Recent work grouped by date and ranked by repository locality.",
-        source: "persisted learnings plus live session activity",
-        action: "compare current cwd with nearby project/session entries",
-    },
-    TabGuide {
-        purpose: "How UserPromptSubmit retrieval behaves in real usage.",
-        source: "7-day rag.jsonl gate, injection, miss, and latency history",
-        action: "inspect recent prompts, then reproduce one in Simulator",
-    },
-    TabGuide {
-        purpose: "Whether retrieval improves finding, use, and final answers.",
-        source: "persisted L1 eval, L2 utilization, and L3 A/B runs",
-        action: "run kmd eval/util/ab to append comparable measurements",
-    },
-    TabGuide {
-        purpose: "Operational verification of every local kmd dependency.",
-        source: "config, store, index, daemon, hooks, logs, search, activity, journal",
-        action: "t executes checks and keeps the latest 500 runs",
+        purpose: "Monitor runtime, retrieval quality, evaluations, and self-checks together.",
+        source: "daemon, hooks, store, rag.jsonl, evaluations, and check history",
+        action: "r refreshes · t runs the complete self-check suite",
     },
     TabGuide {
         purpose: "Run real queries against the local index without writing logs.",
@@ -318,10 +291,13 @@ pub fn snapshot() -> Result<DashboardSnapshot> {
     let cwd = std::env::current_dir()?.display().to_string();
     let mut errors = Vec::new();
     let runtime = runtime_status(&mut errors);
-    let activity = crate::activity::recent("", &cwd, 30).unwrap_or_else(|error| {
+    let mut activity = crate::activity::recent("", &cwd, 30).unwrap_or_else(|error| {
         errors.push(format!("activity: {error}"));
         Vec::new()
     });
+    if let Err(error) = crate::activity::backfill_turns(&mut activity) {
+        errors.push(format!("activity turn backfill: {error}"));
+    }
     let journal = crate::journal::build(7, None, None, &cwd).unwrap_or_else(|error| {
         errors.push(format!("journal: {error}"));
         crate::journal::JournalView {
@@ -486,379 +462,247 @@ pub fn run_checks() -> Result<CheckRun> {
 struct App {
     tab: usize,
     scroll: u16,
+    selected_session: usize,
     snapshot: DashboardSnapshot,
     simulator: crate::dashboard_simulator::SimulatorState,
+    theme: crate::dashboard_theme::Theme,
     last_refresh: Instant,
     message: String,
-    message_style: Style,
     show_help: bool,
 }
 
 impl App {
     fn refresh(&mut self) {
+        let selected_id = self
+            .snapshot
+            .activity
+            .get(self.selected_session)
+            .map(|card| card.session_id.clone());
         match snapshot() {
             Ok(snapshot) => {
-                let errors = snapshot.errors.len();
                 self.snapshot = snapshot;
+                self.selected_session = selected_id
+                    .and_then(|id| {
+                        self.snapshot
+                            .activity
+                            .iter()
+                            .position(|card| card.session_id == id)
+                    })
+                    .unwrap_or(0);
                 self.last_refresh = Instant::now();
-                if errors == 0 {
-                    self.set_message("refreshed".to_string(), palette::muted());
-                } else {
-                    self.set_message(format!("refreshed with {errors} error(s)"), palette::warn());
-                }
+                self.message = "refreshed".to_string();
             }
-            Err(error) => self.set_message(format!("refresh failed: {error}"), palette::failure()),
+            Err(error) => self.message = format!("refresh failed: {error}"),
         }
-    }
-
-    fn set_message(&mut self, message: String, style: Style) {
-        self.message = message;
-        self.message_style = style;
     }
 
     fn select_tab(&mut self, tab: usize) {
         self.tab = tab % TABS.len();
         self.scroll = 0;
     }
-}
 
-/// `● OK` / `● FAIL` — the word carries the state so monochrome stays readable.
-fn state_badge(ok: bool) -> Span<'static> {
-    Span::styled(
-        if ok { "● OK" } else { "● FAIL" }.to_string(),
-        palette::state(ok),
-    )
-}
-
-fn section(title: &str) -> Line<'static> {
-    Line::from(Span::styled(title.to_string(), palette::heading()))
-}
-
-fn field(name: &str, mut spans: Vec<Span<'static>>) -> Line<'static> {
-    let mut line = vec![
-        Span::raw("  "),
-        Span::styled(format!("{name:<12}"), palette::label()),
-    ];
-    line.append(&mut spans);
-    Line::from(line)
-}
-
-/// Injection rate thresholds mirror how the operator reads the RAG tab: above
-/// half the searched prompts is healthy, a quarter is worth a look, below that
-/// means retrieval is mostly wasted work.
-fn rate_style(pct: f64) -> Style {
-    if pct >= 50.0 {
-        palette::success()
-    } else if pct >= 25.0 {
-        palette::warn()
-    } else {
-        palette::failure()
+    fn select_session(&mut self, next: usize) {
+        if !self.snapshot.activity.is_empty() {
+            self.selected_session = next.min(self.snapshot.activity.len() - 1);
+            self.scroll = 0;
+        }
     }
 }
 
-fn latency_style(ms: u64) -> Style {
-    if ms <= 300 {
-        palette::success()
-    } else if ms <= 1000 {
-        palette::warn()
+fn state_badge(ok: bool) -> &'static str {
+    if ok {
+        crate::dashboard_theme::BADGE_OK
     } else {
-        palette::failure()
+        crate::dashboard_theme::BADGE_FAIL
     }
 }
 
-fn overview_lines(snapshot: &DashboardSnapshot) -> Vec<Line<'static>> {
+fn overview_text(snapshot: &DashboardSnapshot) -> String {
     let runtime = &snapshot.runtime;
-    let hooks_ok = runtime.hooks_installed == runtime.hooks_total;
     let passing_streak = snapshot
         .checks
         .iter()
         .take_while(|run| run.passed == run.total)
         .count();
-
-    let mut lines = vec![section("Runtime")];
-    lines.push(field("daemon", vec![state_badge(runtime.daemon_online)]));
-    lines.push(field(
-        "hooks",
-        vec![
-            Span::styled(
-                format!("{}/{}", runtime.hooks_installed, runtime.hooks_total),
-                palette::state(hooks_ok),
-            ),
-            Span::styled(" installed".to_string(), palette::muted()),
-        ],
-    ));
-    lines.push(field(
-        "documents",
-        vec![
-            Span::styled(runtime.documents.to_string(), palette::strong()),
-            Span::styled(" active / ".to_string(), palette::muted()),
-            Span::styled(
-                runtime.dirty_documents.to_string(),
-                palette::state(runtime.dirty_documents == 0),
-            ),
-            Span::styled(" dirty".to_string(), palette::muted()),
-        ],
-    ));
-    lines.push(field(
-        "socket",
-        vec![Span::styled(
-            runtime.daemon_socket.clone(),
-            palette::muted(),
-        )],
-    ));
-    match snapshot.checks.first() {
-        Some(run) => lines.push(field(
-            "self-check",
-            vec![
+    let check_status = snapshot
+        .checks
+        .first()
+        .map(|run| {
+            format!(
+                "{} {}/{} · {} · streak {}",
                 state_badge(run.passed == run.total),
-                Span::raw(" "),
-                Span::styled(
-                    format!("{}/{}", run.passed, run.total),
-                    palette::state(run.passed == run.total),
-                ),
-                Span::styled(format!(" · {} · ", run.timestamp), palette::muted()),
-                Span::styled(format!("streak {passing_streak}"), palette::value()),
-            ],
-        )),
-        None => lines.push(field(
-            "self-check",
-            vec![Span::styled(
-                "not run (press t)".to_string(),
-                palette::warn(),
-            )],
-        )),
-    }
-
-    lines.push(Line::default());
-    lines.push(section("Knowledge"));
-    lines.push(field(
-        "journal",
-        vec![
-            Span::styled(
-                snapshot.journal.session_count.to_string(),
-                palette::strong(),
-            ),
-            Span::styled(" sessions / ".to_string(), palette::muted()),
-            Span::styled(
-                snapshot.journal.project_count.to_string(),
-                palette::strong(),
-            ),
-            Span::styled(" projects (7d)".to_string(), palette::muted()),
-        ],
-    ));
-    lines.push(field(
-        "activity",
-        vec![
-            Span::styled(snapshot.activity.len().to_string(), palette::strong()),
-            Span::styled(" live cards (24h)".to_string(), palette::muted()),
-        ],
-    ));
-    lines.push(field(
-        "RAG",
-        vec![
-            Span::styled(snapshot.rag.total.to_string(), palette::strong()),
-            Span::styled(" prompts / ".to_string(), palette::muted()),
-            Span::styled(
-                format!("{:.0}%", snapshot.rag.injection_rate_pct),
-                rate_style(snapshot.rag.injection_rate_pct),
-            ),
-            Span::styled(" injection (7d)".to_string(), palette::muted()),
-        ],
-    ));
-    lines.push(field(
-        "latency",
-        vec![
-            Span::styled("median ".to_string(), palette::muted()),
-            Span::styled(
-                format!("{}ms", snapshot.rag.median_latency_ms),
-                latency_style(snapshot.rag.median_latency_ms),
-            ),
-            Span::styled(" · p95 ".to_string(), palette::muted()),
-            Span::styled(
-                format!("{}ms", snapshot.rag.p95_latency_ms),
-                latency_style(snapshot.rag.p95_latency_ms),
-            ),
-        ],
-    ));
-    match snapshot.evaluations.first() {
-        Some(run) => lines.push(field(
-            "evaluation",
-            vec![
-                Span::styled(run.kind.clone(), palette::accent()),
-                Span::styled(" · ".to_string(), palette::muted()),
-                Span::styled(run.summary.clone(), palette::value()),
-                Span::styled(format!(" · {}", run.timestamp), palette::muted()),
-            ],
-        )),
-        None => lines.push(field(
-            "evaluation",
-            vec![Span::styled("not run".to_string(), palette::warn())],
-        )),
-    }
-
-    lines.push(Line::default());
-    lines.push(section("Collections"));
-    for collection in &runtime.collections {
-        lines.push(Line::from(vec![
-            Span::raw("  "),
-            Span::styled(format!("{:<20}", collection.name), palette::label()),
-            Span::styled(format!("{:>6}", collection.documents), palette::strong()),
-            Span::raw("  "),
-            Span::styled(collection.path.clone(), palette::muted()),
-        ]));
-    }
-
-    if !snapshot.errors.is_empty() {
-        lines.push(Line::default());
-        lines.push(Line::from(Span::styled(
-            "Errors".to_string(),
-            palette::failure().add_modifier(Modifier::BOLD),
-        )));
-        for error in &snapshot.errors {
-            lines.push(Line::from(vec![
-                Span::styled("  • ".to_string(), palette::failure()),
-                Span::styled(error.clone(), palette::failure()),
-            ]));
-        }
-    }
-    lines
-}
-
-fn activity_lines(snapshot: &DashboardSnapshot) -> Vec<Line<'static>> {
-    if snapshot.activity.is_empty() {
-        return vec![Line::from(Span::styled(
-            "최근 24시간 activity가 없습니다.".to_string(),
-            palette::muted(),
-        ))];
-    }
-    let mut lines = Vec::new();
-    for card in &snapshot.activity {
-        let time = chrono::DateTime::parse_from_rfc3339(&card.updated_at)
-            .map(|value| {
-                value
-                    .with_timezone(&Local)
-                    .format("%m-%d %H:%M")
-                    .to_string()
-            })
-            .unwrap_or_else(|_| card.updated_at.clone());
-        let id: String = card.session_id.chars().take(8).collect();
-        lines.push(Line::from(vec![
-            Span::styled("● ".to_string(), palette::success()),
-            Span::styled(time, palette::label()),
-            Span::raw("  "),
-            Span::styled(
-                format!("{:<16}", card.repo.as_deref().unwrap_or("(no repo)")),
-                palette::accent(),
-            ),
-            Span::styled(id, palette::muted()),
-        ]));
-        lines.push(Line::from(vec![
-            Span::raw("  "),
-            Span::styled(card.summary.clone(), palette::value()),
-        ]));
-        if card.latest_user != card.summary {
-            lines.push(Line::from(vec![
-                Span::styled("  현재: ".to_string(), palette::label()),
-                Span::styled(card.latest_user.clone(), palette::value()),
-            ]));
-        }
-        if !card.latest_assistant.is_empty() {
-            lines.push(Line::from(vec![
-                Span::styled("  결과: ".to_string(), palette::label()),
-                Span::styled(card.latest_assistant.clone(), palette::value()),
-            ]));
-        }
-        lines.push(Line::from(vec![
-            Span::styled("  cwd: ".to_string(), palette::muted()),
-            Span::styled(card.cwd.clone(), palette::muted()),
-        ]));
-        lines.push(Line::default());
-    }
-    lines
-}
-
-fn rag_lines(snapshot: &DashboardSnapshot) -> Vec<Line<'static>> {
-    let rag = &snapshot.rag;
-    let mut lines = vec![
-        section("Last 7 days"),
-        Line::from(vec![
-            Span::styled("  total ".to_string(), palette::muted()),
-            Span::styled(rag.total.to_string(), palette::strong()),
-            Span::styled(" · searched ".to_string(), palette::muted()),
-            Span::styled(rag.searched.to_string(), palette::value()),
-            Span::styled(" · gated ".to_string(), palette::muted()),
-            Span::styled(rag.gated.to_string(), palette::warn()),
-            Span::styled(" · injected ".to_string(), palette::muted()),
-            Span::styled(rag.injected.to_string(), palette::success()),
-            Span::raw(" "),
-            Span::styled(
-                format!("({:.0}%)", rag.injection_rate_pct),
-                rate_style(rag.injection_rate_pct),
-            ),
-        ]),
-        Line::from(vec![
-            Span::styled("  latency median ".to_string(), palette::muted()),
-            Span::styled(
-                format!("{}ms", rag.median_latency_ms),
-                latency_style(rag.median_latency_ms),
-            ),
-            Span::styled(" · p95 ".to_string(), palette::muted()),
-            Span::styled(
-                format!("{}ms", rag.p95_latency_ms),
-                latency_style(rag.p95_latency_ms),
-            ),
-        ]),
-        Line::default(),
-        section("Recent prompts"),
-    ];
-    for entry in &rag.recent {
-        let (status, status_style) = if entry.stage == "gated" {
-            (
-                format!("GATED:{}", entry.gate_reason.as_deref().unwrap_or("?")),
-                palette::warn(),
+                run.passed,
+                run.total,
+                run.timestamp,
+                passing_streak
             )
-        } else if entry.injected > 0 {
-            (format!("INJ:{}", entry.injected), palette::success())
-        } else {
-            ("MISS".to_string(), palette::muted())
-        };
-        let prompt: String = entry.prompt.chars().take(100).collect();
-        lines.push(Line::from(vec![
-            Span::raw("  "),
-            Span::styled(format!("{status:<16}"), status_style),
-            Span::styled(
-                format!("{:>5}ms", entry.latency_ms),
-                latency_style(entry.latency_ms),
-            ),
-            Span::styled(format!("  {}", entry.ts), palette::muted()),
-        ]));
-        lines.push(Line::from(vec![
-            Span::raw("    "),
-            Span::styled(prompt, palette::value()),
-        ]));
+        })
+        .unwrap_or_else(|| "not run (press t)".to_string());
+    let evaluation_status = snapshot
+        .evaluations
+        .first()
+        .map(|run| format!("{} · {} · {}", run.kind, run.summary, run.timestamp))
+        .unwrap_or_else(|| "not run".to_string());
+    let hooks_warning =
+        crate::dashboard_theme::warning_suffix(runtime.hooks_installed < runtime.hooks_total);
+    let documents_warning = crate::dashboard_theme::warning_suffix(runtime.dirty_documents > 0);
+    let mut output = format!(
+        "Runtime\n  {:<12} {}\n  {:<12} {}/{} installed{}\n  {:<12} {} active / {} dirty{}\n  {:<12} {}\n  {:<12} {}\n\nKnowledge\n  {:<12} {} sessions / {} projects (7d)\n  {:<12} {} live cards (24h)\n  {:<12} {} prompts / {:.0}% injection (7d)\n  {:<12} median {}ms / p95 {}ms\n  {:<12} {}\n",
+        "daemon",
+        state_badge(runtime.daemon_online),
+        "hooks",
+        runtime.hooks_installed,
+        runtime.hooks_total,
+        hooks_warning,
+        "documents",
+        runtime.documents,
+        runtime.dirty_documents,
+        documents_warning,
+        "socket",
+        runtime.daemon_socket,
+        "self-check",
+        check_status,
+        "journal",
+        snapshot.journal.session_count,
+        snapshot.journal.project_count,
+        "activity",
+        snapshot.activity.len(),
+        "RAG",
+        snapshot.rag.total,
+        snapshot.rag.injection_rate_pct,
+        "latency",
+        snapshot.rag.median_latency_ms,
+        snapshot.rag.p95_latency_ms,
+        "evaluation",
+        evaluation_status,
+    );
+    output.push_str("\nCollections\n");
+    for collection in &runtime.collections {
+        output.push_str(&format!(
+            "  {:<20} {:>6}  {}\n",
+            collection.name, collection.documents, collection.path
+        ));
     }
-    lines
+    if !snapshot.errors.is_empty() {
+        output.push_str("\nErrors\n");
+        for error in &snapshot.errors {
+            output.push_str(&format!("  • {error}\n"));
+        }
+    }
+    output
 }
 
-fn evaluations_lines(snapshot: &DashboardSnapshot) -> Vec<Line<'static>> {
-    if snapshot.evaluations.is_empty() {
-        return vec![Line::from(Span::styled(
-            "아직 평가 기록이 없습니다. kmd eval, kmd util, 또는 kmd ab를 실행하세요.".to_string(),
-            palette::warn(),
-        ))];
+fn session_time(timestamp: &str) -> String {
+    chrono::DateTime::parse_from_rfc3339(timestamp)
+        .map(|value| value.with_timezone(&Local).format("%H:%M:%S").to_string())
+        .unwrap_or_else(|_| "--:--:--".to_string())
+}
+
+fn session_timeline(card: &crate::activity::ActivityCard) -> String {
+    let id: String = card.session_id.chars().take(8).collect();
+    let mut output = format!(
+        "Session {id}\nrepo: {}\ncwd: {}\nupdated: {}\nturns: {}\n",
+        card.repo.as_deref().unwrap_or("(no repo)"),
+        card.cwd,
+        card.updated_at,
+        card.turns.len()
+    );
+    if !card.files.is_empty() {
+        output.push_str(&format!("files: {}\n", card.files.join(", ")));
     }
-    let mut lines = vec![
-        section("Successful L1 retrieval, L2 utilization, and L3 A/B runs · latest first"),
-        Line::default(),
-    ];
+    output.push('\n');
+
+    if card.turns.is_empty() {
+        output
+            .push_str("이 카드는 이전 저장 형식으로 생성되어 마지막 요청과 응답만 표시합니다.\n\n");
+        output.push_str("USER\n");
+        output.push_str(&card.latest_user);
+        output.push_str("\n\nCLAUDE\n");
+        if card.latest_assistant.is_empty() {
+            output.push_str("(텍스트 응답 없음)\n");
+        } else {
+            output.push_str(&card.latest_assistant);
+            output.push('\n');
+        }
+        return output;
+    }
+
+    for (index, turn) in card.turns.iter().enumerate() {
+        output.push_str(&format!(
+            "── Turn {} · {} ──\nUSER\n{}\n\nCLAUDE\n",
+            index + 1,
+            session_time(&turn.timestamp),
+            turn.user
+        ));
+        if turn.assistant.is_empty() {
+            output.push_str("(텍스트 응답 없음 또는 응답 대기 중)");
+        } else {
+            output.push_str(&turn.assistant);
+        }
+        output.push_str("\n\n");
+    }
+    output
+}
+
+fn operations_text(snapshot: &DashboardSnapshot) -> String {
+    let mut output = overview_text(snapshot);
+    output.push_str("\nRetrieval\n");
+    output.push_str(&rag_text(snapshot));
+    output.push_str("\nEvaluations\n");
+    output.push_str(&evaluations_text(snapshot));
+    output.push_str("\nSelf-checks\n");
+    output.push_str(&checks_text(snapshot));
+    output
+}
+
+fn rag_text(snapshot: &DashboardSnapshot) -> String {
+    let rag = &snapshot.rag;
+    let mut output = format!(
+        "Last 7 days\n  total {} · searched {} · gated {} · injected {} ({:.0}%)\n  latency median {}ms · p95 {}ms\n\nRecent prompts\n",
+        rag.total,
+        rag.searched,
+        rag.gated,
+        rag.injected,
+        rag.injection_rate_pct,
+        rag.median_latency_ms,
+        rag.p95_latency_ms
+    );
+    for entry in &rag.recent {
+        let status = if entry.stage == "gated" {
+            format!("GATED:{}", entry.gate_reason.as_deref().unwrap_or("?"))
+        } else if entry.injected > 0 {
+            format!("INJ:{}", entry.injected)
+        } else {
+            "MISS".to_string()
+        };
+        // Keep every entry on its two-line layout; embedded newlines would also mimic status rows.
+        let prompt: String = entry
+            .prompt
+            .replace(['\r', '\n'], " ")
+            .chars()
+            .take(100)
+            .collect();
+        // dashboard_theme recognizes status rows by this two-space indent; prompt rows use four.
+        output.push_str(&format!(
+            "  {:<16} {:>5}ms  {}\n    {}\n",
+            status, entry.latency_ms, entry.ts, prompt
+        ));
+    }
+    output
+}
+
+fn evaluations_text(snapshot: &DashboardSnapshot) -> String {
+    if snapshot.evaluations.is_empty() {
+        return "아직 평가 기록이 없습니다. kmd eval, kmd util, 또는 kmd ab를 실행하세요."
+            .to_string();
+    }
+    let mut output =
+        String::from("Successful L1 retrieval, L2 utilization, and L3 A/B runs · latest first\n\n");
     for run in &snapshot.evaluations {
-        lines.push(Line::from(vec![
-            Span::styled("● ".to_string(), palette::accent()),
-            Span::styled(run.timestamp.clone(), palette::muted()),
-            Span::raw("  "),
-            Span::styled(format!("{:<18}", run.kind), palette::accent()),
-            Span::styled(run.summary.clone(), palette::value()),
-        ]));
+        output.push_str(&format!(
+            "● {}  {:<18} {}\n",
+            run.timestamp, run.kind, run.summary
+        ));
         if let Some(object) = run.metrics.as_object() {
             let details = object
                 .iter()
@@ -867,129 +711,164 @@ fn evaluations_lines(snapshot: &DashboardSnapshot) -> Vec<Line<'static>> {
                 .map(|(key, value)| format!("{key}={value}"))
                 .collect::<Vec<_>>();
             if !details.is_empty() {
-                lines.push(Line::from(vec![
-                    Span::raw("  "),
-                    Span::styled(details.join(" · "), palette::muted()),
-                ]));
+                output.push_str(&format!("  {}\n", details.join(" · ")));
             }
         }
-        lines.push(Line::default());
+        output.push('\n');
     }
-    lines
+    output
 }
 
-fn checks_lines(snapshot: &DashboardSnapshot) -> Vec<Line<'static>> {
+fn checks_text(snapshot: &DashboardSnapshot) -> String {
     if snapshot.checks.is_empty() {
-        return vec![Line::from(Span::styled(
-            "아직 self-check 기록이 없습니다. t를 눌러 실행하세요.".to_string(),
-            palette::warn(),
-        ))];
+        return "아직 self-check 기록이 없습니다. t를 눌러 실행하세요.".to_string();
     }
-    let mut lines = Vec::new();
+    let mut output = String::new();
     for run in &snapshot.checks {
-        let ok = run.passed == run.total;
-        lines.push(Line::from(vec![
-            Span::styled(run.timestamp.clone(), palette::muted()),
-            Span::raw("  "),
-            Span::styled(
-                format!("{}/{} passed", run.passed, run.total),
-                palette::state(ok),
-            ),
-            Span::styled(format!("  {}ms", run.duration_ms), palette::muted()),
-        ]));
+        output.push_str(&format!(
+            "{}  {}  {}/{} passed  {}ms\n",
+            run.timestamp,
+            state_badge(run.passed == run.total),
+            run.passed,
+            run.total,
+            run.duration_ms
+        ));
         for item in &run.checks {
-            lines.push(Line::from(vec![
-                Span::raw("  "),
-                Span::styled(
-                    if item.ok { "✓" } else { "✗" }.to_string(),
-                    palette::state(item.ok),
-                ),
-                Span::raw(" "),
-                Span::styled(format!("{:<16}", item.name), palette::label()),
-                Span::styled(
-                    item.detail.clone(),
-                    if item.ok {
-                        palette::value()
-                    } else {
-                        palette::failure()
-                    },
-                ),
-            ]));
+            output.push_str(&format!(
+                "  {} {:<16} {}\n",
+                if item.ok { "✓" } else { "✗" },
+                item.name,
+                item.detail
+            ));
         }
-        lines.push(Line::default());
+        output.push('\n');
     }
-    lines
+    output
 }
 
-/// Colorize `journal::render` output by structural prefix so the journal tab
-/// gains hierarchy without duplicating the renderer.
-fn journal_lines(rendered: &str) -> Vec<Line<'static>> {
-    rendered
-        .lines()
-        .map(|raw| {
-            let trimmed = raw.trim_start();
-            let indent = raw.len() - trimmed.len();
-            let style = if raw.starts_with("kmd journal") {
-                palette::heading()
-            } else if raw.starts_with("anchor:") {
-                palette::muted()
-            } else if indent == 0 && !trimmed.is_empty() {
-                palette::heading()
-            } else if indent == 2 {
-                palette::accent()
-            } else if trimmed.starts_with('●') {
-                palette::success()
-            } else if trimmed.starts_with('○') {
-                palette::value()
-            } else if trimmed.starts_with("cwd:")
-                || trimmed.starts_with("worktree:")
-                || trimmed.starts_with("workspace:")
-            {
-                palette::muted()
-            } else if trimmed.starts_with("현재:") {
-                palette::label()
-            } else {
-                palette::value()
-            };
-            Line::from(Span::styled(raw.to_string(), style))
-        })
-        .collect()
-}
-
-fn body_lines(app: &App) -> Vec<Line<'static>> {
+fn body_content(app: &App) -> Option<(crate::dashboard_theme::BodyKind, String)> {
     match app.tab {
-        0 => overview_lines(&app.snapshot),
-        1 => activity_lines(&app.snapshot),
-        2 => journal_lines(&crate::journal::render(&app.snapshot.journal)),
-        3 => rag_lines(&app.snapshot),
-        4 => evaluations_lines(&app.snapshot),
-        5 => checks_lines(&app.snapshot),
-        _ => Vec::new(),
+        OPERATIONS_TAB => Some((
+            crate::dashboard_theme::BodyKind::Operations,
+            operations_text(&app.snapshot),
+        )),
+        _ => None,
     }
+}
+
+fn short_summary(value: &str, limit: usize) -> String {
+    if value.chars().count() <= limit {
+        value.to_string()
+    } else {
+        format!("{}…", value.chars().take(limit).collect::<String>())
+    }
+}
+
+fn draw_sessions(frame: &mut Frame, area: Rect, app: &App) {
+    let theme = app.theme;
+    if app.snapshot.activity.is_empty() {
+        frame.render_widget(
+            Paragraph::new(
+                "최근 24시간의 session activity가 없습니다.\nClaude 세션에서 Stop hook이 실행되면 요청과 응답 timeline이 여기에 나타납니다.",
+            )
+            .wrap(Wrap { trim: false })
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(theme.border())
+                    .title_style(theme.heading())
+                    .title(" Sessions "),
+            ),
+            area,
+        );
+        return;
+    }
+
+    let columns =
+        Layout::horizontal([Constraint::Percentage(34), Constraint::Percentage(66)]).split(area);
+    let items = app
+        .snapshot
+        .activity
+        .iter()
+        .map(|card| {
+            let id: String = card.session_id.chars().take(8).collect();
+            let updated = chrono::DateTime::parse_from_rfc3339(&card.updated_at)
+                .map(|value| {
+                    value
+                        .with_timezone(&Local)
+                        .format("%m-%d %H:%M")
+                        .to_string()
+                })
+                .unwrap_or_else(|_| card.updated_at.clone());
+            ListItem::new(vec![
+                Line::from(vec![
+                    Span::styled(format!("{id} "), theme.accent()),
+                    Span::raw(card.repo.as_deref().unwrap_or("(no repo)").to_string()),
+                    Span::styled(format!("  {updated}"), theme.muted()),
+                ]),
+                Line::raw(format!("  {}", short_summary(&card.latest_user, 72))),
+            ])
+        })
+        .collect::<Vec<_>>();
+    let mut state = ListState::default().with_selected(Some(app.selected_session));
+    let sessions = List::new(items)
+        .highlight_symbol("> ")
+        .highlight_style(theme.selected())
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(theme.border())
+                .title_style(theme.heading())
+                .title(format!(" Sessions · {} live ", app.snapshot.activity.len())),
+        );
+    frame.render_stateful_widget(sessions, columns[0], &mut state);
+
+    let card = &app.snapshot.activity[app.selected_session];
+    let timeline = crate::dashboard_theme::style_body(
+        crate::dashboard_theme::BodyKind::Sessions,
+        session_timeline(card),
+        theme,
+    );
+    frame.render_widget(
+        Paragraph::new(timeline)
+            .scroll((app.scroll, 0))
+            .wrap(Wrap { trim: false })
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(theme.border())
+                    .title_style(theme.heading())
+                    .title(format!(
+                        " Request → Claude response · scroll {} ",
+                        app.scroll
+                    )),
+            ),
+        columns[1],
+    );
 }
 
 const HELP_ROWS: &[(&str, &str)] = &[
-    ("1-7", "jump to a tab"),
-    ("Tab / Shift-Tab", "next / previous tab"),
-    ("h l  ← →", "previous / next tab"),
-    ("j k  ↑ ↓", "scroll (Simulator: select hit)"),
-    ("J K", "Simulator: scroll result detail"),
-    ("PgUp PgDn", "scroll a page"),
-    ("g G", "jump to top / bottom"),
+    ("1-3 / Tab", "switch view"),
+    ("h/l / ←/→", "previous / next view"),
+    ("j/k / ↑/↓", "Sessions: select session · Operations: scroll"),
+    ("PgUp/PgDn", "scroll the timeline or Operations"),
+    ("g / G", "top / bottom"),
     ("r", "refresh the snapshot"),
     ("t", "run the self-check suite"),
-    ("i or /", "Simulator: start typing a query"),
+    ("i or /", "Simulator: start typing"),
     ("Esc", "Simulator: stop typing · otherwise quit"),
     ("Enter", "Simulator: run the query"),
     ("m", "Simulator: RAG pipeline ⇄ BM25 search"),
+    ("j/k", "Simulator: select a hit"),
+    ("J/K", "Simulator: scroll result detail"),
+    ("n/p", "Simulator: next / previous prompt history"),
     ("x", "Simulator: clear the query"),
-    ("n p", "Simulator: next / previous prompt history"),
     ("?", "toggle this help"),
     ("q", "quit"),
 ];
 
-fn draw_help(frame: &mut Frame, area: Rect) {
-    let width = area.width.saturating_sub(4).min(64).max(20);
+fn draw_help(frame: &mut Frame, area: Rect, theme: crate::dashboard_theme::Theme) {
+    let width = area.width.saturating_sub(4).min(72).max(20);
     let height = (HELP_ROWS.len() as u16 + 2).min(area.height.saturating_sub(2).max(3));
     let popup = Rect {
         x: area.x + (area.width.saturating_sub(width)) / 2,
@@ -1002,8 +881,8 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         .map(|(keys, description)| {
             Line::from(vec![
                 Span::raw(" "),
-                Span::styled(format!("{keys:<16}"), palette::label()),
-                Span::styled((*description).to_string(), palette::value()),
+                Span::styled(format!("{keys:<18}"), theme.heading()),
+                Span::raw((*description).to_string()),
             ])
         })
         .collect::<Vec<_>>();
@@ -1012,17 +891,16 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         Paragraph::new(rows).block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(palette::border_focus())
-                .title(Span::styled(
-                    " keys · ? or Esc closes ".to_string(),
-                    palette::heading(),
-                )),
+                .border_style(theme.selected())
+                .title_style(theme.heading())
+                .title(" keys · ? or Esc closes "),
         ),
         popup,
     );
 }
 
 fn draw(frame: &mut Frame, app: &App) {
+    let theme = app.theme;
     let areas = Layout::vertical([
         Constraint::Length(3),
         Constraint::Length(4),
@@ -1033,44 +911,33 @@ fn draw(frame: &mut Frame, app: &App) {
     let titles = TABS
         .iter()
         .enumerate()
-        .map(|(index, title)| {
-            Line::from(vec![
-                Span::styled(format!(" {}:", index + 1), palette::muted()),
-                Span::raw(format!("{title} ")),
-            ])
-        })
+        .map(|(index, title)| Line::from(format!(" {}:{} ", index + 1, title)))
         .collect::<Vec<_>>();
     let tabs = Tabs::new(titles)
         .select(app.tab)
-        .style(palette::value())
-        .highlight_style(palette::heading().add_modifier(Modifier::REVERSED))
+        .highlight_style(theme.selected())
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(palette::border())
-                .title(Line::from(vec![
-                    Span::styled(" kmd dashboard ".to_string(), palette::heading()),
-                    Span::styled(
-                        format!("· {} ", app.snapshot.generated_at),
-                        palette::muted(),
-                    ),
-                ])),
+                .border_style(theme.border())
+                .title_style(theme.heading())
+                .title(format!(" kmd dashboard · {} ", app.snapshot.generated_at)),
         );
     frame.render_widget(tabs, areas[0]);
 
     let guide = &TAB_GUIDES[app.tab];
     let guide_text = Text::from(vec![
         Line::from(vec![
-            Span::styled("Purpose  ", palette::heading()),
-            Span::styled(guide.purpose.to_string(), palette::value()),
+            Span::styled("Purpose  ", theme.heading()),
+            Span::raw(guide.purpose),
         ]),
         Line::from(vec![
-            Span::styled("Data     ", palette::label()),
-            Span::styled(guide.source.to_string(), palette::muted()),
+            Span::styled("Data     ", theme.muted()),
+            Span::raw(guide.source),
         ]),
         Line::from(vec![
-            Span::styled("Action   ", palette::label()),
-            Span::styled(guide.action.to_string(), palette::muted()),
+            Span::styled("Action   ", theme.muted()),
+            Span::raw(guide.action),
         ]),
     ]);
     frame.render_widget(
@@ -1078,49 +945,49 @@ fn draw(frame: &mut Frame, app: &App) {
         areas[1],
     );
 
-    if app.tab == SIMULATOR_TAB {
+    if app.tab == SESSIONS_TAB {
+        draw_sessions(frame, areas[2], app);
+    } else if app.tab == SIMULATOR_TAB {
         crate::dashboard_simulator::draw(frame, areas[2], &app.simulator);
-    } else {
-        let body = Paragraph::new(body_lines(app))
+    } else if let Some((kind, content)) = body_content(app) {
+        let body = Paragraph::new(crate::dashboard_theme::style_body(kind, content, theme))
             .scroll((app.scroll, 0))
             .wrap(Wrap { trim: false })
             .block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .border_style(palette::border_focus())
-                    .title(Line::from(vec![
-                        Span::styled(format!(" {} ", TABS[app.tab]), palette::heading()),
-                        Span::styled(format!("· scroll {} ", app.scroll), palette::muted()),
-                    ])),
+                    .border_style(theme.border())
+                    .title_style(theme.heading())
+                    .title(format!(" {} · scroll {} ", TABS[app.tab], app.scroll)),
             );
         frame.render_widget(body, areas[2]);
     }
 
     let hints = if app.tab == SIMULATOR_TAB {
         if app.simulator.typing() {
-            "typing · Esc: stop  Enter: run  ↑/↓: history"
+            "typing · Esc: command  Enter: run  ↑/↓: history  ?: keys"
         } else {
             "i: type  Enter: run  m: mode  j/k: hit  J/K: detail  x: clear  ?: keys"
         }
+    } else if app.tab == SESSIONS_TAB {
+        "1-3/Tab: view  j/k: session  PgUp/PgDn: timeline  r: refresh  t: checks  ?: keys"
     } else {
-        "1-7/Tab: tab  j/k: scroll  g/G: top/bottom  r: refresh  t: self-check  ?: keys  q: quit"
+        "1-3/Tab: view  j/k: scroll  g/G: top/bottom  r: refresh  t: checks  ?: keys"
     };
-    let mut footer = vec![Span::styled(hints.to_string(), palette::muted())];
-    if !app.message.is_empty() {
-        footer.push(Span::styled("  ·  ".to_string(), palette::muted()));
-        footer.push(Span::styled(app.message.clone(), app.message_style));
-    }
-    frame.render_widget(Paragraph::new(Line::from(footer)), areas[3]);
+    let footer = Line::from(vec![
+        Span::styled(hints.to_string(), theme.muted()),
+        Span::styled("  ·  ".to_string(), theme.muted()),
+        Span::styled(app.message.clone(), theme.muted()),
+    ]);
+    frame.render_widget(Paragraph::new(footer), areas[3]);
 
     if app.show_help {
-        draw_help(frame, frame.area());
+        draw_help(frame, frame.area(), theme);
     }
 }
 
 fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) -> Result<bool> {
-    // Terminal-reserved chords (Ctrl/Alt) are deliberately unbound: the
-    // Simulator uses a command/typing mode split instead, so plain letters stay
-    // available as commands without stealing keys the terminal owns.
+    // Ctrl/Alt/Super chords belong to the terminal or multiplexer and must pass through.
     if crate::dashboard_simulator::is_reserved_chord(&key) {
         return Ok(false);
     }
@@ -1140,30 +1007,29 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) -> Result<bool> {
         KeyCode::Left | KeyCode::Char('h') | KeyCode::BackTab => {
             app.select_tab((app.tab + TABS.len() - 1) % TABS.len())
         }
-        KeyCode::Char(value @ '1'..='7') => app.select_tab((value as usize) - ('1' as usize)),
+        KeyCode::Char(value @ '1'..='3') => app.select_tab((value as usize) - ('1' as usize)),
         KeyCode::Char('r') => app.refresh(),
         KeyCode::Char('t') => match run_checks() {
             Ok(run) => {
                 app.refresh();
-                app.set_message(
-                    format!("self-check: {}/{} passed", run.passed, run.total),
-                    palette::state(run.passed == run.total),
-                );
-                app.select_tab(5);
+                app.message = format!("self-check: {}/{} passed", run.passed, run.total);
+                app.select_tab(OPERATIONS_TAB);
             }
-            Err(error) => {
-                app.set_message(format!("self-check failed: {error}"), palette::failure())
-            }
+            Err(error) => app.message = format!("self-check failed: {error}"),
         },
-        _ if app.tab == SIMULATOR_TAB => {
-            app.simulator.handle_command_key(key);
+        _ if app.tab == SIMULATOR_TAB => app.simulator.handle_command_key(key),
+        KeyCode::Down | KeyCode::Char('j') if app.tab == SESSIONS_TAB => {
+            app.select_session(app.selected_session.saturating_add(1));
+        }
+        KeyCode::Up | KeyCode::Char('k') if app.tab == SESSIONS_TAB => {
+            app.select_session(app.selected_session.saturating_sub(1));
         }
         KeyCode::Down | KeyCode::Char('j') => app.scroll = app.scroll.saturating_add(1),
         KeyCode::Up | KeyCode::Char('k') => app.scroll = app.scroll.saturating_sub(1),
         KeyCode::PageDown => app.scroll = app.scroll.saturating_add(10),
         KeyCode::PageUp => app.scroll = app.scroll.saturating_sub(10),
-        KeyCode::Char('g') | KeyCode::Home => app.scroll = 0,
-        KeyCode::Char('G') | KeyCode::End => app.scroll = u16::MAX / 2,
+        KeyCode::Home | KeyCode::Char('g') => app.scroll = 0,
+        KeyCode::End | KeyCode::Char('G') => app.scroll = u16::MAX,
         _ => {}
     }
     Ok(false)
@@ -1242,13 +1108,14 @@ pub fn run(json: bool, check_only: bool) -> Result<()> {
         return Ok(());
     }
     run_tui(App {
-        tab: 0,
+        tab: SESSIONS_TAB,
         scroll: 0,
+        selected_session: 0,
         snapshot,
         simulator: crate::dashboard_simulator::SimulatorState::new(),
+        theme: crate::dashboard_theme::Theme::from_env(),
         last_refresh: Instant::now(),
         message: "auto-refresh 5s".to_string(),
-        message_style: palette::muted(),
         show_help: false,
     })
 }
@@ -1256,7 +1123,6 @@ pub fn run(json: bool, check_only: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crossterm::event::{KeyEvent, KeyModifiers};
 
     #[test]
     fn rag_summary_handles_empty_log() {
@@ -1314,21 +1180,9 @@ mod tests {
         assert!(error.to_string().contains("line 1"));
     }
 
-    fn test_app() -> App {
-        App {
-            tab: 0,
-            scroll: 0,
-            snapshot: sample_snapshot(),
-            simulator: crate::dashboard_simulator::SimulatorState::new(),
-            last_refresh: Instant::now(),
-            message: "ready".into(),
-            message_style: palette::muted(),
-            show_help: false,
-        }
-    }
-
-    fn sample_snapshot() -> DashboardSnapshot {
-        DashboardSnapshot {
+    #[test]
+    fn renders_dashboard_tabs_and_checks() {
+        let snapshot = DashboardSnapshot {
             generated_at: "2026-08-01T00:00:00Z".into(),
             cwd: "/repo".into(),
             runtime: RuntimeStatus {
@@ -1345,7 +1199,23 @@ mod tests {
                     path: "/knowledge".into(),
                 }],
             },
-            activity: Vec::new(),
+            activity: vec![crate::activity::ActivityCard {
+                session_id: "12345678-session".into(),
+                updated_at: "2026-08-01T01:02:00Z".into(),
+                updated_epoch: 1_754_011_320,
+                cwd: "/repo".into(),
+                repo: Some("kmd".into()),
+                summary: "대시보드 세션 흐름을 개선한다".into(),
+                latest_user: "질의와 응답을 세션별로 보여줘".into(),
+                latest_assistant: "세션 중심 화면으로 변경했습니다.".into(),
+                turns: vec![crate::activity::ActivityTurn {
+                    timestamp: "2026-08-01T01:01:00Z".into(),
+                    user: "질의와 응답을 세션별로 보여줘".into(),
+                    assistant: "세션 중심 화면으로 변경했습니다.".into(),
+                }],
+                files: vec!["/repo/src/dashboard.rs".into()],
+                links: Vec::new(),
+            }],
             journal: crate::journal::JournalView {
                 from: "20260801".into(),
                 to: "20260801".into(),
@@ -1365,7 +1235,21 @@ mod tests {
                 injection_rate_pct: 50.0,
                 median_latency_ms: 80,
                 p95_latency_ms: 120,
-                recent: Vec::new(),
+                recent: vec![crate::rag::RagLogEntry {
+                    ts: "2026-08-01T00:00:00Z".into(),
+                    session_id: "session".into(),
+                    prompt: "MISS should remain prompt text\nafter normalization".into(),
+                    prompt_len: "MISS should remain prompt text\nafter normalization"
+                        .chars()
+                        .count(),
+                    hangul: false,
+                    stage: "gated".into(),
+                    gate_reason: Some("too_short".into()),
+                    query: None,
+                    injected: 0,
+                    hits: Vec::new(),
+                    latency_ms: 0,
+                }],
             },
             evaluations: vec![crate::evaluation_log::EvaluationRun {
                 timestamp: "2026-08-01T00:00:00Z".into(),
@@ -1375,16 +1259,22 @@ mod tests {
             }],
             checks: vec![check_run()],
             errors: Vec::new(),
-        }
-    }
-
-    #[test]
-    fn renders_dashboard_tabs_and_checks() {
-        let mut app = test_app();
+        };
+        let mut app = App {
+            tab: SESSIONS_TAB,
+            scroll: 0,
+            selected_session: 0,
+            snapshot,
+            simulator: crate::dashboard_simulator::SimulatorState::new(),
+            theme: crate::dashboard_theme::Theme::colored(),
+            last_refresh: Instant::now(),
+            message: "ready".into(),
+            show_help: false,
+        };
         let backend = ratatui::backend::TestBackend::new(120, 40);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|frame| draw(frame, &app)).unwrap();
-        let overview = terminal
+        let sessions = terminal
             .backend()
             .buffer()
             .content()
@@ -1392,134 +1282,139 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
         for label in TABS {
-            assert!(overview.contains(label), "missing tab {label}");
+            assert!(sessions.contains(label), "missing view {label}");
         }
-        assert!(overview.contains("42 active / 0 dirty"));
-        assert!(overview.contains("1/1"));
-        assert!(overview.contains("streak 1"));
+        assert!(sessions.contains("12345678"));
+        assert!(sessions.contains("USER"));
+        assert!(sessions.contains("CLAUDE"));
+        let timeline = session_timeline(&app.snapshot.activity[0]);
+        assert!(timeline.contains("질의와 응답을 세션별로 보여줘"));
+        assert!(timeline.contains("세션 중심 화면으로 변경했습니다."));
 
-        app.select_tab(4);
+        app.theme = crate::dashboard_theme::Theme::plain();
         terminal.draw(|frame| draw(frame, &app)).unwrap();
-        let evaluations = terminal
-            .backend()
-            .buffer()
-            .content()
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect::<String>();
-        assert!(evaluations.contains("eval-known-item"));
-        assert!(evaluations.contains("R@5 90%"));
-
-        app.select_tab(5);
-        terminal.draw(|frame| draw(frame, &app)).unwrap();
-        let checks = terminal
-            .backend()
-            .buffer()
-            .content()
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect::<String>();
-        assert!(checks.contains("1/1 passed"));
-        assert!(checks.contains("42 active, 0 dirty"));
-    }
-
-    #[test]
-    fn overview_colors_state_and_thresholds() {
-        let lines = overview_lines(&sample_snapshot());
-        let styles: Vec<Style> = lines
-            .iter()
-            .flat_map(|line| line.spans.iter().map(|span| span.style))
-            .collect();
-
         assert!(
-            styles.contains(&palette::success()),
-            "healthy state should use the success token"
+            terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .all(|cell| cell.fg == Color::Reset)
         );
-        assert!(
-            styles.contains(&palette::heading()),
-            "sections should use the heading token"
-        );
-        assert!(
-            styles.contains(&palette::muted()),
-            "metadata should use the muted token"
-        );
-    }
+        app.theme = crate::dashboard_theme::Theme::colored();
 
-    #[test]
-    fn rate_and_latency_thresholds_map_to_tokens() {
-        assert_eq!(rate_style(80.0), palette::success());
-        assert_eq!(rate_style(30.0), palette::warn());
-        assert_eq!(rate_style(5.0), palette::failure());
+        let mut second = app.snapshot.activity[0].clone();
+        second.session_id = "87654321-session".into();
+        app.snapshot.activity.push(second);
+        handle_key(
+            &mut app,
+            crossterm::event::KeyEvent::new(
+                KeyCode::Char('j'),
+                crossterm::event::KeyModifiers::NONE,
+            ),
+        )
+        .unwrap();
+        assert_eq!(app.selected_session, 1);
+        assert_eq!(app.scroll, 0);
+        handle_key(
+            &mut app,
+            crossterm::event::KeyEvent::new(
+                KeyCode::PageDown,
+                crossterm::event::KeyModifiers::NONE,
+            ),
+        )
+        .unwrap();
+        assert_eq!(app.selected_session, 1);
+        assert_eq!(app.scroll, 10);
 
-        assert_eq!(latency_style(120), palette::success());
-        assert_eq!(latency_style(700), palette::warn());
-        assert_eq!(latency_style(2500), palette::failure());
-    }
+        handle_key(
+            &mut app,
+            crossterm::event::KeyEvent::new(
+                KeyCode::Char('k'),
+                crossterm::event::KeyModifiers::ALT,
+            ),
+        )
+        .unwrap();
+        assert_eq!(app.selected_session, 1);
+        assert_eq!(app.scroll, 10);
 
-    #[test]
-    fn failing_check_uses_failure_token() {
-        let mut snapshot = sample_snapshot();
-        snapshot.checks[0].passed = 0;
-        snapshot.checks[0].checks[0].ok = false;
-
-        let styles: Vec<Style> = checks_lines(&snapshot)
-            .iter()
-            .flat_map(|line| line.spans.iter().map(|span| span.style))
-            .collect();
-        assert!(styles.contains(&palette::failure()));
-    }
-
-    /// Ctrl/Alt chords collide with the terminal and the tmux prefix, so the
-    /// dashboard must never consume them.
-    #[test]
-    fn reserved_chords_are_not_bound() {
-        for (code, modifiers) in [
-            (KeyCode::Char('c'), KeyModifiers::CONTROL),
-            (KeyCode::Char('u'), KeyModifiers::CONTROL),
-            (KeyCode::Char('m'), KeyModifiers::ALT),
-            (KeyCode::Char('j'), KeyModifiers::ALT),
-        ] {
-            let mut app = test_app();
-            app.select_tab(SIMULATOR_TAB);
-            app.simulator
-                .handle_command_key(KeyEvent::new(code, modifiers));
-
-            assert_eq!(
-                app.simulator.mode,
-                crate::sim::SimulatorMode::Rag,
-                "{code:?}+{modifiers:?} must not change the retrieval mode"
-            );
-            assert!(
-                !app.simulator.typing(),
-                "{code:?}+{modifiers:?} must not start typing"
-            );
-        }
-    }
-
-    #[test]
-    fn help_overlay_toggles_and_absorbs_the_next_key() {
-        let mut app = test_app();
-        assert!(!handle_key(&mut app, KeyEvent::from(KeyCode::Char('?'))).unwrap());
+        handle_key(
+            &mut app,
+            crossterm::event::KeyEvent::new(
+                KeyCode::Char('?'),
+                crossterm::event::KeyModifiers::NONE,
+            ),
+        )
+        .unwrap();
         assert!(app.show_help);
-
-        // The next key closes the overlay instead of acting, so `q` cannot quit
-        // while the operator is still reading the keymap.
-        assert!(!handle_key(&mut app, KeyEvent::from(KeyCode::Char('q'))).unwrap());
+        handle_key(
+            &mut app,
+            crossterm::event::KeyEvent::new(KeyCode::Esc, crossterm::event::KeyModifiers::NONE),
+        )
+        .unwrap();
         assert!(!app.show_help);
-    }
 
-    #[test]
-    fn typing_mode_keeps_q_out_of_the_quit_path() {
-        let mut app = test_app();
         app.select_tab(SIMULATOR_TAB);
-        handle_key(&mut app, KeyEvent::from(KeyCode::Char('i'))).unwrap();
+        handle_key(
+            &mut app,
+            crossterm::event::KeyEvent::new(
+                KeyCode::Char('i'),
+                crossterm::event::KeyModifiers::NONE,
+            ),
+        )
+        .unwrap();
         assert!(app.simulator.typing());
+        handle_key(
+            &mut app,
+            crossterm::event::KeyEvent::new(
+                KeyCode::Char('m'),
+                crossterm::event::KeyModifiers::NONE,
+            ),
+        )
+        .unwrap();
+        assert_eq!(app.simulator.input, "m");
+        assert_eq!(app.simulator.mode, crate::sim::SimulatorMode::Rag);
+        handle_key(
+            &mut app,
+            crossterm::event::KeyEvent::new(KeyCode::Esc, crossterm::event::KeyModifiers::NONE),
+        )
+        .unwrap();
+        handle_key(
+            &mut app,
+            crossterm::event::KeyEvent::new(
+                KeyCode::Char('m'),
+                crossterm::event::KeyModifiers::NONE,
+            ),
+        )
+        .unwrap();
+        assert_eq!(app.simulator.mode, crate::sim::SimulatorMode::Search);
 
-        assert!(!handle_key(&mut app, KeyEvent::from(KeyCode::Char('q'))).unwrap());
-        assert_eq!(app.simulator.input, "q");
+        let operations = operations_text(&app.snapshot);
+        assert!(operations.contains("42 active / 0 dirty"));
+        assert!(operations.contains("1/1 passed"));
+        assert!(operations.contains("MISS should remain prompt text after normalization"));
+        assert!(operations.contains("eval-known-item"));
+        assert!(operations.contains("R@5 90%"));
 
-        handle_key(&mut app, KeyEvent::from(KeyCode::Esc)).unwrap();
-        assert!(!app.simulator.typing());
-        assert!(handle_key(&mut app, KeyEvent::from(KeyCode::Char('q'))).unwrap());
+        app.select_tab(OPERATIONS_TAB);
+        app.snapshot.runtime.hooks_installed = 4;
+        app.snapshot.runtime.dirty_documents = 1;
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        assert!(
+            terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .any(|cell| cell.symbol() == "!" && cell.fg == Color::Yellow)
+        );
+        assert!(
+            terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .any(|cell| cell.symbol() == "●" && cell.fg == Color::Green)
+        );
     }
 }

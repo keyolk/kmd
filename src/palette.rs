@@ -42,11 +42,6 @@ pub fn value() -> Style {
     Style::default()
 }
 
-/// Emphasized values such as counts the operator scans for.
-pub fn strong() -> Style {
-    Style::default().add_modifier(Modifier::BOLD)
-}
-
 /// Secondary metadata: paths, timestamps, hints.
 pub fn muted() -> Style {
     fg(MUTED)

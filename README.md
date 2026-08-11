@@ -42,17 +42,12 @@ kmd journal --cwd ~/src/sendbird/soda-k8s/.worktree/cohome --days 14
 kmd journal --json
 ```
 
-`kmd dashboard` provides seven tabs. Every tab includes an in-product summary of
-its purpose, data source, and primary action:
+`kmd dashboard` uses three focused views instead of separate tabs for each data source:
 
-| Tab | Function |
+| View | Function |
 |---|---|
-| Overview | Runtime, hook, index, collection, check, and evaluation health |
-| Activity | Live Claude sessions observed during the last 24 hours |
-| Journal | Date-oriented sessions/learnings ranked by repository locality |
-| RAG | Seven-day gate, injection, miss, and latency history |
-| Evaluations | Persisted L1 retrieval, L2 utilization, and L3 A/B results |
-| Checks | Operational verification history for all local dependencies |
+| Sessions | Live Claude sessions with the complete user request → Claude response timeline |
+| Operations | Runtime, retrieval, evaluation, and self-check health in one scrollable view |
 | Simulator | Real RAG pipeline or raw BM25 queries against the local index |
 
 ### Keys
@@ -63,15 +58,15 @@ the full keymap.
 
 | Key | Action |
 |---|---|
-| `1`–`7`, `Tab`/`Shift-Tab`, `h`/`l`, `←`/`→` | switch tab |
-| `j`/`k`, `↑`/`↓`, `PgUp`/`PgDn`, `g`/`G` | scroll |
+| `1`–`3`, `Tab`/`Shift-Tab`, `h`/`l`, `←`/`→` | switch view |
+| `j`/`k`, `↑`/`↓` | select a session or scroll Operations |
+| `PgUp`/`PgDn`, `g`/`G` | scroll the current timeline/view |
 | `r` | refresh the snapshot |
 | `t` | run the self-check suite |
 | `?` | toggle the keymap overlay |
 | `q`, `Esc` | quit |
 
-The Simulator tab splits input into a command mode and a typing mode, so plain
-letters stay usable as commands:
+The Simulator view splits input into command and typing modes:
 
 | Mode | Key | Action |
 |---|---|---|
@@ -79,21 +74,16 @@ letters stay usable as commands:
 | command | `Enter` | run the query |
 | command | `m` | RAG pipeline ⇄ BM25 search |
 | command | `j`/`k` | select a hit |
-| command | `J`/`K` | scroll the result detail |
+| command | `J`/`K` | scroll result detail |
 | command | `n`/`p` | next / previous prompt history |
 | command | `x` | clear the query |
 | typing | `Esc` | back to command mode |
 | typing | `Enter` | run the query |
 | typing | `↑`/`↓` | recall prompt history |
 
-RAG mode shows the production path (gate → extracted query → filtered hits →
-injected context); BM25 mode shows raw retrieval. Simulator runs never write
-`rag.jsonl`.
-
-Colors are semantic tokens defined once in `src/palette.rs`: green for healthy
-state, yellow for gated or slow, red for failures, cyan for labels, magenta for
-categories, and dim for metadata. Every colored state is also carried by a word
-or symbol, so `NO_COLOR=1` stays fully readable.
+RAG mode shows gate → extracted query → filtered hits → injected context; BM25 mode
+shows raw retrieval. Simulator runs never write `rag.jsonl`. Semantic colors remain
+readable through text and symbols; set `NO_COLOR=1` to disable hues.
 
 The latest 500 check results are kept in `~/.local/state/kmd/checks.jsonl`.
 Successful `eval`, `util`, and `ab` runs are kept in
@@ -124,8 +114,6 @@ already consume `qmd search --json`.
 - `src/bm25.rs` — tantivy index, dual ko/en fields, search + snippets
 - `src/output.rs` — qmd-compatible JSON / CLI output
 - `src/dashboard.rs` — operations TUI, JSON snapshot, checks and evaluation history
-- `src/dashboard_simulator.rs` — Simulator tab: query input, worker thread, result panes
-- `src/palette.rs` — semantic color tokens shared by the TUI (honors `NO_COLOR`)
 - `src/evaluation_log.rs` — bounded history for successful L1/L2/L3 evaluation runs
 - `src/eval.rs` — L1 retrieval eval (`kmd eval`): known-item + gold
 - `src/util.rs` — L2 injection utilization (`kmd util`)
