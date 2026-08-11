@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use chrono::{Local, Utc};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use ratatui::prelude::*;
-use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Tabs, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Tabs, Wrap};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::Write;
@@ -38,7 +38,7 @@ const TAB_GUIDES: &[TabGuide] = &[
     TabGuide {
         purpose: "Run real queries against the local index without writing logs.",
         source: "RAG gate/filter/context pipeline or raw BM25 retrieval",
-        action: "Enter runs · Alt-m changes mode · ↑/↓ recalls prompt history",
+        action: "i types · Enter runs · m switches mode · ? lists every key",
     },
 ];
 
@@ -468,6 +468,7 @@ struct App {
     theme: crate::dashboard_theme::Theme,
     last_refresh: Instant,
     message: String,
+    show_help: bool,
 }
 
 impl App {
@@ -846,6 +847,58 @@ fn draw_sessions(frame: &mut Frame, area: Rect, app: &App) {
     );
 }
 
+const HELP_ROWS: &[(&str, &str)] = &[
+    ("1-3 / Tab", "switch view"),
+    ("h/l / ←/→", "previous / next view"),
+    ("j/k / ↑/↓", "Sessions: select session · Operations: scroll"),
+    ("PgUp/PgDn", "scroll the timeline or Operations"),
+    ("g / G", "top / bottom"),
+    ("r", "refresh the snapshot"),
+    ("t", "run the self-check suite"),
+    ("i or /", "Simulator: start typing"),
+    ("Esc", "Simulator: stop typing · otherwise quit"),
+    ("Enter", "Simulator: run the query"),
+    ("m", "Simulator: RAG pipeline ⇄ BM25 search"),
+    ("j/k", "Simulator: select a hit"),
+    ("J/K", "Simulator: scroll result detail"),
+    ("n/p", "Simulator: next / previous prompt history"),
+    ("x", "Simulator: clear the query"),
+    ("?", "toggle this help"),
+    ("q", "quit"),
+];
+
+fn draw_help(frame: &mut Frame, area: Rect, theme: crate::dashboard_theme::Theme) {
+    let width = area.width.saturating_sub(4).min(72).max(20);
+    let height = (HELP_ROWS.len() as u16 + 2).min(area.height.saturating_sub(2).max(3));
+    let popup = Rect {
+        x: area.x + (area.width.saturating_sub(width)) / 2,
+        y: area.y + (area.height.saturating_sub(height)) / 2,
+        width,
+        height,
+    };
+    let rows = HELP_ROWS
+        .iter()
+        .map(|(keys, description)| {
+            Line::from(vec![
+                Span::raw(" "),
+                Span::styled(format!("{keys:<18}"), theme.heading()),
+                Span::raw((*description).to_string()),
+            ])
+        })
+        .collect::<Vec<_>>();
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Paragraph::new(rows).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(theme.selected())
+                .title_style(theme.heading())
+                .title(" keys · ? or Esc closes "),
+        ),
+        popup,
+    );
+}
+
 fn draw(frame: &mut Frame, app: &App) {
     let theme = app.theme;
     let areas = Layout::vertical([
@@ -895,7 +948,7 @@ fn draw(frame: &mut Frame, app: &App) {
     if app.tab == SESSIONS_TAB {
         draw_sessions(frame, areas[2], app);
     } else if app.tab == SIMULATOR_TAB {
-        crate::dashboard_simulator::draw(frame, areas[2], &app.simulator, theme);
+        crate::dashboard_simulator::draw(frame, areas[2], &app.simulator);
     } else if let Some((kind, content)) = body_content(app) {
         let body = Paragraph::new(crate::dashboard_theme::style_body(kind, content, theme))
             .scroll((app.scroll, 0))
@@ -910,59 +963,53 @@ fn draw(frame: &mut Frame, app: &App) {
         frame.render_widget(body, areas[2]);
     }
 
-    let help_text = if app.tab == SIMULATOR_TAB {
-        format!(
-            "Tab: next  Shift-Tab/Esc: leave  Enter: run  Alt-m: mode  ↑/↓: history  Alt-j/k: hit  PgUp/PgDn: detail  {}",
-            app.message
-        )
+    let hints = if app.tab == SIMULATOR_TAB {
+        if app.simulator.typing() {
+            "typing · Esc: command  Enter: run  ↑/↓: history  ?: keys"
+        } else {
+            "i: type  Enter: run  m: mode  j/k: hit  J/K: detail  x: clear  ?: keys"
+        }
     } else if app.tab == SESSIONS_TAB {
-        format!(
-            "←/→ or 1-3: view  j/k ↑/↓: session  PgUp/PgDn: timeline  r: refresh  t: self-check  q/Esc: quit  {}",
-            app.message
-        )
+        "1-3/Tab: view  j/k: session  PgUp/PgDn: timeline  r: refresh  t: checks  ?: keys"
     } else {
-        format!(
-            "←/→ or 1-3: view  j/k ↑/↓ PgUp/PgDn: scroll  r: refresh  t: self-check  q/Esc: quit  {}",
-            app.message
-        )
+        "1-3/Tab: view  j/k: scroll  g/G: top/bottom  r: refresh  t: checks  ?: keys"
     };
-    frame.render_widget(Paragraph::new(help_text).style(theme.muted()), areas[3]);
+    let footer = Line::from(vec![
+        Span::styled(hints.to_string(), theme.muted()),
+        Span::styled("  ·  ".to_string(), theme.muted()),
+        Span::styled(app.message.clone(), theme.muted()),
+    ]);
+    frame.render_widget(Paragraph::new(footer), areas[3]);
+
+    if app.show_help {
+        draw_help(frame, frame.area(), theme);
+    }
 }
 
 fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) -> Result<bool> {
-    if app.tab == SIMULATOR_TAB {
-        match (key.code, key.modifiers) {
-            (KeyCode::Tab, _) => app.select_tab(app.tab + 1),
-            (KeyCode::BackTab, _) | (KeyCode::Esc, _) => app.select_tab(0),
-            _ => {
-                app.simulator.handle_key(key);
-            }
-        }
+    // Ctrl/Alt/Super chords belong to the terminal or multiplexer and must pass through.
+    if crate::dashboard_simulator::is_reserved_chord(&key) {
+        return Ok(false);
+    }
+    if app.show_help {
+        app.show_help = false;
+        return Ok(false);
+    }
+    if app.tab == SIMULATOR_TAB && app.simulator.typing() {
+        app.simulator.handle_typing_key(key);
         return Ok(false);
     }
 
-    match (key.code, key.modifiers) {
-        (KeyCode::Char('q'), _) | (KeyCode::Esc, _) => return Ok(true),
-        (KeyCode::Right, _) | (KeyCode::Char('l'), _) | (KeyCode::Tab, _) => {
-            app.select_tab(app.tab + 1)
-        }
-        (KeyCode::Left, _) | (KeyCode::Char('h'), _) | (KeyCode::BackTab, _) => {
+    match key.code {
+        KeyCode::Char('q') | KeyCode::Esc => return Ok(true),
+        KeyCode::Char('?') => app.show_help = true,
+        KeyCode::Right | KeyCode::Char('l') | KeyCode::Tab => app.select_tab(app.tab + 1),
+        KeyCode::Left | KeyCode::Char('h') | KeyCode::BackTab => {
             app.select_tab((app.tab + TABS.len() - 1) % TABS.len())
         }
-        (KeyCode::Char(value @ '1'..='3'), _) => app.select_tab((value as usize) - ('1' as usize)),
-        (KeyCode::Down, _) | (KeyCode::Char('j'), _) if app.tab == SESSIONS_TAB => {
-            app.select_session(app.selected_session.saturating_add(1));
-        }
-        (KeyCode::Up, _) | (KeyCode::Char('k'), _) if app.tab == SESSIONS_TAB => {
-            app.select_session(app.selected_session.saturating_sub(1));
-        }
-        (KeyCode::Down, _) | (KeyCode::Char('j'), _) => app.scroll = app.scroll.saturating_add(1),
-        (KeyCode::Up, _) | (KeyCode::Char('k'), _) => app.scroll = app.scroll.saturating_sub(1),
-        (KeyCode::PageDown, _) => app.scroll = app.scroll.saturating_add(10),
-        (KeyCode::PageUp, _) => app.scroll = app.scroll.saturating_sub(10),
-        (KeyCode::Home, _) => app.scroll = 0,
-        (KeyCode::Char('r'), _) => app.refresh(),
-        (KeyCode::Char('t'), _) => match run_checks() {
+        KeyCode::Char(value @ '1'..='3') => app.select_tab((value as usize) - ('1' as usize)),
+        KeyCode::Char('r') => app.refresh(),
+        KeyCode::Char('t') => match run_checks() {
             Ok(run) => {
                 app.refresh();
                 app.message = format!("self-check: {}/{} passed", run.passed, run.total);
@@ -970,6 +1017,19 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) -> Result<bool> {
             }
             Err(error) => app.message = format!("self-check failed: {error}"),
         },
+        _ if app.tab == SIMULATOR_TAB => app.simulator.handle_command_key(key),
+        KeyCode::Down | KeyCode::Char('j') if app.tab == SESSIONS_TAB => {
+            app.select_session(app.selected_session.saturating_add(1));
+        }
+        KeyCode::Up | KeyCode::Char('k') if app.tab == SESSIONS_TAB => {
+            app.select_session(app.selected_session.saturating_sub(1));
+        }
+        KeyCode::Down | KeyCode::Char('j') => app.scroll = app.scroll.saturating_add(1),
+        KeyCode::Up | KeyCode::Char('k') => app.scroll = app.scroll.saturating_sub(1),
+        KeyCode::PageDown => app.scroll = app.scroll.saturating_add(10),
+        KeyCode::PageUp => app.scroll = app.scroll.saturating_sub(10),
+        KeyCode::Home | KeyCode::Char('g') => app.scroll = 0,
+        KeyCode::End | KeyCode::Char('G') => app.scroll = u16::MAX,
         _ => {}
     }
     Ok(false)
@@ -1056,6 +1116,7 @@ pub fn run(json: bool, check_only: bool) -> Result<()> {
         theme: crate::dashboard_theme::Theme::from_env(),
         last_refresh: Instant::now(),
         message: "auto-refresh 5s".to_string(),
+        show_help: false,
     })
 }
 
@@ -1208,6 +1269,7 @@ mod tests {
             theme: crate::dashboard_theme::Theme::colored(),
             last_refresh: Instant::now(),
             message: "ready".into(),
+            show_help: false,
         };
         let backend = ratatui::backend::TestBackend::new(120, 40);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -1264,6 +1326,68 @@ mod tests {
         .unwrap();
         assert_eq!(app.selected_session, 1);
         assert_eq!(app.scroll, 10);
+
+        handle_key(
+            &mut app,
+            crossterm::event::KeyEvent::new(
+                KeyCode::Char('k'),
+                crossterm::event::KeyModifiers::ALT,
+            ),
+        )
+        .unwrap();
+        assert_eq!(app.selected_session, 1);
+        assert_eq!(app.scroll, 10);
+
+        handle_key(
+            &mut app,
+            crossterm::event::KeyEvent::new(
+                KeyCode::Char('?'),
+                crossterm::event::KeyModifiers::NONE,
+            ),
+        )
+        .unwrap();
+        assert!(app.show_help);
+        handle_key(
+            &mut app,
+            crossterm::event::KeyEvent::new(KeyCode::Esc, crossterm::event::KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert!(!app.show_help);
+
+        app.select_tab(SIMULATOR_TAB);
+        handle_key(
+            &mut app,
+            crossterm::event::KeyEvent::new(
+                KeyCode::Char('i'),
+                crossterm::event::KeyModifiers::NONE,
+            ),
+        )
+        .unwrap();
+        assert!(app.simulator.typing());
+        handle_key(
+            &mut app,
+            crossterm::event::KeyEvent::new(
+                KeyCode::Char('m'),
+                crossterm::event::KeyModifiers::NONE,
+            ),
+        )
+        .unwrap();
+        assert_eq!(app.simulator.input, "m");
+        assert_eq!(app.simulator.mode, crate::sim::SimulatorMode::Rag);
+        handle_key(
+            &mut app,
+            crossterm::event::KeyEvent::new(KeyCode::Esc, crossterm::event::KeyModifiers::NONE),
+        )
+        .unwrap();
+        handle_key(
+            &mut app,
+            crossterm::event::KeyEvent::new(
+                KeyCode::Char('m'),
+                crossterm::event::KeyModifiers::NONE,
+            ),
+        )
+        .unwrap();
+        assert_eq!(app.simulator.mode, crate::sim::SimulatorMode::Search);
 
         let operations = operations_text(&app.snapshot);
         assert!(operations.contains("42 active / 0 dirty"));

@@ -1,5 +1,10 @@
 //! Interactive query simulator embedded in the operations dashboard.
+//!
+//! Input is split into a command mode and a typing mode so every action stays on
+//! a plain key. Terminal-reserved chords (Ctrl/Alt) are never bound — inside a
+//! multiplexer those collide with the terminal or the tmux prefix.
 
+use crate::palette;
 use crate::sim::{self, SimulatorMode, SimulatorResult};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::prelude::*;
@@ -13,6 +18,14 @@ const WIDE_WIDTH: u16 = 96;
 
 type WorkerResult = (u64, Result<SimulatorResult, String>);
 
+/// Ctrl/Alt chords belong to the terminal and the multiplexer prefix. Leaving
+/// them unhandled keeps `Ctrl-C`, `Ctrl-Z`, and tmux bindings working while the
+/// dashboard is focused.
+pub fn is_reserved_chord(key: &KeyEvent) -> bool {
+    key.modifiers
+        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
+}
+
 pub struct SimulatorState {
     pub input: String,
     pub mode: SimulatorMode,
@@ -21,6 +34,7 @@ pub struct SimulatorState {
     pub running: bool,
     pub selected_hit: usize,
     pub detail_scroll: u16,
+    typing: bool,
     history: Vec<String>,
     history_idx: Option<usize>,
     generation: u64,
@@ -39,12 +53,17 @@ impl SimulatorState {
             running: false,
             selected_hit: 0,
             detail_scroll: 0,
+            typing: false,
             history: sim::prompt_history(),
             history_idx: None,
             generation: 0,
             tx,
             rx,
         }
+    }
+
+    pub fn typing(&self) -> bool {
+        self.typing
     }
 
     pub fn run(&mut self) {
@@ -89,38 +108,61 @@ impl SimulatorState {
         changed
     }
 
-    pub fn handle_key(&mut self, key: KeyEvent) -> bool {
-        match (key.code, key.modifiers) {
-            (KeyCode::Enter, _) => self.run(),
-            (KeyCode::Char('m'), KeyModifiers::ALT) => {
+    /// Keys while composing a query. Esc returns to command mode; every
+    /// printable key is text, so no letter is stolen from the query.
+    pub fn handle_typing_key(&mut self, key: KeyEvent) {
+        if is_reserved_chord(&key) {
+            return;
+        }
+        match key.code {
+            KeyCode::Esc => self.typing = false,
+            KeyCode::Enter => self.run(),
+            KeyCode::Backspace => {
+                self.input.pop();
+                self.history_idx = None;
+            }
+            KeyCode::Up => self.previous_history(),
+            KeyCode::Down => self.next_history(),
+            KeyCode::Char(value) => {
+                self.input.push(value);
+                self.history_idx = None;
+            }
+            _ => {}
+        }
+    }
+
+    /// Keys while not composing a query.
+    pub fn handle_command_key(&mut self, key: KeyEvent) {
+        if is_reserved_chord(&key) {
+            return;
+        }
+        match key.code {
+            KeyCode::Char('i') | KeyCode::Char('/') => self.typing = true,
+            KeyCode::Enter => self.run(),
+            KeyCode::Char('m') => {
                 self.mode = self.mode.toggle();
                 self.result = None;
                 self.error = None;
             }
-            (KeyCode::Char('u'), KeyModifiers::CONTROL) => {
+            KeyCode::Char('x') => {
                 self.input.clear();
+                self.result = None;
+                self.error = None;
                 self.history_idx = None;
             }
-            (KeyCode::Backspace, _) => {
-                self.input.pop();
-                self.history_idx = None;
+            KeyCode::Char('p') | KeyCode::Up => self.previous_history(),
+            KeyCode::Char('n') | KeyCode::Down => self.next_history(),
+            KeyCode::Char('j') => self.next_hit(),
+            KeyCode::Char('k') => self.previous_hit(),
+            KeyCode::Char('J') | KeyCode::PageDown => {
+                self.detail_scroll = self.detail_scroll.saturating_add(8)
             }
-            (KeyCode::Up, _) => self.previous_history(),
-            (KeyCode::Down, _) => self.next_history(),
-            (KeyCode::Char('j'), KeyModifiers::ALT) => self.next_hit(),
-            (KeyCode::Char('k'), KeyModifiers::ALT) => self.previous_hit(),
-            (KeyCode::PageDown, _) => self.detail_scroll = self.detail_scroll.saturating_add(8),
-            (KeyCode::PageUp, _) => self.detail_scroll = self.detail_scroll.saturating_sub(8),
-            (KeyCode::Home, _) => self.detail_scroll = 0,
-            (KeyCode::Char(value), modifiers)
-                if modifiers.is_empty() || modifiers == KeyModifiers::SHIFT =>
-            {
-                self.input.push(value);
-                self.history_idx = None;
+            KeyCode::Char('K') | KeyCode::PageUp => {
+                self.detail_scroll = self.detail_scroll.saturating_sub(8)
             }
-            _ => return false,
+            KeyCode::Home => self.detail_scroll = 0,
+            _ => {}
         }
-        true
     }
 
     fn previous_history(&mut self) {
@@ -163,23 +205,18 @@ impl SimulatorState {
     }
 }
 
-pub fn draw(
-    frame: &mut Frame,
-    area: Rect,
-    state: &SimulatorState,
-    theme: crate::dashboard_theme::Theme,
-) {
+pub fn draw(frame: &mut Frame, area: Rect, state: &SimulatorState) {
     if area.width < MIN_WIDTH || area.height < MIN_HEIGHT {
         let message = Paragraph::new(format!(
             "Simulator needs at least {MIN_WIDTH}x{MIN_HEIGHT}. Current area: {}x{}",
             area.width, area.height
         ))
+        .style(palette::warn())
         .wrap(Wrap { trim: false })
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(theme.border())
-                .title_style(theme.warning())
+                .border_style(palette::warn())
                 .title(" terminal too small "),
         );
         frame.render_widget(message, area);
@@ -193,87 +230,144 @@ pub fn draw(
     ])
     .split(area);
 
-    let input_title = format!(
-        " query · {} · Enter runs{} ",
-        state.mode.label(),
-        if state.running { " · RUNNING" } else { "" }
-    );
-    let input_title_style = if state.running {
-        theme.warning().add_modifier(Modifier::BOLD)
-    } else {
-        theme.heading()
-    };
-    let input = Paragraph::new(state.input.as_str()).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_style(theme.border())
-            .title_style(input_title_style)
-            .title(input_title),
-    );
-    frame.render_widget(input, rows[0]);
-
-    let (status_text, status_style) = match (&state.error, &state.result, state.running) {
-        (_, _, true) => (
-            "Running against the local kmd index…".to_string(),
-            theme.warning(),
-        ),
-        (Some(error), _, _) => (format!("ERROR · {error}"), theme.error()),
-        (_, Some(result), _) if result.gate_reason.is_some() => (
-            format!(
-                "GATED · {} · no search or context injection",
-                result.gate_reason.as_deref().unwrap_or("unknown")
-            ),
-            theme.warning(),
-        ),
-        (_, Some(result), _) => (
-            format!(
-                "{} · query: {}\nhits {} · context {} · {}ms",
-                result.mode.label(),
-                result.query,
-                result.hits.len(),
-                if result.context.is_some() { "yes" } else { "no" },
-                result.latency_ms
-            ),
-            Style::default(),
-        ),
-        _ => (
-            "Type a real prompt or keyword query. RAG shows gate → extraction → filtered hits → injected context; BM25 shows raw retrieval.".to_string(),
-            Style::default(),
-        ),
-    };
-    frame.render_widget(
-        Paragraph::new(status_text)
-            .style(status_style)
-            .wrap(Wrap { trim: false })
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_style(theme.border())
-                    .title_style(theme.heading())
-                    .title(" execution "),
-            ),
-        rows[1],
-    );
+    draw_query(frame, rows[0], state);
+    draw_status(frame, rows[1], state);
 
     if area.width >= WIDE_WIDTH {
         let columns = Layout::horizontal([Constraint::Percentage(42), Constraint::Percentage(58)])
             .split(rows[2]);
-        draw_hits(frame, columns[0], state, theme);
-        draw_detail(frame, columns[1], state, theme);
+        draw_hits(frame, columns[0], state);
+        draw_detail(frame, columns[1], state);
     } else {
         let body = Layout::vertical([Constraint::Percentage(45), Constraint::Percentage(55)])
             .split(rows[2]);
-        draw_hits(frame, body[0], state, theme);
-        draw_detail(frame, body[1], state, theme);
+        draw_hits(frame, body[0], state);
+        draw_detail(frame, body[1], state);
     }
 }
 
-fn draw_hits(
-    frame: &mut Frame,
-    area: Rect,
-    state: &SimulatorState,
-    theme: crate::dashboard_theme::Theme,
-) {
+fn draw_query(frame: &mut Frame, area: Rect, state: &SimulatorState) {
+    let mut title = vec![
+        Span::styled(" query ".to_string(), palette::heading()),
+        Span::styled("· ".to_string(), palette::muted()),
+        Span::styled(state.mode.label().to_string(), palette::accent()),
+        Span::styled(" · ".to_string(), palette::muted()),
+    ];
+    if state.typing() {
+        title.push(Span::styled("TYPING".to_string(), palette::success()));
+        title.push(Span::styled(
+            " Esc stops · Enter runs ".to_string(),
+            palette::muted(),
+        ));
+    } else {
+        title.push(Span::styled("COMMAND".to_string(), palette::label()));
+        title.push(Span::styled(
+            " i types · Enter runs ".to_string(),
+            palette::muted(),
+        ));
+    }
+    if state.running {
+        title.push(Span::styled("· RUNNING ".to_string(), palette::warn()));
+    }
+
+    let body = if state.input.is_empty() {
+        Line::from(Span::styled(
+            "press i to type a prompt or keyword query".to_string(),
+            palette::muted(),
+        ))
+    } else {
+        Line::from(Span::styled(state.input.clone(), palette::value()))
+    };
+    frame.render_widget(
+        Paragraph::new(body).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(if state.typing() {
+                    palette::border_focus()
+                } else {
+                    palette::border()
+                })
+                .title(Line::from(title)),
+        ),
+        area,
+    );
+}
+
+fn draw_status(frame: &mut Frame, area: Rect, state: &SimulatorState) {
+    let lines = match (&state.error, &state.result, state.running) {
+        (_, _, true) => vec![Line::from(Span::styled(
+            "Running against the local kmd index…".to_string(),
+            palette::warn(),
+        ))],
+        (Some(error), _, _) => vec![Line::from(vec![
+            Span::styled("ERROR ".to_string(), palette::failure()),
+            Span::styled(error.clone(), palette::failure()),
+        ])],
+        (_, Some(result), _) if result.gate_reason.is_some() => vec![
+            Line::from(vec![
+                Span::styled("GATED ".to_string(), palette::warn()),
+                Span::styled(
+                    result.gate_reason.clone().unwrap_or_default(),
+                    palette::warn(),
+                ),
+            ]),
+            Line::from(Span::styled(
+                "the hook would skip search and inject nothing".to_string(),
+                palette::muted(),
+            )),
+        ],
+        (_, Some(result), _) => {
+            let injected = result.context.is_some();
+            vec![
+                Line::from(vec![
+                    Span::styled(result.mode.label().to_string(), palette::accent()),
+                    Span::styled(" · query: ".to_string(), palette::muted()),
+                    Span::styled(result.query.clone(), palette::value()),
+                ]),
+                Line::from(vec![
+                    Span::styled("hits ".to_string(), palette::muted()),
+                    Span::styled(
+                        result.hits.len().to_string(),
+                        palette::state(!result.hits.is_empty()),
+                    ),
+                    Span::styled(" · context ".to_string(), palette::muted()),
+                    Span::styled(
+                        if injected { "yes" } else { "no" }.to_string(),
+                        if injected {
+                            palette::success()
+                        } else {
+                            palette::muted()
+                        },
+                    ),
+                    Span::styled(" · ".to_string(), palette::muted()),
+                    Span::styled(format!("{}ms", result.latency_ms), palette::value()),
+                ]),
+            ]
+        }
+        _ => vec![
+            Line::from(Span::styled(
+                "RAG pipeline: gate → extracted query → filtered hits → injected context"
+                    .to_string(),
+                palette::muted(),
+            )),
+            Line::from(Span::styled(
+                "BM25 search: raw retrieval across every collection · m switches mode".to_string(),
+                palette::muted(),
+            )),
+        ],
+    };
+    frame.render_widget(
+        Paragraph::new(lines).wrap(Wrap { trim: false }).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(palette::border())
+                .title(Span::styled(" execution ".to_string(), palette::heading())),
+        ),
+        area,
+    );
+}
+
+fn draw_hits(frame: &mut Frame, area: Rect, state: &SimulatorState) {
     let items = state
         .result
         .as_ref()
@@ -284,9 +378,12 @@ fn draw_hits(
                 .enumerate()
                 .map(|(index, hit)| {
                     let path = hit.file.strip_prefix("kmd://").unwrap_or(&hit.file);
+                    let (collection, rest) = path.split_once('/').unwrap_or(("", path));
                     ListItem::new(Line::from(vec![
-                        Span::styled(format!("{:>2}. ", index + 1), theme.muted()),
-                        Span::raw(format!("{:.2} {path}", hit.score)),
+                        Span::styled(format!("{:>2}. ", index + 1), palette::muted()),
+                        Span::styled(format!("{:>6.2} ", hit.score), palette::success()),
+                        Span::styled(format!("{collection}/"), palette::accent()),
+                        Span::styled(rest.to_string(), palette::value()),
                     ]))
                 })
                 .collect::<Vec<_>>()
@@ -298,63 +395,104 @@ fn draw_hits(
     }
     let list = List::new(items)
         .highlight_symbol("> ")
-        .highlight_style(theme.selected())
+        .highlight_style(palette::selection())
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(theme.border())
-                .title_style(theme.heading())
-                .title(" hits · Alt-j/k selects "),
+                .border_style(palette::border())
+                .title(Line::from(vec![
+                    Span::styled(" hits ".to_string(), palette::heading()),
+                    Span::styled("· j/k selects ".to_string(), palette::muted()),
+                ])),
         );
     frame.render_stateful_widget(list, area, &mut list_state);
 }
 
-fn draw_detail(
-    frame: &mut Frame,
-    area: Rect,
-    state: &SimulatorState,
-    theme: crate::dashboard_theme::Theme,
-) {
-    let (title, content) = match state.result.as_ref() {
+fn draw_detail(frame: &mut Frame, area: Rect, state: &SimulatorState) {
+    let (title, lines) = match state.result.as_ref() {
         Some(result) if result.mode == SimulatorMode::Rag => (
-            " injected context · PgUp/PgDn scroll ",
-            result
-                .context
-                .clone()
-                .unwrap_or_else(|| "(no context would be injected)".to_string()),
+            " injected context ",
+            match result.context.as_ref() {
+                Some(context) => context
+                    .lines()
+                    .map(|line| {
+                        let style = if line.starts_with("[QMD]") {
+                            palette::accent()
+                        } else if line.starts_with('<') || line == "---" {
+                            palette::muted()
+                        } else {
+                            palette::value()
+                        };
+                        Line::from(Span::styled(line.to_string(), style))
+                    })
+                    .collect::<Vec<_>>(),
+                None => vec![Line::from(Span::styled(
+                    "(no context would be injected)".to_string(),
+                    palette::muted(),
+                ))],
+            },
         ),
-        Some(result) => {
-            let detail = result
-                .hits
-                .get(state.selected_hit)
-                .map(|hit| {
-                    format!(
-                        "{}\nscore: {:.3}\ntitle: {}\ncontext: {}\n\n{}",
-                        hit.file,
-                        hit.score,
-                        hit.title,
-                        hit.context.as_deref().unwrap_or("-"),
-                        hit.snippet.as_deref().unwrap_or("(no snippet)")
-                    )
-                })
-                .unwrap_or_else(|| "(no search hits)".to_string());
-            (" selected hit · PgUp/PgDn scroll ", detail)
-        }
+        Some(result) => (
+            " selected hit ",
+            match result.hits.get(state.selected_hit) {
+                Some(hit) => {
+                    let mut lines = vec![
+                        Line::from(Span::styled(hit.file.clone(), palette::accent())),
+                        Line::from(vec![
+                            Span::styled("score:   ".to_string(), palette::label()),
+                            Span::styled(format!("{:.3}", hit.score), palette::success()),
+                        ]),
+                        Line::from(vec![
+                            Span::styled("title:   ".to_string(), palette::label()),
+                            Span::styled(hit.title.clone(), palette::value()),
+                        ]),
+                        Line::from(vec![
+                            Span::styled("context: ".to_string(), palette::label()),
+                            Span::styled(
+                                hit.context.clone().unwrap_or_else(|| "-".to_string()),
+                                palette::muted(),
+                            ),
+                        ]),
+                        Line::default(),
+                    ];
+                    lines.extend(
+                        hit.snippet
+                            .as_deref()
+                            .unwrap_or("(no snippet)")
+                            .lines()
+                            .map(|line| {
+                                Line::from(Span::styled(line.to_string(), palette::value()))
+                            })
+                            .collect::<Vec<_>>(),
+                    );
+                    lines
+                }
+                None => vec![Line::from(Span::styled(
+                    "(no search hits)".to_string(),
+                    palette::muted(),
+                ))],
+            },
+        ),
         None => (
             " result detail ",
-            "Run a query to inspect results.".to_string(),
+            vec![Line::from(Span::styled(
+                "Run a query to inspect results.".to_string(),
+                palette::muted(),
+            ))],
         ),
     };
     frame.render_widget(
-        Paragraph::new(content)
+        Paragraph::new(lines)
             .scroll((state.detail_scroll, 0))
             .wrap(Wrap { trim: false })
             .block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .border_style(theme.border())
-                    .title_style(theme.heading())
-                    .title(title),
+                    .border_style(palette::border())
+                    .title(Line::from(vec![
+                        Span::styled(title.to_string(), palette::heading()),
+                        Span::styled("· J/K scrolls ".to_string(), palette::muted()),
+                    ])),
             ),
         area,
     );
@@ -363,6 +501,11 @@ fn draw_detail(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crossterm::event::KeyModifiers;
+
+    fn press(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
 
     #[test]
     fn mode_toggle_round_trips() {
@@ -371,19 +514,50 @@ mod tests {
     }
 
     #[test]
+    fn typing_mode_captures_command_letters_as_text() {
+        let mut state = SimulatorState::new();
+        state.handle_command_key(press(KeyCode::Char('i')));
+        assert!(state.typing());
+
+        for value in "mxjq".chars() {
+            state.handle_typing_key(press(KeyCode::Char(value)));
+        }
+        assert_eq!(state.input, "mxjq");
+        assert_eq!(state.mode, SimulatorMode::Rag);
+
+        state.handle_typing_key(press(KeyCode::Esc));
+        assert!(!state.typing());
+    }
+
+    #[test]
+    fn command_mode_toggles_and_clears_without_modifiers() {
+        let mut state = SimulatorState::new();
+        state.input = "keep".to_string();
+
+        state.handle_command_key(press(KeyCode::Char('m')));
+        assert_eq!(state.mode, SimulatorMode::Search);
+
+        state.handle_command_key(press(KeyCode::Char('x')));
+        assert!(state.input.is_empty());
+    }
+
+    #[test]
+    fn command_mode_scrolls_detail_with_shifted_letters() {
+        let mut state = SimulatorState::new();
+        state.handle_command_key(press(KeyCode::Char('J')));
+        assert_eq!(state.detail_scroll, 8);
+
+        state.handle_command_key(press(KeyCode::Char('K')));
+        assert_eq!(state.detail_scroll, 0);
+    }
+
+    #[test]
     fn narrow_layout_renders_floor_message() {
         let backend = ratatui::backend::TestBackend::new(50, 12);
         let mut terminal = Terminal::new(backend).unwrap();
         let state = SimulatorState::new();
         terminal
-            .draw(|frame| {
-                draw(
-                    frame,
-                    frame.area(),
-                    &state,
-                    crate::dashboard_theme::Theme::plain(),
-                )
-            })
+            .draw(|frame| draw(frame, frame.area(), &state))
             .unwrap();
         let output = terminal
             .backend()
@@ -393,33 +567,5 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
         assert!(output.contains("needs at least"));
-    }
-
-    #[test]
-    fn error_status_renders_in_red() {
-        let backend = ratatui::backend::TestBackend::new(100, 30);
-        let mut terminal = Terminal::new(backend).unwrap();
-        let mut state = SimulatorState::new();
-        state.error = Some("search failed".to_string());
-
-        terminal
-            .draw(|frame| {
-                draw(
-                    frame,
-                    frame.area(),
-                    &state,
-                    crate::dashboard_theme::Theme::colored(),
-                )
-            })
-            .unwrap();
-
-        assert!(
-            terminal
-                .backend()
-                .buffer()
-                .content()
-                .iter()
-                .any(|cell| cell.symbol() == "E" && cell.fg == Color::Red)
-        );
     }
 }

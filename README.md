@@ -50,14 +50,40 @@ kmd journal --json
 | Operations | Runtime, retrieval, evaluation, and self-check health in one scrollable view |
 | Simulator | Real RAG pipeline or raw BM25 queries against the local index |
 
-Use `←`/`→`, `h`/`l`, or `1`–`3` to switch views. In Sessions, use `j`/`k` or
-`↑`/`↓` to select a session and `PgUp`/`PgDn` to scroll its timeline. Use `r` to
-refresh and `t` to run self-checks. In Simulator, type a prompt and press
-`Enter`; `Alt-m` switches between the production RAG path (gate → extracted query →
-filtered hits → injected context) and raw BM25 search, `↑`/`↓` recalls prompt
-history, `Alt-j`/`Alt-k` selects a hit, and `PgUp`/`PgDn` scrolls details. Simulator
-runs do not write `rag.jsonl`. The dashboard uses terminal-native semantic colors for
-status and navigation; set `NO_COLOR=1` to keep the same layout without colors.
+### Keys
+
+No binding uses `Ctrl`, `Alt`, or `Cmd` — those chords stay with the terminal and
+the tmux prefix, and the dashboard passes them through untouched. Press `?` for
+the full keymap.
+
+| Key | Action |
+|---|---|
+| `1`–`3`, `Tab`/`Shift-Tab`, `h`/`l`, `←`/`→` | switch view |
+| `j`/`k`, `↑`/`↓` | select a session or scroll Operations |
+| `PgUp`/`PgDn`, `g`/`G` | scroll the current timeline/view |
+| `r` | refresh the snapshot |
+| `t` | run the self-check suite |
+| `?` | toggle the keymap overlay |
+| `q`, `Esc` | quit |
+
+The Simulator view splits input into command and typing modes:
+
+| Mode | Key | Action |
+|---|---|---|
+| command | `i` or `/` | start typing a query |
+| command | `Enter` | run the query |
+| command | `m` | RAG pipeline ⇄ BM25 search |
+| command | `j`/`k` | select a hit |
+| command | `J`/`K` | scroll result detail |
+| command | `n`/`p` | next / previous prompt history |
+| command | `x` | clear the query |
+| typing | `Esc` | back to command mode |
+| typing | `Enter` | run the query |
+| typing | `↑`/`↓` | recall prompt history |
+
+RAG mode shows gate → extracted query → filtered hits → injected context; BM25 mode
+shows raw retrieval. Simulator runs never write `rag.jsonl`. Semantic colors remain
+readable through text and symbols; set `NO_COLOR=1` to disable hues.
 
 The latest 500 check results are kept in `~/.local/state/kmd/checks.jsonl`.
 Successful `eval`, `util`, and `ab` runs are kept in
