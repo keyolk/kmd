@@ -46,13 +46,19 @@ kmd journal --json
 
 | View | Function |
 |---|---|
-| Sessions | Extracted kmd queries and retrieval results grouped by Claude session |
+| Sessions | Live Claude sessions merged with the kmd queries and retrieval results of each session |
 | Operations | Runtime, retrieval, evaluation, and self-check health in one scrollable view |
 | Simulator | Real RAG pipeline or raw BM25 queries against the local index |
 
-Sessions reads only `searched` entries from the last seven days of `rag.jsonl`. It shows
-the extracted query, latency/injection metadata, and each hit's path, score, and snippet;
-it does not read or display Claude conversation transcripts.
+Sessions merges two sources so a session stays visible even when it never triggered a
+retrieval. Rows are tagged `rag`, `live`, or `live+rag`:
+
+- `rag` — `searched` entries from the last seven days of `rag.jsonl`: the extracted query,
+  latency/injection metadata, and each hit's path, score, and snippet.
+- `live` — activity cards for Claude sessions seen in the last 24 hours: repo, cwd, and the
+  latest request/result summary that the `UserPromptSubmit` hook already shares across sessions.
+
+Neither source reads or displays full Claude conversation transcripts.
 
 ### Keys
 
