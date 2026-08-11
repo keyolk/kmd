@@ -26,9 +26,9 @@ struct TabGuide {
 
 const TAB_GUIDES: &[TabGuide] = &[
     TabGuide {
-        purpose: "Inspect each Claude session as a transparent request → response timeline.",
-        source: "live transcripts observed during the last 24 hours",
-        action: "j/k selects a session · PgUp/PgDn scrolls its complete timeline",
+        purpose: "Inspect the kmd queries and retrieval results produced in each Claude session.",
+        source: "searched entries in rag.jsonl from the last 7 days",
+        action: "j/k selects a session · PgUp/PgDn scrolls its query/result history",
     },
     TabGuide {
         purpose: "Monitor runtime, retrieval quality, evaluations, and self-checks together.",
@@ -61,6 +61,22 @@ pub struct RuntimeStatus {
     pub collections: Vec<CollectionStatus>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct RagQueryRecord {
+    pub ts: String,
+    pub query: String,
+    pub injected: usize,
+    pub hits: Vec<crate::rag::RagHitLog>,
+    pub latency_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RagSession {
+    pub session_id: String,
+    pub latest_ts: String,
+    pub queries: Vec<RagQueryRecord>,
+}
+
 #[derive(Debug, Serialize)]
 pub struct RagSummary {
     pub total: usize,
@@ -70,6 +86,7 @@ pub struct RagSummary {
     pub injection_rate_pct: f64,
     pub median_latency_ms: u64,
     pub p95_latency_ms: u64,
+    pub sessions: Vec<RagSession>,
     pub recent: Vec<crate::rag::RagLogEntry>,
 }
 
@@ -94,7 +111,6 @@ pub struct DashboardSnapshot {
     pub generated_at: String,
     pub cwd: String,
     pub runtime: RuntimeStatus,
-    pub activity: Vec<crate::activity::ActivityCard>,
     pub journal: crate::journal::JournalView,
     pub rag: RagSummary,
     pub evaluations: Vec<crate::evaluation_log::EvaluationRun>,
@@ -199,6 +215,7 @@ fn rag_summary(errors: &mut Vec<String>) -> RagSummary {
     } else {
         latencies[((latencies.len() - 1) * 95) / 100]
     };
+    let sessions = group_rag_sessions(&entries, 30);
     let recent = entries.into_iter().rev().take(30).collect();
     RagSummary {
         total,
@@ -208,8 +225,50 @@ fn rag_summary(errors: &mut Vec<String>) -> RagSummary {
         injection_rate_pct: pct(injected, searched),
         median_latency_ms,
         p95_latency_ms,
+        sessions,
         recent,
     }
+}
+
+fn group_rag_sessions(entries: &[crate::rag::RagLogEntry], limit: usize) -> Vec<RagSession> {
+    let mut grouped = std::collections::BTreeMap::<String, Vec<RagQueryRecord>>::new();
+    for entry in entries.iter().filter(|entry| {
+        entry.stage == "searched"
+            && !entry.session_id.is_empty()
+            && entry.query.as_ref().is_some_and(|query| !query.is_empty())
+    }) {
+        grouped
+            .entry(entry.session_id.clone())
+            .or_default()
+            .push(RagQueryRecord {
+                ts: entry.ts.clone(),
+                query: entry.query.clone().unwrap_or_default(),
+                injected: entry.injected,
+                hits: entry.hits.clone(),
+                latency_ms: entry.latency_ms,
+            });
+    }
+
+    let mut sessions = grouped
+        .into_iter()
+        .map(|(session_id, mut queries)| {
+            queries.sort_by_key(|entry| entry.ts.parse::<u64>().unwrap_or(0));
+            RagSession {
+                latest_ts: queries
+                    .last()
+                    .map(|entry| entry.ts.clone())
+                    .unwrap_or_default(),
+                session_id,
+                queries,
+            }
+        })
+        .collect::<Vec<_>>();
+    sessions.sort_by(|a, b| {
+        let epoch = |value: &str| value.parse::<u64>().unwrap_or(0);
+        epoch(&b.latest_ts).cmp(&epoch(&a.latest_ts))
+    });
+    sessions.truncate(limit);
+    sessions
 }
 
 fn parse_check_history(raw: &str) -> Result<Vec<CheckRun>> {
@@ -291,13 +350,6 @@ pub fn snapshot() -> Result<DashboardSnapshot> {
     let cwd = std::env::current_dir()?.display().to_string();
     let mut errors = Vec::new();
     let runtime = runtime_status(&mut errors);
-    let mut activity = crate::activity::recent("", &cwd, 30).unwrap_or_else(|error| {
-        errors.push(format!("activity: {error}"));
-        Vec::new()
-    });
-    if let Err(error) = crate::activity::backfill_turns(&mut activity) {
-        errors.push(format!("activity turn backfill: {error}"));
-    }
     let journal = crate::journal::build(7, None, None, &cwd).unwrap_or_else(|error| {
         errors.push(format!("journal: {error}"));
         crate::journal::JournalView {
@@ -322,7 +374,6 @@ pub fn snapshot() -> Result<DashboardSnapshot> {
         generated_at: Local::now().to_rfc3339(),
         cwd,
         runtime,
-        activity,
         journal,
         rag,
         evaluations,
@@ -475,18 +526,20 @@ impl App {
     fn refresh(&mut self) {
         let selected_id = self
             .snapshot
-            .activity
+            .rag
+            .sessions
             .get(self.selected_session)
-            .map(|card| card.session_id.clone());
+            .map(|session| session.session_id.clone());
         match snapshot() {
             Ok(snapshot) => {
                 self.snapshot = snapshot;
                 self.selected_session = selected_id
                     .and_then(|id| {
                         self.snapshot
-                            .activity
+                            .rag
+                            .sessions
                             .iter()
-                            .position(|card| card.session_id == id)
+                            .position(|session| session.session_id == id)
                     })
                     .unwrap_or(0);
                 self.last_refresh = Instant::now();
@@ -502,8 +555,8 @@ impl App {
     }
 
     fn select_session(&mut self, next: usize) {
-        if !self.snapshot.activity.is_empty() {
-            self.selected_session = next.min(self.snapshot.activity.len() - 1);
+        if !self.snapshot.rag.sessions.is_empty() {
+            self.selected_session = next.min(self.snapshot.rag.sessions.len() - 1);
             self.scroll = 0;
         }
     }
@@ -547,7 +600,7 @@ fn overview_text(snapshot: &DashboardSnapshot) -> String {
         crate::dashboard_theme::warning_suffix(runtime.hooks_installed < runtime.hooks_total);
     let documents_warning = crate::dashboard_theme::warning_suffix(runtime.dirty_documents > 0);
     let mut output = format!(
-        "Runtime\n  {:<12} {}\n  {:<12} {}/{} installed{}\n  {:<12} {} active / {} dirty{}\n  {:<12} {}\n  {:<12} {}\n\nKnowledge\n  {:<12} {} sessions / {} projects (7d)\n  {:<12} {} live cards (24h)\n  {:<12} {} prompts / {:.0}% injection (7d)\n  {:<12} median {}ms / p95 {}ms\n  {:<12} {}\n",
+        "Runtime\n  {:<12} {}\n  {:<12} {}/{} installed{}\n  {:<12} {} active / {} dirty{}\n  {:<12} {}\n  {:<12} {}\n\nKnowledge\n  {:<12} {} sessions / {} projects (7d)\n  {:<12} {} query sessions (7d)\n  {:<12} {} prompts / {:.0}% injection (7d)\n  {:<12} median {}ms / p95 {}ms\n  {:<12} {}\n",
         "daemon",
         state_badge(runtime.daemon_online),
         "hooks",
@@ -565,8 +618,8 @@ fn overview_text(snapshot: &DashboardSnapshot) -> String {
         "journal",
         snapshot.journal.session_count,
         snapshot.journal.project_count,
-        "activity",
-        snapshot.activity.len(),
+        "query sessions",
+        snapshot.rag.sessions.len(),
         "RAG",
         snapshot.rag.total,
         snapshot.rag.injection_rate_pct,
@@ -592,54 +645,58 @@ fn overview_text(snapshot: &DashboardSnapshot) -> String {
     output
 }
 
-fn session_time(timestamp: &str) -> String {
-    chrono::DateTime::parse_from_rfc3339(timestamp)
-        .map(|value| value.with_timezone(&Local).format("%H:%M:%S").to_string())
-        .unwrap_or_else(|_| "--:--:--".to_string())
+fn rag_time(timestamp: &str) -> String {
+    timestamp
+        .parse::<i64>()
+        .ok()
+        .and_then(|seconds| chrono::DateTime::<Utc>::from_timestamp(seconds, 0))
+        .map(|value| {
+            value
+                .with_timezone(&Local)
+                .format("%m-%d %H:%M:%S")
+                .to_string()
+        })
+        .unwrap_or_else(|| timestamp.to_string())
 }
 
-fn session_timeline(card: &crate::activity::ActivityCard) -> String {
-    let id: String = card.session_id.chars().take(8).collect();
+fn query_results(session: &RagSession) -> String {
+    let id: String = session.session_id.chars().take(8).collect();
     let mut output = format!(
-        "Session {id}\nrepo: {}\ncwd: {}\nupdated: {}\nturns: {}\n",
-        card.repo.as_deref().unwrap_or("(no repo)"),
-        card.cwd,
-        card.updated_at,
-        card.turns.len()
+        "Session {id}\nqueries: {}\nlatest: {}\n\n",
+        session.queries.len(),
+        rag_time(&session.latest_ts)
     );
-    if !card.files.is_empty() {
-        output.push_str(&format!("files: {}\n", card.files.join(", ")));
-    }
-    output.push('\n');
 
-    if card.turns.is_empty() {
-        output
-            .push_str("이 카드는 이전 저장 형식으로 생성되어 마지막 요청과 응답만 표시합니다.\n\n");
-        output.push_str("USER\n");
-        output.push_str(&card.latest_user);
-        output.push_str("\n\nCLAUDE\n");
-        if card.latest_assistant.is_empty() {
-            output.push_str("(텍스트 응답 없음)\n");
-        } else {
-            output.push_str(&card.latest_assistant);
-            output.push('\n');
-        }
-        return output;
-    }
-
-    for (index, turn) in card.turns.iter().enumerate() {
+    for (index, entry) in session.queries.iter().enumerate() {
         output.push_str(&format!(
-            "── Turn {} · {} ──\nUSER\n{}\n\nCLAUDE\n",
+            "── Query {} · {} ──\nQUERY\n{}\n\nRESULTS · {} hits · {} injected · {}ms\n",
             index + 1,
-            session_time(&turn.timestamp),
-            turn.user
+            rag_time(&entry.ts),
+            entry.query,
+            entry.hits.len(),
+            entry.injected,
+            entry.latency_ms
         ));
-        if turn.assistant.is_empty() {
-            output.push_str("(텍스트 응답 없음 또는 응답 대기 중)");
+        if entry.hits.is_empty() {
+            output.push_str("  (no hits)\n");
         } else {
-            output.push_str(&turn.assistant);
+            for (hit_index, hit) in entry.hits.iter().enumerate() {
+                output.push_str(&format!(
+                    "  {}. {:.3} {}\n",
+                    hit_index + 1,
+                    hit.score,
+                    hit.file
+                ));
+                if !hit.snippet.is_empty() {
+                    for line in hit.snippet.lines() {
+                        output.push_str("     ");
+                        output.push_str(line);
+                        output.push('\n');
+                    }
+                }
+            }
         }
-        output.push_str("\n\n");
+        output.push('\n');
     }
     output
 }
@@ -766,10 +823,10 @@ fn short_summary(value: &str, limit: usize) -> String {
 
 fn draw_sessions(frame: &mut Frame, area: Rect, app: &App) {
     let theme = app.theme;
-    if app.snapshot.activity.is_empty() {
+    if app.snapshot.rag.sessions.is_empty() {
         frame.render_widget(
             Paragraph::new(
-                "최근 24시간의 session activity가 없습니다.\nClaude 세션에서 Stop hook이 실행되면 요청과 응답 timeline이 여기에 나타납니다.",
+                "최근 7일간 검색이 실행된 kmd query session이 없습니다.\nUserPromptSubmit hook이 검색을 실행하면 query와 retrieval results가 여기에 나타납니다.",
             )
             .wrap(Wrap { trim: false })
             .block(
@@ -777,7 +834,7 @@ fn draw_sessions(frame: &mut Frame, area: Rect, app: &App) {
                     .borders(Borders::ALL)
                     .border_style(theme.border())
                     .title_style(theme.heading())
-                    .title(" Sessions "),
+                    .title(" Query sessions "),
             ),
             area,
         );
@@ -788,25 +845,23 @@ fn draw_sessions(frame: &mut Frame, area: Rect, app: &App) {
         Layout::horizontal([Constraint::Percentage(34), Constraint::Percentage(66)]).split(area);
     let items = app
         .snapshot
-        .activity
+        .rag
+        .sessions
         .iter()
-        .map(|card| {
-            let id: String = card.session_id.chars().take(8).collect();
-            let updated = chrono::DateTime::parse_from_rfc3339(&card.updated_at)
-                .map(|value| {
-                    value
-                        .with_timezone(&Local)
-                        .format("%m-%d %H:%M")
-                        .to_string()
-                })
-                .unwrap_or_else(|_| card.updated_at.clone());
+        .map(|session| {
+            let id: String = session.session_id.chars().take(8).collect();
+            let latest_query = session
+                .queries
+                .last()
+                .map(|entry| entry.query.as_str())
+                .unwrap_or("(missing query)");
             ListItem::new(vec![
                 Line::from(vec![
                     Span::styled(format!("{id} "), theme.accent()),
-                    Span::raw(card.repo.as_deref().unwrap_or("(no repo)").to_string()),
-                    Span::styled(format!("  {updated}"), theme.muted()),
+                    Span::styled(format!("{} queries", session.queries.len()), theme.muted()),
+                    Span::styled(format!("  {}", rag_time(&session.latest_ts)), theme.muted()),
                 ]),
-                Line::raw(format!("  {}", short_summary(&card.latest_user, 72))),
+                Line::raw(format!("  {}", short_summary(latest_query, 72))),
             ])
         })
         .collect::<Vec<_>>();
@@ -819,18 +874,21 @@ fn draw_sessions(frame: &mut Frame, area: Rect, app: &App) {
                 .borders(Borders::ALL)
                 .border_style(theme.border())
                 .title_style(theme.heading())
-                .title(format!(" Sessions · {} live ", app.snapshot.activity.len())),
+                .title(format!(
+                    " Query sessions · {} ",
+                    app.snapshot.rag.sessions.len()
+                )),
         );
     frame.render_stateful_widget(sessions, columns[0], &mut state);
 
-    let card = &app.snapshot.activity[app.selected_session];
-    let timeline = crate::dashboard_theme::style_body(
+    let session = &app.snapshot.rag.sessions[app.selected_session];
+    let detail = crate::dashboard_theme::style_body(
         crate::dashboard_theme::BodyKind::Sessions,
-        session_timeline(card),
+        query_results(session),
         theme,
     );
     frame.render_widget(
-        Paragraph::new(timeline)
+        Paragraph::new(detail)
             .scroll((app.scroll, 0))
             .wrap(Wrap { trim: false })
             .block(
@@ -838,10 +896,7 @@ fn draw_sessions(frame: &mut Frame, area: Rect, app: &App) {
                     .borders(Borders::ALL)
                     .border_style(theme.border())
                     .title_style(theme.heading())
-                    .title(format!(
-                        " Request → Claude response · scroll {} ",
-                        app.scroll
-                    )),
+                    .title(format!(" kmd query → results · scroll {} ", app.scroll)),
             ),
         columns[1],
     );
@@ -868,7 +923,7 @@ const HELP_ROWS: &[(&str, &str)] = &[
 ];
 
 fn draw_help(frame: &mut Frame, area: Rect, theme: crate::dashboard_theme::Theme) {
-    let width = area.width.saturating_sub(4).min(72).max(20);
+    let width = area.width.saturating_sub(4).clamp(20, 72);
     let height = (HELP_ROWS.len() as u16 + 2).min(area.height.saturating_sub(2).max(3));
     let popup = Rect {
         x: area.x + (area.width.saturating_sub(width)) / 2,
@@ -1180,6 +1235,54 @@ mod tests {
         assert!(error.to_string().contains("line 1"));
     }
 
+    fn rag_entry(
+        session_id: &str,
+        ts: &str,
+        stage: &str,
+        query: Option<&str>,
+    ) -> crate::rag::RagLogEntry {
+        crate::rag::RagLogEntry {
+            ts: ts.into(),
+            session_id: session_id.into(),
+            prompt: "not exposed by query sessions".into(),
+            prompt_len: 29,
+            hangul: false,
+            stage: stage.into(),
+            gate_reason: (stage == "gated").then(|| "too_short".into()),
+            query: query.map(str::to_string),
+            injected: usize::from(stage == "searched"),
+            hits: Vec::new(),
+            latency_ms: 10,
+        }
+    }
+
+    #[test]
+    fn groups_only_searched_queries_by_session() {
+        let entries = vec![
+            rag_entry("older-session", "100", "searched", Some("older second")),
+            rag_entry("newer-session", "300", "searched", Some("newer query")),
+            rag_entry("older-session", "50", "searched", Some("older first")),
+            rag_entry("gated-session", "400", "gated", None),
+            rag_entry("empty-query", "500", "searched", Some("")),
+        ];
+
+        let sessions = group_rag_sessions(&entries, 30);
+
+        assert_eq!(sessions.len(), 2);
+        assert_eq!(sessions[0].session_id, "newer-session");
+        assert_eq!(sessions[1].session_id, "older-session");
+        assert_eq!(sessions[1].latest_ts, "100");
+        assert_eq!(sessions[1].queries[0].query, "older first");
+        assert_eq!(sessions[1].queries[1].query, "older second");
+        let encoded = serde_json::to_value(&sessions).unwrap();
+        assert!(encoded.to_string().contains("older first"));
+        assert!(
+            !encoded
+                .to_string()
+                .contains("not exposed by query sessions")
+        );
+    }
+
     #[test]
     fn renders_dashboard_tabs_and_checks() {
         let snapshot = DashboardSnapshot {
@@ -1199,23 +1302,6 @@ mod tests {
                     path: "/knowledge".into(),
                 }],
             },
-            activity: vec![crate::activity::ActivityCard {
-                session_id: "12345678-session".into(),
-                updated_at: "2026-08-01T01:02:00Z".into(),
-                updated_epoch: 1_754_011_320,
-                cwd: "/repo".into(),
-                repo: Some("kmd".into()),
-                summary: "대시보드 세션 흐름을 개선한다".into(),
-                latest_user: "질의와 응답을 세션별로 보여줘".into(),
-                latest_assistant: "세션 중심 화면으로 변경했습니다.".into(),
-                turns: vec![crate::activity::ActivityTurn {
-                    timestamp: "2026-08-01T01:01:00Z".into(),
-                    user: "질의와 응답을 세션별로 보여줘".into(),
-                    assistant: "세션 중심 화면으로 변경했습니다.".into(),
-                }],
-                files: vec!["/repo/src/dashboard.rs".into()],
-                links: Vec::new(),
-            }],
             journal: crate::journal::JournalView {
                 from: "20260801".into(),
                 to: "20260801".into(),
@@ -1235,6 +1321,21 @@ mod tests {
                 injection_rate_pct: 50.0,
                 median_latency_ms: 80,
                 p95_latency_ms: 120,
+                sessions: vec![RagSession {
+                    session_id: "12345678-session".into(),
+                    latest_ts: "1754010120".into(),
+                    queries: vec![RagQueryRecord {
+                        ts: "1754010120".into(),
+                        query: "dashboard session query results".into(),
+                        injected: 1,
+                        hits: vec![crate::rag::RagHitLog {
+                            file: "kmd://learnings/dashboard.md".into(),
+                            score: 12.5,
+                            snippet: "session별 retrieval 결과".into(),
+                        }],
+                        latency_ms: 80,
+                    }],
+                }],
                 recent: vec![crate::rag::RagLogEntry {
                     ts: "2026-08-01T00:00:00Z".into(),
                     session_id: "session".into(),
@@ -1285,11 +1386,14 @@ mod tests {
             assert!(sessions.contains(label), "missing view {label}");
         }
         assert!(sessions.contains("12345678"));
-        assert!(sessions.contains("USER"));
-        assert!(sessions.contains("CLAUDE"));
-        let timeline = session_timeline(&app.snapshot.activity[0]);
-        assert!(timeline.contains("질의와 응답을 세션별로 보여줘"));
-        assert!(timeline.contains("세션 중심 화면으로 변경했습니다."));
+        assert!(sessions.contains("QUERY"));
+        assert!(sessions.contains("RESULTS"));
+        assert!(!sessions.contains("대화 원문은 화면에 표시하지 않는다"));
+        let results = query_results(&app.snapshot.rag.sessions[0]);
+        assert!(results.contains("dashboard session query results"));
+        assert!(results.contains("12.500 kmd://learnings/dashboard.md"));
+        assert!(results.contains("session별 retrieval 결과"));
+        assert!(!results.contains("대화 원문은 화면에 표시하지 않는다"));
 
         app.theme = crate::dashboard_theme::Theme::plain();
         terminal.draw(|frame| draw(frame, &app)).unwrap();
@@ -1303,9 +1407,9 @@ mod tests {
         );
         app.theme = crate::dashboard_theme::Theme::colored();
 
-        let mut second = app.snapshot.activity[0].clone();
+        let mut second = app.snapshot.rag.sessions[0].clone();
         second.session_id = "87654321-session".into();
-        app.snapshot.activity.push(second);
+        app.snapshot.rag.sessions.push(second);
         handle_key(
             &mut app,
             crossterm::event::KeyEvent::new(

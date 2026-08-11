@@ -109,8 +109,9 @@ fn is_heading(kind: BodyKind, line: &str) -> bool {
     match kind {
         BodyKind::Sessions => {
             line.starts_with("Session ")
-                || line.starts_with("── Turn ")
-                || matches!(line, "USER" | "CLAUDE")
+                || line.starts_with("── Query ")
+                || line == "QUERY"
+                || line.starts_with("RESULTS ·")
         }
         BodyKind::Operations => {
             matches!(
@@ -150,15 +151,10 @@ fn style_overview_line(line: &str, theme: Theme) -> Line<'static> {
 }
 
 fn style_session_line(line: &str, theme: Theme) -> Line<'static> {
-    if line.starts_with("repo:")
-        || line.starts_with("cwd:")
-        || line.starts_with("updated:")
-        || line.starts_with("turns:")
-        || line.starts_with("files:")
-    {
+    if line.starts_with("queries:") || line.starts_with("latest:") {
         return Line::styled(line.to_string(), theme.muted());
     }
-    if line.starts_with("(텍스트 응답 없음") {
+    if line.trim_start().starts_with("(no hits)") {
         return Line::styled(line.to_string(), theme.warning());
     }
     Line::raw(line.to_string())
