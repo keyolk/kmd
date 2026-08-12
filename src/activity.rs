@@ -289,6 +289,65 @@ fn short_file(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
 }
 
+/// A session is `active` while it is still sending kmd queries, `recent` when it went
+/// quiet within the last hour, and `idle` beyond that.
+pub const ACTIVE_WINDOW_SECS: i64 = 15 * 60;
+pub const RECENT_WINDOW_SECS: i64 = 60 * 60;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionActivity {
+    Active,
+    Recent,
+    Idle,
+}
+
+impl SessionActivity {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Recent => "recent",
+            Self::Idle => "idle",
+        }
+    }
+
+    /// Classify by how long ago the session last talked to kmd. The UserPromptSubmit hook
+    /// only runs inside a running session, so that timestamp is proof the session was
+    /// alive at that moment — kmd needs no separate pid or heartbeat probe.
+    pub fn from_last_query(now: i64, last_query_epoch: i64) -> Self {
+        if last_query_epoch <= 0 {
+            return Self::Idle;
+        }
+        match now.saturating_sub(last_query_epoch) {
+            age if age <= ACTIVE_WINDOW_SECS => Self::Active,
+            age if age <= RECENT_WINDOW_SECS => Self::Recent,
+            _ => Self::Idle,
+        }
+    }
+}
+
+/// session id prefix → last kmd query epoch, from the RAG log.
+/// Keyed on the shared 8-character prefix because activity cards may store a truncated id.
+pub fn last_query_epochs() -> std::collections::HashMap<String, i64> {
+    let mut latest = std::collections::HashMap::new();
+    let Ok(entries) = crate::stats::load_entries(Some(RECENT_WINDOW_SECS as u64)) else {
+        return latest;
+    };
+    for entry in entries {
+        let Ok(ts) = entry.ts.parse::<i64>() else {
+            continue;
+        };
+        let key: String = entry.session_id.chars().take(8).collect();
+        if key.is_empty() {
+            continue;
+        }
+        latest
+            .entry(key)
+            .and_modify(|current| *current = (*current).max(ts))
+            .or_insert(ts);
+    }
+    latest
+}
+
 pub fn render_recent(
     current_session: &str,
     current_cwd: &str,
@@ -299,8 +358,10 @@ pub fn render_recent(
         return Ok(None);
     }
 
+    let now = Utc::now().timestamp();
+    let last_queries = last_query_epochs();
     let mut out = String::from(
-        "<daily-activity>\n다른 Claude Code 세션의 최근 24시간 활동입니다. 현재 요청과 관련 있을 때만 참고하고, 중요한 상태는 다시 검증하세요.\n",
+        "<daily-activity>\n다른 Claude Code 세션의 최근 24시간 활동입니다. `active`는 지금 kmd에 질의 중인 세션, `recent`는 최근 1시간 내 질의한 세션입니다. 현재 요청과 관련 있을 때만 참고하고, 중요한 상태는 다시 검증하세요.\n",
     );
     for card in cards {
         let id8: String = card.session_id.chars().take(8).collect();
@@ -314,7 +375,16 @@ pub fn render_recent(
                 .next()
                 .unwrap_or("unknown")
         });
-        out.push_str(&format!("- {} [{}:{}] {}\n", time, axis, id8, card.summary));
+        let activity =
+            SessionActivity::from_last_query(now, last_queries.get(&id8).copied().unwrap_or(0));
+        out.push_str(&format!(
+            "- {} [{}:{}] ({}) {}\n",
+            time,
+            axis,
+            id8,
+            activity.label(),
+            card.summary
+        ));
         if card.latest_user != card.summary {
             out.push_str(&format!("  현재 요청: {}\n", card.latest_user));
         }
@@ -354,6 +424,33 @@ pub fn run(limit: usize, json: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn classifies_session_activity_by_last_kmd_query() {
+        let now = 1_754_010_000_i64;
+
+        assert_eq!(
+            SessionActivity::from_last_query(now, now - 60),
+            SessionActivity::Active
+        );
+        assert_eq!(
+            SessionActivity::from_last_query(now, now - ACTIVE_WINDOW_SECS),
+            SessionActivity::Active
+        );
+        assert_eq!(
+            SessionActivity::from_last_query(now, now - ACTIVE_WINDOW_SECS - 1),
+            SessionActivity::Recent
+        );
+        assert_eq!(
+            SessionActivity::from_last_query(now, now - RECENT_WINDOW_SECS - 1),
+            SessionActivity::Idle
+        );
+        // No query at all means kmd has no evidence the session is running.
+        assert_eq!(
+            SessionActivity::from_last_query(now, 0),
+            SessionActivity::Idle
+        );
+    }
 
     #[test]
     fn parses_live_transcript_into_activity_card() {

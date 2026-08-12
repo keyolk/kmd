@@ -155,6 +155,7 @@ fn style_session_line(line: &str, theme: Theme) -> Line<'static> {
     if line.starts_with("queries:")
         || line.starts_with("latest query:")
         || line.starts_with("origin:")
+        || line.starts_with("activity:")
         || line.starts_with("repo:")
         || line.starts_with("cwd:")
         || line.starts_with("updated:")
