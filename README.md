@@ -50,8 +50,12 @@ kmd journal --json
 | Operations | Runtime, retrieval, evaluation, and self-check health in one scrollable view |
 | Simulator | Real RAG pipeline or raw BM25 queries against the local index |
 
-Sessions merges two sources so a session stays visible even when it never triggered a
-retrieval. Rows are tagged `rag`, `live`, or `live+rag`:
+Sessions shows which Claude sessions are alive right now. Liveness is derived from the
+data kmd already owns: the `UserPromptSubmit` hook only runs inside a running session, so
+the most recent `rag.jsonl` query timestamp proves that session was alive at that moment.
+Rows are tagged `active` (queried within 15 minutes), `recent` (within an hour), or `idle`.
+
+Each row also records where its data came from — `rag`, `live`, or `live+rag`:
 
 - `rag` — `searched` entries from the last seven days of `rag.jsonl`: the extracted query,
   latency/injection metadata, and each hit's path, score, and snippet.
@@ -59,6 +63,10 @@ retrieval. Rows are tagged `rag`, `live`, or `live+rag`:
   latest request/result summary that the `UserPromptSubmit` hook already shares across sessions.
 
 Neither source reads or displays full Claude conversation transcripts.
+
+The same `active` / `recent` / `idle` tag is attached to the `<daily-activity>` block that
+`kmd rag --hook` injects on every prompt, so a running session can tell which of its peers
+are working right now rather than which ones merely finished something today.
 
 ### Keys
 

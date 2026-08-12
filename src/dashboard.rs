@@ -1,5 +1,6 @@
 //! Operations dashboard for kmd runtime state, activity, journal, RAG, and checks.
 
+use crate::activity::SessionActivity;
 use anyhow::{Context, Result};
 use chrono::{Local, Utc};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
@@ -26,8 +27,8 @@ struct TabGuide {
 
 const TAB_GUIDES: &[TabGuide] = &[
     TabGuide {
-        purpose: "See which Claude sessions are active and what kmd retrieved for each one.",
-        source: "live activity cards (24h) merged with searched rag.jsonl entries (7d)",
+        purpose: "See which Claude sessions are querying kmd right now and what each one got.",
+        source: "rag.jsonl query recency (active/recent/idle) plus live activity cards",
         action: "j/k selects a session · PgUp/PgDn scrolls its activity and query history",
     },
     TabGuide {
@@ -294,6 +295,15 @@ impl SessionEntry<'_> {
 
     fn query_count(&self) -> usize {
         self.rag.map_or(0, |session| session.queries.len())
+    }
+
+    /// How recently this session talked to kmd — the liveness signal kmd already owns.
+    fn activity(&self, now: i64) -> SessionActivity {
+        let last_query = self
+            .rag
+            .and_then(|session| session.latest_ts.parse::<i64>().ok())
+            .unwrap_or(0);
+        SessionActivity::from_last_query(now, last_query)
     }
 }
 
@@ -639,6 +649,15 @@ impl App {
     }
 }
 
+/// Sessions that queried kmd inside the active window — the ones still running right now.
+fn active_sessions(snapshot: &DashboardSnapshot) -> usize {
+    let now = Utc::now().timestamp();
+    merge_session_entries(&snapshot.rag.sessions, &snapshot.activity)
+        .iter()
+        .filter(|entry| entry.activity(now) == SessionActivity::Active)
+        .count()
+}
+
 fn state_badge(ok: bool) -> &'static str {
     if ok {
         crate::dashboard_theme::BADGE_OK
@@ -677,7 +696,7 @@ fn overview_text(snapshot: &DashboardSnapshot) -> String {
         crate::dashboard_theme::warning_suffix(runtime.hooks_installed < runtime.hooks_total);
     let documents_warning = crate::dashboard_theme::warning_suffix(runtime.dirty_documents > 0);
     let mut output = format!(
-        "Runtime\n  {:<12} {}\n  {:<12} {}/{} installed{}\n  {:<12} {} active / {} dirty{}\n  {:<12} {}\n  {:<12} {}\n\nKnowledge\n  {:<12} {} sessions / {} projects (7d)\n  {:<12} {} query (7d) / {} live (24h)\n  {:<12} {} prompts / {:.0}% injection (7d)\n  {:<12} median {}ms / p95 {}ms\n  {:<12} {}\n",
+        "Runtime\n  {:<12} {}\n  {:<12} {}/{} installed{}\n  {:<12} {} active / {} dirty{}\n  {:<12} {}\n  {:<12} {}\n\nKnowledge\n  {:<12} {} sessions / {} projects (7d)\n  {:<12} {} active now / {} with queries (7d)\n  {:<12} {} prompts / {:.0}% injection (7d)\n  {:<12} median {}ms / p95 {}ms\n  {:<12} {}\n",
         "daemon",
         state_badge(runtime.daemon_online),
         "hooks",
@@ -696,8 +715,8 @@ fn overview_text(snapshot: &DashboardSnapshot) -> String {
         snapshot.journal.session_count,
         snapshot.journal.project_count,
         "sessions",
+        active_sessions(snapshot),
         snapshot.rag.sessions.len(),
-        snapshot.activity.len(),
         "RAG",
         snapshot.rag.total,
         snapshot.rag.injection_rate_pct,
@@ -748,9 +767,13 @@ fn local_time(timestamp: &str) -> String {
         .unwrap_or_else(|_| timestamp.to_string())
 }
 
-fn session_details(entry: &SessionEntry<'_>) -> String {
+fn session_details(entry: &SessionEntry<'_>, now: i64) -> String {
     let id: String = entry.session_id.chars().take(8).collect();
-    let mut output = format!("Session {id}\norigin: {}\n", entry.origin());
+    let mut output = format!(
+        "Session {id}\nactivity: {}\norigin: {}\n",
+        entry.activity(now).label(),
+        entry.origin()
+    );
 
     if let Some(card) = entry.live {
         output.push_str(&format!(
@@ -966,17 +989,22 @@ fn draw_sessions(frame: &mut Frame, area: Rect, app: &App) {
         return;
     }
 
-    let live_count = entries.iter().filter(|entry| entry.live.is_some()).count();
+    let now = Utc::now().timestamp();
+    let active_count = entries
+        .iter()
+        .filter(|entry| entry.activity(now) == SessionActivity::Active)
+        .count();
     let columns =
         Layout::horizontal([Constraint::Percentage(34), Constraint::Percentage(66)]).split(area);
     let items = entries
         .iter()
         .map(|entry| {
             let id: String = entry.session_id.chars().take(8).collect();
-            let origin_style = if entry.live.is_some() {
-                theme.success()
-            } else {
-                theme.muted()
+            let activity = entry.activity(now);
+            let activity_style = match activity {
+                SessionActivity::Active => theme.success(),
+                SessionActivity::Recent => theme.warning(),
+                SessionActivity::Idle => theme.muted(),
             };
             let summary = entry
                 .rag
@@ -987,8 +1015,9 @@ fn draw_sessions(frame: &mut Frame, area: Rect, app: &App) {
             ListItem::new(vec![
                 Line::from(vec![
                     Span::styled(format!("{id} "), theme.accent()),
-                    Span::styled(format!("{:<8}", entry.origin()), origin_style),
-                    Span::styled(format!(" {} queries", entry.query_count()), theme.muted()),
+                    Span::styled(format!("{:<7}", activity.label()), activity_style),
+                    Span::styled(format!("{:<9}", entry.origin()), theme.muted()),
+                    Span::styled(format!("{} queries", entry.query_count()), theme.muted()),
                 ]),
                 Line::raw(format!("  {}", short_summary(summary, 72))),
             ])
@@ -1005,16 +1034,16 @@ fn draw_sessions(frame: &mut Frame, area: Rect, app: &App) {
                 .border_style(theme.border())
                 .title_style(theme.heading())
                 .title(format!(
-                    " Sessions · {} total · {} live ",
-                    entries.len(),
-                    live_count
+                    " Sessions · {} active now · {} total ",
+                    active_count,
+                    entries.len()
                 )),
         );
     frame.render_stateful_widget(sessions, columns[0], &mut state);
 
     let detail = crate::dashboard_theme::style_body(
         crate::dashboard_theme::BodyKind::Sessions,
-        session_details(&entries[selected]),
+        session_details(&entries[selected], now),
         theme,
     );
     frame.render_widget(
@@ -1445,10 +1474,57 @@ mod tests {
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].origin(), "live+rag");
         assert_eq!(merged[0].query_count(), 1);
-        let details = session_details(&merged[0]);
+        let details = session_details(&merged[0], 1_754_010_600);
         assert!(details.contains("origin: live+rag"));
         assert!(details.contains("same session request"));
         assert!(details.contains("merged query"));
+    }
+
+    #[test]
+    fn last_kmd_query_decides_session_activity() {
+        let now = 1_754_010_000_i64;
+        let session_at = |ts: i64| RagSession {
+            session_id: "session".into(),
+            latest_ts: ts.to_string(),
+            queries: vec![RagQueryRecord {
+                ts: ts.to_string(),
+                query: "q".into(),
+                injected: 0,
+                hits: Vec::new(),
+                latency_ms: 1,
+            }],
+        };
+
+        let just_now = session_at(now - 60);
+        let ten_minutes = session_at(now - 600);
+        let half_hour = session_at(now - 1_800);
+        let two_hours = session_at(now - 7_200);
+
+        let activity_of = |session: &RagSession| {
+            merge_session_entries(std::slice::from_ref(session), &[])[0].activity(now)
+        };
+
+        assert_eq!(activity_of(&just_now), SessionActivity::Active);
+        assert_eq!(activity_of(&ten_minutes), SessionActivity::Active);
+        assert_eq!(activity_of(&half_hour), SessionActivity::Recent);
+        assert_eq!(activity_of(&two_hours), SessionActivity::Idle);
+
+        // A live card alone is not proof of liveness — kmd only knows a session is
+        // running when that session actually sent it a query.
+        let card = crate::activity::ActivityCard {
+            session_id: "livecard".into(),
+            updated_at: "2026-08-01T00:00:00Z".into(),
+            updated_epoch: now,
+            cwd: "/repo".into(),
+            repo: None,
+            summary: "card".into(),
+            latest_user: "card".into(),
+            latest_assistant: String::new(),
+            files: Vec::new(),
+            links: Vec::new(),
+        };
+        let merged = merge_session_entries(&[], std::slice::from_ref(&card));
+        assert_eq!(merged[0].activity(now), SessionActivity::Idle);
     }
 
     #[test]
@@ -1577,12 +1653,15 @@ mod tests {
         assert_eq!(merged[0].origin(), "live");
         assert_eq!(merged[1].origin(), "rag");
 
-        let live_only = session_details(&merged[0]);
+        let live_only = session_details(&merged[0], 1_754_010_200);
         assert!(live_only.contains("LIVE ACTIVITY"));
         assert!(live_only.contains("live session latest request"));
         assert!(live_only.contains("(no kmd retrieval ran in this session)"));
+        // No kmd query ever ran here, so kmd cannot claim the session is alive.
+        assert!(live_only.contains("activity: idle"));
 
-        let results = session_details(&merged[1]);
+        let results = session_details(&merged[1], 1_754_010_200);
+        assert!(results.contains("activity: active"));
         assert!(results.contains("dashboard session query results"));
         assert!(results.contains("12.500 kmd://learnings/dashboard.md"));
         assert!(results.contains("session별 retrieval 결과"));
