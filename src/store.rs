@@ -18,6 +18,20 @@ pub struct Doc {
     pub title: String,
     pub body: String,
     pub context: Option<String>,
+    /// 본문 미저장 문서의 원본 절대경로. Some이면 `body`는 비어 있고
+    /// 본문이 필요한 쪽은 `body_of`로 파일에서 읽는다.
+    pub abspath: Option<String>,
+}
+
+/// 문서 본문 — `abspath`가 있으면 원본 파일에서 읽고, 없으면 저장된 `body`.
+///
+/// 파일이 사라졌거나 읽을 수 없으면 Ok(None). 인덱스가 워킹트리보다 최신일 수
+/// 있으므로(브랜치 전환, 파일 삭제) 이건 에러가 아니라 정상적인 결과다.
+pub fn body_of(doc: &Doc) -> Option<String> {
+    match &doc.abspath {
+        Some(p) => std::fs::read_to_string(p).ok(),
+        None => Some(doc.body.clone()),
+    }
 }
 
 impl Store {
@@ -42,15 +56,19 @@ impl Store {
                 hash        TEXT NOT NULL DEFAULT '',
                 active      INTEGER NOT NULL DEFAULT 1,
                 dirty       INTEGER NOT NULL DEFAULT 1,
+                abspath     TEXT,
                 UNIQUE(collection, relpath)
             );
             CREATE INDEX IF NOT EXISTS idx_documents_dirty ON documents(dirty) WHERE dirty = 1;
             "#,
         )?;
+        // 기존 DB 마이그레이션 — 이미 있으면 duplicate column 에러를 무시한다.
+        let _ = conn.execute("ALTER TABLE documents ADD COLUMN abspath TEXT", []);
         Ok(Store { conn })
     }
 
     /// 스캔 시 파일 메타가 기존과 같으면 skip. 다르면 upsert + dirty 마킹.
+    #[allow(clippy::too_many_arguments)]
     pub fn upsert_doc(
         &mut self,
         collection: &str,
@@ -61,6 +79,7 @@ impl Store {
         mtime_ns: i64,
         size: i64,
         hash: &str,
+        abspath: Option<&str>,
     ) -> Result<UpsertOutcome> {
         let existing: Option<(i64, String)> = self
             .conn
@@ -86,16 +105,16 @@ impl Store {
             }
             Some((id, _)) => {
                 self.conn.execute(
-                    "UPDATE documents SET title=?2, body=?3, context=?4, mtime_ns=?5, size=?6, hash=?7, active=1, dirty=1 WHERE id=?1",
-                    params![id, title, body, context, mtime_ns, size, hash],
+                    "UPDATE documents SET title=?2, body=?3, context=?4, mtime_ns=?5, size=?6, hash=?7, abspath=?8, active=1, dirty=1 WHERE id=?1",
+                    params![id, title, body, context, mtime_ns, size, hash, abspath],
                 )?;
                 Ok(UpsertOutcome::Updated)
             }
             None => {
                 self.conn.execute(
-                    "INSERT INTO documents (collection, relpath, title, body, context, mtime_ns, size, hash, active, dirty) \
-                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,1,1)",
-                    params![collection, relpath, title, body, context, mtime_ns, size, hash],
+                    "INSERT INTO documents (collection, relpath, title, body, context, mtime_ns, size, hash, abspath, active, dirty) \
+                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,1,1)",
+                    params![collection, relpath, title, body, context, mtime_ns, size, hash, abspath],
                 )?;
                 Ok(UpsertOutcome::Added)
             }
@@ -127,7 +146,7 @@ impl Store {
 
     pub fn dirty_docs(&self) -> Result<Vec<Doc>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, collection, relpath, title, body, context FROM documents WHERE dirty = 1",
+            "SELECT id, collection, relpath, title, body, context, abspath FROM documents WHERE dirty = 1",
         )?;
         let rows = stmt.query_map([], |r| {
             Ok(Doc {
@@ -137,6 +156,7 @@ impl Store {
                 title: r.get(3)?,
                 body: r.get(4)?,
                 context: r.get(5)?,
+                abspath: r.get(6)?,
             })
         })?;
         Ok(rows.collect::<std::result::Result<_, _>>()?)

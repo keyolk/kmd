@@ -24,7 +24,60 @@ kmd update              # index collections from ~/.config/kmd/index.yml
 kmd search "인증서 SAN" -n 5 --json
 kmd status
 
-# Track runtime, sessions, RAG history, and persisted self-checks.
+# Cross-axis search: past sessions, curated knowledge, and project source at once.
+kmd global "worktree"
+kmd global "SearchSessions" --axis project
+kmd global "인증서 갱신" -n 3 --json
+```
+
+### Axes
+
+`kmd search` queries one collection at a time. `kmd global` queries three *axes* and
+returns a quota of hits from each, so no single axis crowds out the rest:
+
+| Axis | Contents |
+|---|---|
+| `session` | Past Claude Code sessions (`learnings`, `narwhal-runs`) |
+| `knowledge` | Curated notes — wiki, memory, rules, skills, contexts |
+| `project` | Source code across local git repositories |
+
+A single ranked list would not work here: code repeats identifiers so its term
+frequencies run high, while session summaries are short. Merged into one list, one axis
+takes every top slot. Per-axis quotas keep all three visible.
+
+An axis is assigned per collection in `index.yml` via `axis:`. Collections without it
+fall back to a name-based default (`learnings` and `narwhal-runs` → `session`, everything
+else → `knowledge`), so existing configs keep working untouched.
+
+The `project` axis is deliberately excluded from the RAG hook's automatic injection
+(`rag.rs`'s `CLAUDE_COLLECTIONS`) — source files surface only when you ask for them.
+
+### Indexing source code
+
+Code collections use `source: git-repos`, which finds git repositories under `path` and
+enumerates each one with `git ls-files`. Build artifacts drop out via `.gitignore` for
+free, and it beats a full directory walk (203 repos enumerate in ~6s).
+
+```yaml
+  project:
+    path: /Users/me/src
+    source: git-repos
+    axis: project
+    store_body: false
+    max_file_size: 1048576
+    exclude:
+      - "**/vendor/**"
+      - "**/*.pb.go"
+```
+
+`store_body: false` (the default for `source: git-repos`) records only the absolute path
+instead of copying file contents into the store. Indexing and snippets read the original
+file. Source trees are large and stay put on disk, so a second copy would waste space and
+go stale; notes collections keep `store_body: true` because their contents are the
+document.
+
+```sh
+# Everything else is unchanged.
 kmd dashboard
 kmd dashboard --json
 kmd dashboard --check

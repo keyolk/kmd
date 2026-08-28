@@ -10,6 +10,7 @@ mod dashboard_theme;
 mod embed;
 mod eval;
 mod evaluation_log;
+mod global;
 mod hook;
 mod hook_config;
 mod journal;
@@ -58,6 +59,19 @@ enum Command {
         #[arg(short, long)]
         collection: Option<String>,
         /// JSON output (qmd-compatible schema)
+        #[arg(long)]
+        json: bool,
+    },
+    /// Cross-axis search over knowledge, past sessions, and project source
+    Global {
+        query: String,
+        /// Max results per axis
+        #[arg(short = 'n', long, default_value_t = 5)]
+        limit: usize,
+        /// Restrict to one axis: knowledge | session | project
+        #[arg(short, long)]
+        axis: Option<String>,
+        /// JSON output
         #[arg(long)]
         json: bool,
     },
@@ -296,6 +310,12 @@ fn main() -> Result<()> {
             collection,
             json,
         } => cmd_search(&query, limit, collection.as_deref(), json),
+        Command::Global {
+            query,
+            limit,
+            axis,
+            json,
+        } => cmd_global(&query, limit, axis.as_deref(), json),
         Command::Rag { hook, prompt } => cmd_rag(hook, prompt.as_deref()),
         Command::Stats { hours } => stats::print_stats(hours.map(|h| h * 3600)),
         Command::Log { count, follow } => stats::print_log(count, follow),
@@ -425,9 +445,25 @@ fn cmd_update(force: bool, r#async: bool) -> Result<()> {
     }
     let indexed = bm25::index_dirty(&config::tantivy_dir(), &mut store)?;
     eprintln!(
-        "scanned {} files ({} added, {} updated, {} removed), bm25 indexed {}",
-        stats.seen, stats.added, stats.updated, stats.removed, indexed
+        "scanned {} files ({} added, {} updated, {} removed, {} skipped), bm25 indexed {}",
+        stats.seen, stats.added, stats.updated, stats.removed, stats.skipped, indexed
     );
+    Ok(())
+}
+
+fn cmd_global(query: &str, limit: usize, axis: Option<&str>, json: bool) -> Result<()> {
+    let cfg = config::load()?;
+    if let Some(a) = axis
+        && !global::AXES.contains(&a)
+    {
+        anyhow::bail!("unknown axis {:?} — expected one of {:?}", a, global::AXES);
+    }
+    let axes = global::search(&config::tantivy_dir(), &cfg, query, limit, axis)?;
+    if json {
+        println!("{}", output::axes_to_json(&axes)?);
+    } else {
+        output::print_axes(&axes);
+    }
     Ok(())
 }
 

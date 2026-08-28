@@ -171,10 +171,15 @@ fn blob_to_vec(b: &[u8]) -> Vec<f32> {
 pub fn embed_pending(store: &mut Store, limit: Option<usize>) -> Result<usize> {
     ensure_schema(store)?;
 
-    // 임베딩 없는 활성 문서 목록
+    // 임베딩 없는 활성 문서 목록.
+    //
+    // 본문 미저장 문서(abspath IS NOT NULL — project 축)는 제외한다. 코드 38만 건
+    // 임베딩은 비용이 비현실적이고, 코드 검색은 식별자 정확 매칭이 지배적이라
+    // BM25로 충분하다. 벡터 검색은 knowledge/session 축에만 적용된다.
     let mut stmt = store.conn.prepare(
         "SELECT d.id, d.title, d.body FROM documents d
          WHERE d.active = 1
+           AND d.abspath IS NULL
            AND NOT EXISTS (SELECT 1 FROM embeddings e WHERE e.doc_id = d.id)
          ORDER BY d.id",
     )?;
