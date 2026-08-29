@@ -1,21 +1,27 @@
 # kmd
 
-Korean-aware markdown search — a qmd-compatible CLI built on tantivy + lindera (ko-dic).
+Korean-aware markdown search over notes, past Claude Code sessions, and project source.
+Built on tantivy + lindera (ko-dic).
 
 ## Why
 
-[qmd](https://github.com/tobi/qmd)'s BM25 (SQLite FTS5 unicode61 + per-char CJK
-normalization) misses most Korean queries. kmd indexes Korean text with proper
-morphological analysis ("인증서를" → "인증서" + "를"), so Korean keyword search
+kmd replaced [qmd](https://github.com/tobi/qmd), whose BM25 (SQLite FTS5 unicode61 +
+per-char CJK normalization) missed most Korean queries. kmd indexes Korean text with
+proper morphological analysis ("인증서를" → "인증서" + "를"), so Korean keyword search
 actually works.
 
-Measured on 60 real Korean prompts (Claude Code RAG hook simulation):
+Measured on 60 real Korean prompts (Claude Code RAG hook simulation) while both
+engines were installed side by side:
 
 | Engine | Korean hit rate | English hit rate | hook latency |
 |---|---|---|---|
 | qmd 1.0 (BM25) | 13% | 52% | ~150ms |
 | qmd 2.6.3 (BM25+CJK per-char) | 18% | 67% | ~150ms |
 | **kmd (lindera BM25)** | **72%** | 62% | **~82ms (daemon) / ~370ms (cold)** |
+
+qmd has since been removed from this environment; the comparison numbers above are
+kept as the historical record that motivated kmd, and are no longer reproducible
+locally.
 
 ## Usage
 
@@ -176,23 +182,22 @@ ordered by date and then by spatial locality: exact cwd, same worktree, same can
 Git repository, and touched-file overlap. New learnings persist their creation `Cwd:`;
 older learnings recover it from the original transcript or infer it from touched files.
 
-Reads qmd's `index.yml` as-is; emits qmd-compatible `--json` output
-(docid/score/file/title/context/snippet), so it drops into scripts that
-already consume `qmd search --json`.
+`--json` output keeps the docid/score/file/title/context/snippet shape inherited
+from qmd, so scripts written against the old format still work.
 
 ## Layout
 
-- `src/config.rs` — index.yml loading (qmd-compatible)
+- `src/config.rs` — index.yml loading, collection sources and axes
 - `src/store.rs` — SQLite document store (source of truth, dirty tracking)
 - `src/scan.rs` — collection scan, incremental upsert by content hash
 - `src/tokenize.rs` — lindera ko-dic (Korean) + lowercase/stemmer (English)
 - `src/bm25.rs` — tantivy index, dual ko/en fields, search + snippets
-- `src/output.rs` — qmd-compatible JSON / CLI output
+- `src/global.rs` — cross-axis search (`kmd global`)
+- `src/output.rs` — JSON / CLI output, per-axis rendering
 - `src/dashboard.rs` — operations TUI, JSON snapshot, checks and evaluation history
 - `src/evaluation_log.rs` — bounded history for successful L1/L2/L3 evaluation runs
 - `src/eval.rs` — L1 retrieval eval (`kmd eval`): known-item + gold
 - `src/util.rs` — L2 injection utilization (`kmd util`)
-- `src/ab.rs` — L3 A/B blind comparison (`kmd ab`)
 
 ## Roadmap
 
@@ -202,14 +207,15 @@ already consume `qmd search --json`.
 
 ## Evaluation
 
-3-layer utility eval — see [`eval/README.md`](eval/README.md).
+Two-layer utility eval — see [`eval/README.md`](eval/README.md).
 
 | Layer | Question | Command |
 |---|---|---|
-| L1 retrieval | found the right doc? | `kmd eval --compare-qmd` |
+| L1 retrieval | found the right doc? | `kmd eval` |
 | L2 utilization | did the answer use it? | `kmd util` |
-| L3 A/B | was the answer better? | `kmd ab --prompts eval/prompts.txt` |
 
-Measured (known-item, 341 queries, k=5): Korean R@5 **kmd 69% vs qmd 44%**,
-English **kmd 99% vs qmd 85%**. Blind A/B (10 pairs): **kmd 70% win**.
-Reproduce with `make eval-all`.
+Current (known-item, 400 queries, k=5): R@5 **81%** overall — Korean **75%**,
+English **97%**. Reproduce with `make eval-all`.
+
+The L3 A/B layer compared kmd against qmd head-to-head; it was removed along with
+qmd itself.

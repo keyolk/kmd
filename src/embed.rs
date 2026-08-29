@@ -29,8 +29,7 @@ pub fn model_path() -> PathBuf {
     if let Ok(p) = std::env::var("KMD_EMBED_MODEL") {
         return PathBuf::from(p);
     }
-    PathBuf::from(std::env::var("HOME").expect("HOME not set"))
-        .join(".cache/qmd/models/hf_ggml-org_embeddinggemma-300M-Q8_0.gguf")
+    crate::config::models_dir().join("hf_ggml-org_embeddinggemma-300M-Q8_0.gguf")
 }
 
 pub struct Embedder {

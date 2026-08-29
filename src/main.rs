@@ -1,4 +1,3 @@
-mod ab;
 mod activity;
 mod bm25;
 mod config;
@@ -163,9 +162,6 @@ enum Command {
         /// Cutoff k for Recall@k / MRR
         #[arg(short = 'k', long, default_value_t = 5)]
         k: usize,
-        /// Also run each query against qmd for side-by-side comparison
-        #[arg(long)]
-        compare_qmd: bool,
         /// known-item: only evaluate Korean-derived queries
         #[arg(long)]
         hangul: bool,
@@ -192,21 +188,6 @@ enum Command {
         /// Include synthetic sessions and auto prompts (task-notification, etc.)
         #[arg(long)]
         all: bool,
-        /// JSON output
-        #[arg(long)]
-        json: bool,
-    },
-    /// A/B blind comparison (L3): kmd vs qmd context, proxy or external judge
-    Ab {
-        /// Prompts file (one per line) for building A/B pairs
-        #[arg(long)]
-        prompts: Option<std::path::PathBuf>,
-        /// Emit blind pairs to this file (+ .key.jsonl) for external judging
-        #[arg(long)]
-        emit: Option<std::path::PathBuf>,
-        /// Tally external verdicts.jsonl ({id,winner}); needs --prompts <pairs.jsonl>
-        #[arg(long)]
-        judge: Option<std::path::PathBuf>,
         /// JSON output
         #[arg(long)]
         json: bool,
@@ -347,12 +328,11 @@ fn main() -> Result<()> {
             collection,
             sample,
             k,
-            compare_qmd,
             hangul,
             json,
         } => {
             if let Some(path) = gold {
-                eval::gold(&path, k, compare_qmd, json)
+                eval::gold(&path, k, json)
             } else {
                 let colls = if collection.is_empty() {
                     rag::CLAUDE_COLLECTIONS
@@ -362,7 +342,7 @@ fn main() -> Result<()> {
                 } else {
                     collection
                 };
-                eval::known_item(colls, sample, k, compare_qmd, hangul, json)
+                eval::known_item(colls, sample, k, hangul, json)
             }
         }
         Command::Util { hours, json } => util::print_utilization(hours.map(|h| h * 3600), json),
@@ -372,12 +352,6 @@ fn main() -> Result<()> {
             all,
             json,
         } => util::show(session.as_deref(), limit, all, json),
-        Command::Ab {
-            prompts,
-            emit,
-            judge,
-            json,
-        } => ab::run(prompts.as_deref(), emit.as_deref(), judge.as_deref(), json),
         Command::LearningsExtract {
             session,
             recent,

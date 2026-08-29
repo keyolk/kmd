@@ -111,6 +111,12 @@ pub fn tantivy_dir() -> PathBuf {
     cache_home().join("tantivy")
 }
 
+/// GGUF 모델 보관 위치. 예전에는 qmd의 캐시(`~/.cache/qmd/models`)에 얹혀 있었다.
+#[cfg(feature = "embed")]
+pub fn models_dir() -> PathBuf {
+    cache_home().join("models")
+}
+
 pub fn load() -> Result<IndexConfig> {
     let path = config_path();
     let raw = std::fs::read_to_string(&path)
