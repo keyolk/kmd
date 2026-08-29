@@ -38,7 +38,7 @@ const TAB_GUIDES: &[TabGuide] = &[
     },
     TabGuide {
         purpose: "Run real queries against the local index without writing logs.",
-        source: "RAG gate/filter/context pipeline or raw BM25 retrieval",
+        source: "RAG pipeline · raw BM25 · Global across session/knowledge/project",
         action: "i types · Enter runs · m switches mode · ? lists every key",
     },
 ];
@@ -1072,7 +1072,7 @@ const HELP_ROWS: &[(&str, &str)] = &[
     ("i or /", "Simulator: start typing"),
     ("Esc", "Simulator: stop typing · otherwise quit"),
     ("Enter", "Simulator: run the query"),
-    ("m", "Simulator: RAG pipeline ⇄ BM25 search"),
+    ("m", "Simulator: RAG ⇄ BM25 search ⇄ Global"),
     ("j/k", "Simulator: select a hit"),
     ("J/K", "Simulator: scroll result detail"),
     ("n/p", "Simulator: next / previous prompt history"),

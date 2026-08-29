@@ -101,7 +101,7 @@ kmd journal --json
 |---|---|
 | Sessions | Live Claude sessions merged with the kmd queries and retrieval results of each session |
 | Operations | Runtime, retrieval, evaluation, and self-check health in one scrollable view |
-| Simulator | Real RAG pipeline or raw BM25 queries against the local index |
+| Simulator | Real RAG pipeline, raw BM25, or cross-axis Global queries against the local index |
 
 Sessions shows which Claude sessions are alive right now. Liveness is derived from the
 data kmd already owns: the `UserPromptSubmit` hook only runs inside a running session, so
@@ -143,7 +143,7 @@ The Simulator view splits input into command and typing modes:
 |---|---|---|
 | command | `i` or `/` | start typing a query |
 | command | `Enter` | run the query |
-| command | `m` | RAG pipeline ⇄ BM25 search |
+| command | `m` | RAG pipeline ⇄ BM25 search ⇄ Global |
 | command | `j`/`k` | select a hit |
 | command | `J`/`K` | scroll result detail |
 | command | `n`/`p` | next / previous prompt history |
@@ -153,8 +153,12 @@ The Simulator view splits input into command and typing modes:
 | typing | `↑`/`↓` | recall prompt history |
 
 RAG mode shows gate → extracted query → filtered hits → injected context; BM25 mode
-shows raw retrieval. Simulator runs never write `rag.jsonl`. Semantic colors remain
-readable through text and symbols; set `NO_COLOR=1` to disable hues.
+shows raw retrieval; Global mode is `kmd global` in the TUI — hits arrive grouped under
+`── session` / `── knowledge` / `── project` headers, each axis holding its own quota, and
+an axis with no hits keeps its header so "nothing matched" stays distinguishable from
+"that axis is not indexed." Selection still walks the hits themselves, skipping headers.
+Simulator runs never write `rag.jsonl`. Semantic colors remain readable through text and
+symbols; set `NO_COLOR=1` to disable hues.
 
 The latest 500 check results are kept in `~/.local/state/kmd/checks.jsonl`.
 Successful `eval`, `util`, and `ab` runs are kept in
