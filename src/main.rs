@@ -29,7 +29,7 @@ mod util;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
-/// Korean-aware markdown search — qmd-compatible CLI.
+/// Korean-aware search over notes, past sessions, and project source.
 #[derive(Parser)]
 #[command(name = "kmd", version, about)]
 struct Cli {
@@ -57,7 +57,7 @@ enum Command {
         /// Restrict to a collection
         #[arg(short, long)]
         collection: Option<String>,
-        /// JSON output (qmd-compatible schema)
+        /// JSON output (docid/score/file/title/context/snippet)
         #[arg(long)]
         json: bool,
     },

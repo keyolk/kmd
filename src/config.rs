@@ -1,4 +1,4 @@
-//! index.yml 로딩 — `~/.config/kmd/index.yml`. (이전 qmd 공유 경로에서 이관.)
+//! index.yml 로딩 — `~/.config/kmd/index.yml`.
 //!
 //! ```yaml
 //! collections:
@@ -43,7 +43,7 @@ pub struct Collection {
     pub path: PathBuf,
     #[serde(default = "default_pattern")]
     pub pattern: String,
-    /// prefix → 설명. qmd는 ""(루트) 키를 컬렉션 전체 컨텍스트로 사용.
+    /// prefix → 설명. ""(루트) 키가 컬렉션 전체 컨텍스트다.
     #[serde(default)]
     pub context: BTreeMap<String, String>,
     #[serde(default)]
@@ -111,7 +111,7 @@ pub fn tantivy_dir() -> PathBuf {
     cache_home().join("tantivy")
 }
 
-/// GGUF 모델 보관 위치. 예전에는 qmd의 캐시(`~/.cache/qmd/models`)에 얹혀 있었다.
+/// GGUF 모델 보관 위치.
 #[cfg(feature = "embed")]
 pub fn models_dir() -> PathBuf {
     cache_home().join("models")

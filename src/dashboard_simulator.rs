@@ -480,7 +480,7 @@ fn draw_detail(frame: &mut Frame, area: Rect, state: &SimulatorState) {
                 Some(context) => context
                     .lines()
                     .map(|line| {
-                        let style = if line.starts_with("[QMD]") {
+                        let style = if line.starts_with("[KMD]") || line.starts_with("[QMD]") {
                             palette::accent()
                         } else if line.starts_with('<') || line == "---" {
                             palette::muted()

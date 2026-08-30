@@ -404,7 +404,8 @@ mod tests {
 
     #[test]
     fn norm_path_bridges_space_and_dash() {
-        // qmd(하이픈)와 kmd(공백) 파일명이 동일 정규화로 매칭돼야 공정 비교가 성립.
+        // 옛 인덱스는 파일명 공백을 하이픈으로 바꿨다. gold 파일이 그 표기로
+        // 남아 있어도 매칭돼야 한다.
         assert_eq!(
             norm_path("qmd://learnings/20260429 0-85eaf018.md"),
             norm_path("qmd://learnings/20260429-0-85eaf018.md"),

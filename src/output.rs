@@ -1,4 +1,4 @@
-//! 출력 포맷 — qmd --json 호환 스키마(docid/score/file/title/context/snippet).
+//! 출력 포맷 — docid/score/file/title/context/snippet.
 
 use crate::bm25::SearchHit;
 use crate::config::IndexConfig;

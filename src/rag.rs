@@ -1,5 +1,5 @@
 //! RAG 훅 파이프라인 — UserPromptSubmit stdin JSON을 받아
-//! 게이팅 → 키워드 추출 → BM25 검색 → <qmd-context> 출력.
+//! 게이팅 → 키워드 추출 → BM25 검색 → <kmd-context> 출력.
 //! 모든 결정을 JSONL로 로깅한다 (실사용 관측이 목적).
 
 use crate::bm25::{self, SearchHit};
@@ -162,8 +162,15 @@ fn is_structural_noise(p: &str) -> bool {
     if t.starts_with('❯') || t.starts_with("$ ") || t.starts_with("> ") {
         return true;
     }
-    // 4) 이전에 주입된 컨텍스트를 되붙인 경우 (재귀 오염 방지)
-    if t.starts_with("<qmd-context") || t.starts_with("[QMD]") || t.starts_with("━━ session") {
+    // 4) 이전에 주입된 컨텍스트를 되붙인 경우 (재귀 오염 방지).
+    //    옛 <qmd-context>/[QMD] 표기도 계속 인식한다 — 과거 세션에서 복사해 온
+    //    텍스트가 그 형태로 남아 있다.
+    if t.starts_with("<kmd-context")
+        || t.starts_with("<qmd-context")
+        || t.starts_with("[KMD]")
+        || t.starts_with("[QMD]")
+        || t.starts_with("━━ session")
+    {
         return true;
     }
     false
@@ -246,7 +253,7 @@ pub fn filter_hits(hits: Vec<SearchHit>) -> Vec<SearchHit> {
     kept
 }
 
-/// 주입 컨텍스트 포맷 — 기존 qmd_rag.py 출력과 동일한 <qmd-context> 형태.
+/// 주입 컨텍스트 포맷 — `<kmd-context>` 블록. 항목 머리표는 `[KMD]`.
 pub fn format_context(hits: &[SearchHit]) -> Option<String> {
     let chunks: Vec<String> = hits
         .iter()
@@ -257,7 +264,7 @@ pub fn format_context(hits: &[SearchHit]) -> Option<String> {
             }
             let display = h.file.strip_prefix("kmd://").unwrap_or(&h.file);
             let mut header = format!(
-                "[QMD] {}",
+                "[KMD] {}",
                 if h.title.is_empty() {
                     display
                 } else {
@@ -274,7 +281,7 @@ pub fn format_context(hits: &[SearchHit]) -> Option<String> {
         return None;
     }
     Some(format!(
-        "<qmd-context>\nRelevant knowledge from your QMD index:\n\n{}\n</qmd-context>",
+        "<kmd-context>\nRelevant knowledge from your kmd index:\n\n{}\n</kmd-context>",
         chunks.join("\n---\n")
     ))
 }
@@ -474,7 +481,20 @@ mod tests {
             Err("noise")
         );
         assert_eq!(
+            gate("[KMD] Session: 8e79893a some pasted context block here"),
+            Err("noise")
+        );
+        // 옛 표기도 계속 걸러야 한다 — 과거 세션에서 복사해 온 텍스트.
+        assert_eq!(
             gate("[QMD] Session: 8e79893a some pasted context block here"),
+            Err("noise")
+        );
+        assert_eq!(
+            gate("<qmd-context>\nRelevant knowledge from your QMD index:"),
+            Err("noise")
+        );
+        assert_eq!(
+            gate("<kmd-context>\nRelevant knowledge from your kmd index:"),
             Err("noise")
         );
     }

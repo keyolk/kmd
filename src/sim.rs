@@ -378,7 +378,7 @@ fn draw(f: &mut Frame, app: &App) {
     let ctx = Paragraph::new(ctx_text).wrap(Wrap { trim: false }).block(
         Block::default()
             .borders(Borders::ALL)
-            .title(" injected <qmd-context> "),
+            .title(" injected <kmd-context> "),
     );
     f.render_widget(ctx, body_chunks[1]);
 

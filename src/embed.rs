@@ -1,4 +1,4 @@
-//! 임베딩 + 벡터 검색 — embeddinggemma-300M GGUF(qmd 모델 재활용).
+//! 임베딩 + 벡터 검색 — embeddinggemma-300M GGUF.
 //!
 //! - `kmd embed`: dirty가 아닌 활성 문서 중 임베딩 없는 것을 청크 단위로 임베딩
 //! - 저장: SQLite `embeddings` 테이블 (BLOB f32-le), 브루트포스 코사인 검색
