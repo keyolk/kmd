@@ -318,7 +318,7 @@ fn draw_status(frame: &mut Frame, area: Rect, state: &SimulatorState) {
         ],
         (_, Some(result), _) => {
             let injected = result.context.is_some();
-            vec![
+            let mut lines = vec![
                 Line::from(vec![
                     Span::styled(result.mode.label().to_string(), palette::accent()),
                     Span::styled(" · query: ".to_string(), palette::muted()),
@@ -342,7 +342,19 @@ fn draw_status(frame: &mut Frame, area: Rect, state: &SimulatorState) {
                     Span::styled(" · ".to_string(), palette::muted()),
                     Span::styled(format!("{}ms", result.latency_ms), palette::value()),
                 ]),
-            ]
+            ];
+            if !result.axes.is_empty() {
+                let mut spans = vec![Span::styled("axes ".to_string(), palette::muted())];
+                for (index, (axis, count)) in result.axes.iter().enumerate() {
+                    if index > 0 {
+                        spans.push(Span::styled(" · ".to_string(), palette::muted()));
+                    }
+                    spans.push(Span::styled(format!("{axis} "), palette::accent()));
+                    spans.push(Span::styled(count.to_string(), palette::state(*count > 0)));
+                }
+                lines.push(Line::from(spans));
+            }
+            lines
         }
         _ => vec![
             Line::from(Span::styled(
@@ -351,7 +363,12 @@ fn draw_status(frame: &mut Frame, area: Rect, state: &SimulatorState) {
                 palette::muted(),
             )),
             Line::from(Span::styled(
-                "BM25 search: raw retrieval across every collection · m switches mode".to_string(),
+                "BM25 search: raw retrieval across every collection".to_string(),
+                palette::muted(),
+            )),
+            Line::from(Span::styled(
+                "Global: session / knowledge / project, quota'd per axis · m switches mode"
+                    .to_string(),
                 palette::muted(),
             )),
         ],
@@ -367,32 +384,82 @@ fn draw_status(frame: &mut Frame, area: Rect, state: &SimulatorState) {
     );
 }
 
+/// hits 리스트에 축 헤더를 섞은 결과. 선택은 hit 인덱스로 유지되므로 화면 행과
+/// hit 인덱스를 잇는 매핑을 함께 돌려준다.
+struct HitRows<'a> {
+    items: Vec<ListItem<'a>>,
+    /// 화면 행 → hit 인덱스. 헤더 행은 None.
+    row_to_hit: Vec<Option<usize>>,
+}
+
+fn hit_rows(state: &SimulatorState) -> HitRows<'static> {
+    let Some(result) = state.result.as_ref() else {
+        return HitRows {
+            items: Vec::new(),
+            row_to_hit: Vec::new(),
+        };
+    };
+
+    // 축 경계를 hit 인덱스로 바꿔 둔다: 그 인덱스 앞에 헤더 행이 들어간다.
+    let mut header_at: Vec<(usize, String, usize)> = Vec::new();
+    let mut cursor = 0usize;
+    for (axis, count) in &result.axes {
+        header_at.push((cursor, axis.clone(), *count));
+        cursor += count;
+    }
+
+    let mut items = Vec::new();
+    let mut row_to_hit = Vec::new();
+    for (index, hit) in result.hits.iter().enumerate() {
+        if let Some((_, axis, count)) = header_at.iter().find(|(at, _, _)| *at == index) {
+            items.push(ListItem::new(Line::from(vec![
+                Span::styled(format!("── {axis} "), palette::heading()),
+                Span::styled(format!("({count})"), palette::muted()),
+            ])));
+            row_to_hit.push(None);
+        }
+        let path = hit.file.strip_prefix("kmd://").unwrap_or(&hit.file);
+        let (collection, rest) = path.split_once('/').unwrap_or(("", path));
+        items.push(ListItem::new(Line::from(vec![
+            Span::styled(format!("{:>2}. ", index + 1), palette::muted()),
+            Span::styled(format!("{:>6.2} ", hit.score), palette::success()),
+            Span::styled(format!("{collection}/"), palette::accent()),
+            Span::styled(rest.to_string(), palette::value()),
+        ])));
+        row_to_hit.push(Some(index));
+    }
+
+    // 결과가 0건인 축도 보여준다 — "검색은 됐는데 없음"과 "그 축이 인덱싱되지
+    // 않음"은 다른 상태다.
+    for (at, axis, count) in &header_at {
+        if *count == 0 && *at >= result.hits.len() {
+            items.push(ListItem::new(Line::from(vec![
+                Span::styled(format!("── {axis} "), palette::heading()),
+                Span::styled("(0)".to_string(), palette::muted()),
+            ])));
+            row_to_hit.push(None);
+        }
+    }
+
+    HitRows { items, row_to_hit }
+}
+
 fn draw_hits(frame: &mut Frame, area: Rect, state: &SimulatorState) {
-    let items = state
-        .result
-        .as_ref()
-        .map(|result| {
-            result
-                .hits
-                .iter()
-                .enumerate()
-                .map(|(index, hit)| {
-                    let path = hit.file.strip_prefix("kmd://").unwrap_or(&hit.file);
-                    let (collection, rest) = path.split_once('/').unwrap_or(("", path));
-                    ListItem::new(Line::from(vec![
-                        Span::styled(format!("{:>2}. ", index + 1), palette::muted()),
-                        Span::styled(format!("{:>6.2} ", hit.score), palette::success()),
-                        Span::styled(format!("{collection}/"), palette::accent()),
-                        Span::styled(rest.to_string(), palette::value()),
-                    ]))
-                })
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
+    let HitRows { items, row_to_hit } = hit_rows(state);
     let mut list_state = ListState::default();
     if !items.is_empty() {
-        list_state.select(Some(state.selected_hit.min(items.len() - 1)));
+        // 선택은 hit 인덱스 기준이므로 해당 hit이 놓인 화면 행을 찾는다.
+        let row = row_to_hit
+            .iter()
+            .position(|slot| *slot == Some(state.selected_hit))
+            .unwrap_or(0);
+        list_state.select(Some(row));
     }
+    let title = if state.result.as_ref().is_some_and(|r| !r.axes.is_empty()) {
+        " hits · j/k selects · axes quota'd separately "
+    } else {
+        " hits · j/k selects "
+    };
     let list = List::new(items)
         .highlight_symbol("> ")
         .highlight_style(palette::selection())
@@ -400,10 +467,7 @@ fn draw_hits(frame: &mut Frame, area: Rect, state: &SimulatorState) {
             Block::default()
                 .borders(Borders::ALL)
                 .border_style(palette::border())
-                .title(Line::from(vec![
-                    Span::styled(" hits ".to_string(), palette::heading()),
-                    Span::styled("· j/k selects ".to_string(), palette::muted()),
-                ])),
+                .title(Span::styled(title.to_string(), palette::heading())),
         );
     frame.render_stateful_widget(list, area, &mut list_state);
 }
@@ -416,7 +480,7 @@ fn draw_detail(frame: &mut Frame, area: Rect, state: &SimulatorState) {
                 Some(context) => context
                     .lines()
                     .map(|line| {
-                        let style = if line.starts_with("[QMD]") {
+                        let style = if line.starts_with("[KMD]") || line.starts_with("[QMD]") {
                             palette::accent()
                         } else if line.starts_with('<') || line == "---" {
                             palette::muted()
@@ -510,7 +574,81 @@ mod tests {
     #[test]
     fn mode_toggle_round_trips() {
         assert_eq!(SimulatorMode::Rag.toggle(), SimulatorMode::Search);
-        assert_eq!(SimulatorMode::Search.toggle(), SimulatorMode::Rag);
+        assert_eq!(SimulatorMode::Search.toggle(), SimulatorMode::Global);
+        assert_eq!(SimulatorMode::Global.toggle(), SimulatorMode::Rag);
+    }
+
+    fn hit(file: &str) -> crate::bm25::SearchHit {
+        crate::bm25::SearchHit {
+            docid: "#000001".into(),
+            score: 1.0,
+            file: file.into(),
+            title: "t".into(),
+            context: None,
+            snippet: None,
+        }
+    }
+
+    fn global_result(axes: Vec<(&str, usize)>) -> SimulatorResult {
+        let mut hits = Vec::new();
+        for (axis, count) in &axes {
+            for i in 0..*count {
+                hits.push(hit(&format!("kmd://{axis}/doc{i}.md")));
+            }
+        }
+        SimulatorResult {
+            mode: SimulatorMode::Global,
+            query: "q".into(),
+            gate_reason: None,
+            hits,
+            context: None,
+            latency_ms: 1,
+            axes: axes
+                .into_iter()
+                .map(|(a, c)| (a.to_string(), c))
+                .collect(),
+        }
+    }
+
+    /// 축 헤더가 들어가도 j/k 선택은 hit 인덱스를 가리켜야 한다.
+    #[test]
+    fn axis_headers_do_not_shift_hit_selection() {
+        let mut state = SimulatorState::new();
+        state.result = Some(global_result(vec![("session", 2), ("project", 2)]));
+
+        let rows = hit_rows(&state);
+        // 헤더 2 + hit 4
+        assert_eq!(rows.items.len(), 6);
+        assert_eq!(
+            rows.row_to_hit,
+            vec![None, Some(0), Some(1), None, Some(2), Some(3)],
+        );
+    }
+
+    /// 결과가 0건인 축도 화면에 남아야 한다 — "없음"과 "인덱싱 안 됨"은 다르다.
+    #[test]
+    fn empty_axis_still_renders_a_header() {
+        let mut state = SimulatorState::new();
+        state.result = Some(global_result(vec![("session", 1), ("project", 0)]));
+
+        let rows = hit_rows(&state);
+        // session 헤더 + hit 1개 + 빈 project 헤더
+        assert_eq!(rows.items.len(), 3);
+        assert_eq!(rows.row_to_hit, vec![None, Some(0), None]);
+    }
+
+    /// 축이 없는 모드(RAG/BM25)는 헤더 없이 평평하게 그린다.
+    #[test]
+    fn non_global_modes_render_without_headers() {
+        let mut state = SimulatorState::new();
+        let mut result = global_result(vec![("session", 3)]);
+        result.mode = SimulatorMode::Search;
+        result.axes.clear();
+        state.result = Some(result);
+
+        let rows = hit_rows(&state);
+        assert_eq!(rows.items.len(), 3);
+        assert_eq!(rows.row_to_hit, vec![Some(0), Some(1), Some(2)]);
     }
 
     #[test]

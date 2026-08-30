@@ -7,7 +7,7 @@ use anyhow::Result;
 use serde::Serialize;
 use std::path::Path;
 use tantivy::collector::TopDocs;
-use tantivy::query::QueryParser;
+use tantivy::query::{BooleanQuery, Occur, Query, QueryParser, TermQuery};
 use tantivy::schema::{
     FAST, Field, INDEXED, IndexRecordOption, STORED, STRING, Schema, TextFieldIndexing,
     TextOptions, Value,
@@ -34,6 +34,7 @@ struct Fields {
     title: Field,
     context: Field,
     body_stored: Field,
+    abspath: Field,
     title_ko: Field,
     title_en: Field,
     body_ko: Field,
@@ -59,6 +60,7 @@ fn build_schema() -> (Schema, Fields) {
         title: b.add_text_field("title", STORED),
         context: b.add_text_field("context", STORED),
         body_stored: b.add_text_field("body_stored", STORED),
+        abspath: b.add_text_field("abspath", STORED),
         title_ko: b.add_text_field("title_ko", ko_opts.clone()),
         title_en: b.add_text_field("title_en", en_opts.clone()),
         body_ko: b.add_text_field("body_ko", ko_opts),
@@ -92,19 +94,27 @@ pub fn index_dirty(dir: &Path, store: &mut Store) -> Result<usize> {
     for d in &dirty {
         writer.delete_term(Term::from_field_i64(f.doc_id, d.id));
         if store.is_active(d.id)? {
-            writer.add_document(doc!(
-                f.doc_id => d.id,
-                f.collection => d.collection.clone(),
-                f.relpath => d.relpath.clone(),
-                f.title => d.title.clone(),
-                f.context => d.context.clone().unwrap_or_default(),
-                f.body_stored => d.body.clone(),
-                f.title_ko => d.title.clone(),
-                f.title_en => d.title.clone(),
-                f.body_ko => d.body.clone(),
-                f.body_en => d.body.clone(),
-            ))?;
-            indexed += 1;
+            // 본문 미저장 문서는 원본에서 읽는다. 파일이 사라졌으면 색인만 건너뛰고
+            // dirty는 해제한다 — 다음 스캔이 deactivate_missing으로 정리한다.
+            if let Some(body) = crate::store::body_of(d) {
+                // abspath가 있으면 body_stored를 비워 인덱스 크기를 아낀다.
+                // 스니펫은 검색 시점에 원본에서 읽는다.
+                let stored = if d.abspath.is_some() { "" } else { body.as_str() };
+                writer.add_document(doc!(
+                    f.doc_id => d.id,
+                    f.collection => d.collection.clone(),
+                    f.relpath => d.relpath.clone(),
+                    f.title => d.title.clone(),
+                    f.context => d.context.clone().unwrap_or_default(),
+                    f.body_stored => stored,
+                    f.abspath => d.abspath.clone().unwrap_or_default(),
+                    f.title_ko => d.title.clone(),
+                    f.title_en => d.title.clone(),
+                    f.body_ko => body.clone(),
+                    f.body_en => body.clone(),
+                ))?;
+                indexed += 1;
+            }
         }
         ids.push(d.id);
     }
@@ -115,10 +125,24 @@ pub fn index_dirty(dir: &Path, store: &mut Store) -> Result<usize> {
 
 pub fn search(
     dir: &Path,
-    _cfg: &IndexConfig,
+    cfg: &IndexConfig,
     query: &str,
     limit: usize,
     collection: Option<&str>,
+) -> Result<Vec<SearchHit>> {
+    let filter = collection.map(|c| std::slice::from_ref(&c).to_vec());
+    search_in(dir, cfg, query, limit, filter.as_deref())
+}
+
+/// 컬렉션 집합으로 좁힌 검색. `collections`가 None이면 전 인덱스.
+///
+/// `kmd global`이 한 축(여러 컬렉션)을 한 번에 질의하려고 쓴다.
+pub fn search_in(
+    dir: &Path,
+    _cfg: &IndexConfig,
+    query: &str,
+    limit: usize,
+    collections: Option<&[&str]>,
 ) -> Result<Vec<SearchHit>> {
     let (index, f) = open_or_create(dir)?;
     let reader = index.reader()?;
@@ -133,9 +157,32 @@ pub fn search(
     // 사용자 쿼리는 구문이 아니라 키워드 집합 — lenient 파싱
     let (parsed, _errors) = parser.parse_query_lenient(query);
 
-    // 컬렉션 필터가 있으면 과잉 수집 후 필터링 (규모상 충분)
-    let fetch = if collection.is_some() { limit * 20 } else { limit };
-    let top = searcher.search(&parsed, &TopDocs::with_limit(fetch.max(limit)))?;
+    // 컬렉션 필터는 질의에 넣는다. 과잉 수집 후 후처리로 거르면, 인덱스가 커질수록
+    // 큰 컬렉션이 상위를 모두 차지해 작은 컬렉션이 한 건도 살아남지 못한다
+    // (project 36만 건 추가 후 실제로 learnings가 통째로 사라졌다).
+    let final_query: Box<dyn Query> = match collections {
+        Some(want) if !want.is_empty() => {
+            let mut clauses: Vec<(Occur, Box<dyn Query>)> =
+                vec![(Occur::Must, Box::new(BooleanQuery::from(vec![(
+                    Occur::Must,
+                    parsed,
+                )])))];
+            let coll_clauses: Vec<(Occur, Box<dyn Query>)> = want
+                .iter()
+                .map(|c| {
+                    let term = Term::from_field_text(f.collection, c);
+                    let q: Box<dyn Query> =
+                        Box::new(TermQuery::new(term, IndexRecordOption::Basic));
+                    (Occur::Should, q)
+                })
+                .collect();
+            clauses.push((Occur::Must, Box::new(BooleanQuery::new(coll_clauses))));
+            Box::new(BooleanQuery::new(clauses))
+        }
+        _ => parsed,
+    };
+
+    let top = searcher.search(&final_query, &TopDocs::with_limit(limit))?;
 
     let mut hits = Vec::new();
     for (score, addr) in top {
@@ -148,16 +195,26 @@ pub fn search(
                 .to_string()
         };
         let coll = get_str(f.collection);
-        if let Some(want) = collection {
-            if coll != want {
-                continue;
-            }
+        if let Some(want) = collections
+            && !want.contains(&coll.as_str())
+        {
+            continue;
         }
         let doc_id = retrieved
             .get_first(f.doc_id)
             .and_then(|v| v.as_i64())
             .unwrap_or(0);
-        let body = get_str(f.body_stored);
+        let abspath = get_str(f.abspath);
+        // 본문 미저장 문서는 스니펫을 원본에서 읽는다. 파일이 사라졌으면(브랜치
+        // 전환, 삭제) 인덱스가 워킹트리보다 최신인 것이므로 그 hit은 버린다.
+        let body = if abspath.is_empty() {
+            get_str(f.body_stored)
+        } else {
+            match std::fs::read_to_string(&abspath) {
+                Ok(b) => b,
+                Err(_) => continue,
+            }
+        };
         let context = {
             let c = get_str(f.context);
             if c.is_empty() { None } else { Some(c) }
@@ -208,4 +265,188 @@ fn make_snippet(body: &str, query: &str, max_len: usize) -> String {
         out.push('…');
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::Store;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static SEQ: AtomicUsize = AtomicUsize::new(0);
+
+    struct TmpDir(std::path::PathBuf);
+
+    impl TmpDir {
+        fn new(tag: &str) -> Self {
+            let n = SEQ.fetch_add(1, Ordering::SeqCst);
+            let p = std::env::temp_dir().join(format!(
+                "kmd-bm25-test-{}-{}-{}",
+                std::process::id(),
+                tag,
+                n
+            ));
+            let _ = std::fs::remove_dir_all(&p);
+            std::fs::create_dir_all(&p).expect("mkdir temp");
+            TmpDir(p)
+        }
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TmpDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn empty_cfg() -> IndexConfig {
+        serde_yaml::from_str("collections: {}").unwrap()
+    }
+
+    /// 한 컬렉션에 `count`개의 문서를 넣는다. 본문은 모두 같은 단어를 담아
+    /// 어느 컬렉션이든 질의에 매칭되게 한다.
+    fn seed(store: &mut Store, collection: &str, count: usize, word: &str) {
+        for i in 0..count {
+            store
+                .upsert_doc(
+                    collection,
+                    &format!("doc{}.md", i),
+                    &format!("{} {}", collection, i),
+                    &format!("{} body {}", word, i),
+                    None,
+                    0,
+                    0,
+                    &format!("hash-{}-{}", collection, i),
+                    None,
+                )
+                .unwrap();
+        }
+    }
+
+    /// 큰 컬렉션이 상위를 독식해도 작은 컬렉션이 자기 몫을 받아야 한다.
+    ///
+    /// 회귀 가드: 예전에는 `limit * 20`만 가져와 후처리로 걸렀다. project 36만 건을
+    /// 인덱싱한 뒤 상위 40건이 전부 project가 되면서 `--axis session -n 2`가
+    /// 0건을 반환했다.
+    #[test]
+    fn small_collection_survives_a_much_larger_one() {
+        let store_dir = TmpDir::new("store");
+        let index_dir = TmpDir::new("index");
+        let mut store = Store::open(&store_dir.path().join("s.sqlite")).unwrap();
+
+        seed(&mut store, "big", 500, "shared");
+        seed(&mut store, "small", 3, "shared");
+        index_dirty(index_dir.path(), &mut store).unwrap();
+
+        let cfg = empty_cfg();
+        let hits = search_in(index_dir.path(), &cfg, "shared", 2, Some(&["small"])).unwrap();
+
+        assert_eq!(hits.len(), 2, "small collection must still yield hits");
+        assert!(
+            hits.iter().all(|h| h.file.starts_with("kmd://small/")),
+            "filter leaked other collections: {:?}",
+            hits.iter().map(|h| &h.file).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn multiple_collections_are_unioned() {
+        let store_dir = TmpDir::new("store-union");
+        let index_dir = TmpDir::new("index-union");
+        let mut store = Store::open(&store_dir.path().join("s.sqlite")).unwrap();
+
+        seed(&mut store, "a", 5, "shared");
+        seed(&mut store, "b", 5, "shared");
+        seed(&mut store, "c", 5, "shared");
+        index_dirty(index_dir.path(), &mut store).unwrap();
+
+        let cfg = empty_cfg();
+        let hits = search_in(index_dir.path(), &cfg, "shared", 20, Some(&["a", "b"])).unwrap();
+
+        assert_eq!(hits.len(), 10, "both requested collections contribute");
+        assert!(
+            !hits.iter().any(|h| h.file.starts_with("kmd://c/")),
+            "unrequested collection leaked"
+        );
+    }
+
+    #[test]
+    fn no_filter_searches_everything() {
+        let store_dir = TmpDir::new("store-all");
+        let index_dir = TmpDir::new("index-all");
+        let mut store = Store::open(&store_dir.path().join("s.sqlite")).unwrap();
+
+        seed(&mut store, "a", 3, "shared");
+        seed(&mut store, "b", 3, "shared");
+        index_dirty(index_dir.path(), &mut store).unwrap();
+
+        let cfg = empty_cfg();
+        let hits = search_in(index_dir.path(), &cfg, "shared", 20, None).unwrap();
+        assert_eq!(hits.len(), 6);
+    }
+
+    /// 본문 미저장 문서는 색인도 스니펫도 원본 파일에서 읽는다.
+    #[test]
+    fn body_less_doc_indexes_and_snippets_from_disk() {
+        let src = TmpDir::new("src");
+        let store_dir = TmpDir::new("store-abspath");
+        let index_dir = TmpDir::new("index-abspath");
+
+        let file = src.path().join("code.go");
+        std::fs::write(&file, "package main\n// uniquetoken lives here\n").unwrap();
+
+        let mut store = Store::open(&store_dir.path().join("s.sqlite")).unwrap();
+        store
+            .upsert_doc(
+                "project",
+                "code.go",
+                "code.go",
+                "", // 본문은 store에 없다
+                None,
+                0,
+                0,
+                "h1",
+                Some(file.to_str().unwrap()),
+            )
+            .unwrap();
+        let n = index_dirty(index_dir.path(), &mut store).unwrap();
+        assert_eq!(n, 1, "body is read from disk for indexing");
+
+        let cfg = empty_cfg();
+        let hits = search_in(index_dir.path(), &cfg, "uniquetoken", 5, None).unwrap();
+        assert_eq!(hits.len(), 1, "term from the on-disk body is searchable");
+        assert!(
+            hits[0].snippet.as_deref().unwrap().contains("uniquetoken"),
+            "snippet is read back from the original file"
+        );
+    }
+
+    /// 원본이 사라진 문서는 색인에서 조용히 빠진다 — 에러가 아니다.
+    #[test]
+    fn missing_original_is_skipped_not_fatal() {
+        let store_dir = TmpDir::new("store-missing");
+        let index_dir = TmpDir::new("index-missing");
+        let mut store = Store::open(&store_dir.path().join("s.sqlite")).unwrap();
+
+        store
+            .upsert_doc(
+                "project",
+                "gone.go",
+                "gone.go",
+                "",
+                None,
+                0,
+                0,
+                "h1",
+                Some("/nonexistent/gone.go"),
+            )
+            .unwrap();
+
+        let n = index_dirty(index_dir.path(), &mut store).unwrap();
+        assert_eq!(n, 0, "vanished file contributes no document");
+        // dirty는 해제돼 다음 스캔이 계속 진행될 수 있어야 한다.
+        assert!(store.dirty_docs().unwrap().is_empty());
+    }
 }

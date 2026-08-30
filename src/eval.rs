@@ -4,7 +4,6 @@
 //! 1. `known-item` (자기지도): 문서에서 한글 구절을 뽑아 rag 파이프라인과 동일하게
 //!    키워드화한 뒤, 그 쿼리로 원본 문서가 top-k에 돌아오는지 측정한다. 라벨이
 //!    필요 없고 수백 쿼리로 재현 가능하며, 한글 형태소 매칭을 격리해서 잰다.
-//!    `--compare-qmd`로 같은 쿼리를 qmd에도 던져 나란히 대조한다.
 //! 2. `gold <path>`: 사람이 라벨한 gold YAML(prompt→기대 파일 substring)로 회귀 측정.
 //!
 //! 지표: Recall@1/3/5, MRR@k. 한글/영어 쿼리를 분리 집계한다.
@@ -83,15 +82,15 @@ pub struct EngineReport {
 // ---------------------------------------------------------- 검색 어댑터 ----
 
 /// kmd BM25 검색 → expected 파일의 rank.
-/// qmd는 파일명의 공백을 하이픈으로 정규화하므로, 엔진 간 공정 비교를 위해
+/// 과거 인덱스는 파일명의 공백을 하이픈으로 정규화했으므로, 표기 차이를 흡수하려고
 /// 양쪽 경로를 동일 정규화(공백류→'-', 소문자)한 full-path로 매칭한다.
 fn rank_kmd(expected: &str, hits: &[String]) -> Option<usize> {
     let want = norm_path(expected);
     hits.iter().position(|f| norm_path(f) == want).map(|i| i + 1)
 }
 
-/// 경로 정규화 — 스킴 접두어(qmd://·kmd://)를 먼저 벗기고, 공백/연속 공백을 '-'로,
-/// 소문자화. qmd/kmd 파일명 표기 및 스킴 차이 모두 흡수.
+/// 경로 정규화 — 스킴 접두어를 벗기고, 공백/연속 공백을 '-'로, 소문자화.
+/// 과거 gold 파일이 옛 스킴(qmd://)으로 적혀 있어도 매칭되게 한다.
 fn norm_path(uri: &str) -> String {
     let stripped = uri
         .strip_prefix("qmd://")
@@ -206,29 +205,10 @@ fn load_samples(collections: &[String], sample: usize, hangul_only: bool) -> Res
     Ok(all)
 }
 
-/// qmd에 쿼리를 던져 top-k file 목록을 파싱.
-fn qmd_search(query: &str, k: usize) -> Option<Vec<String>> {
-    let out = std::process::Command::new("qmd")
-        .args(["search", query, "-n", &k.to_string(), "--json"])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let v: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
-    Some(
-        v.as_array()?
-            .iter()
-            .filter_map(|h| h.get("file").and_then(|f| f.as_str()).map(String::from))
-            .collect(),
-    )
-}
-
 pub fn known_item(
     collections: Vec<String>,
     sample: usize,
     k: usize,
-    compare_qmd: bool,
     hangul_only: bool,
     json: bool,
 ) -> Result<()> {
@@ -242,11 +222,6 @@ pub fn known_item(
         engine: "kmd".into(),
         ..Default::default()
     };
-    let mut qmd = EngineReport {
-        engine: "qmd".into(),
-        ..Default::default()
-    };
-
     for s in &samples {
         // kmd
         let t = Instant::now();
@@ -260,26 +235,9 @@ pub fn known_item(
         } else {
             kmd.english.record(rank, lat);
         }
-
-        if compare_qmd {
-            let t = Instant::now();
-            let qfiles = qmd_search(&s.query, k).unwrap_or_default();
-            let lat = t.elapsed().as_millis();
-            let rank = rank_kmd(&s.file, &qfiles);
-            qmd.all.record(rank, lat);
-            if s.hangul {
-                qmd.korean.record(rank, lat);
-            } else {
-                qmd.english.record(rank, lat);
-            }
-        }
     }
 
-    let reports: Vec<&EngineReport> = if compare_qmd {
-        vec![&kmd, &qmd]
-    } else {
-        vec![&kmd]
-    };
+    let reports: Vec<&EngineReport> = vec![&kmd];
     crate::evaluation_log::record(
         "eval-known-item",
         format!(
@@ -329,7 +287,7 @@ struct GoldCase {
     expect_any: Vec<String>,
 }
 
-pub fn gold(path: &Path, k: usize, compare_qmd: bool, json: bool) -> Result<()> {
+pub fn gold(path: &Path, k: usize, json: bool) -> Result<()> {
     let raw = std::fs::read_to_string(path)
         .with_context(|| format!("cannot read gold file {}", path.display()))?;
     let cases: Vec<GoldCase> =
@@ -343,11 +301,6 @@ pub fn gold(path: &Path, k: usize, compare_qmd: bool, json: bool) -> Result<()> 
         engine: "kmd".into(),
         ..Default::default()
     };
-    let mut qmd = EngineReport {
-        engine: "qmd".into(),
-        ..Default::default()
-    };
-
     for c in &cases {
         // 실제 훅과 동일하게 프롬프트에서 키워드 추출.
         let query = match rag::gate(&c.prompt) {
@@ -366,26 +319,9 @@ pub fn gold(path: &Path, k: usize, compare_qmd: bool, json: bool) -> Result<()> 
         } else {
             kmd.english.record(rank, lat);
         }
-
-        if compare_qmd {
-            let t = Instant::now();
-            let qhits = qmd_search(&query, k).unwrap_or_default();
-            let lat = t.elapsed().as_millis();
-            let rank = gold_rank(&c.expect_any, qhits.iter().map(|f| (f.as_str(), "")));
-            qmd.all.record(rank, lat);
-            if hangul {
-                qmd.korean.record(rank, lat);
-            } else {
-                qmd.english.record(rank, lat);
-            }
-        }
     }
 
-    let reports: Vec<&EngineReport> = if compare_qmd {
-        vec![&kmd, &qmd]
-    } else {
-        vec![&kmd]
-    };
+    let reports: Vec<&EngineReport> = vec![&kmd];
     crate::evaluation_log::record(
         "eval-gold",
         format!(
@@ -468,7 +404,8 @@ mod tests {
 
     #[test]
     fn norm_path_bridges_space_and_dash() {
-        // qmd(하이픈)와 kmd(공백) 파일명이 동일 정규화로 매칭돼야 공정 비교가 성립.
+        // 옛 인덱스는 파일명 공백을 하이픈으로 바꿨다. gold 파일이 그 표기로
+        // 남아 있어도 매칭돼야 한다.
         assert_eq!(
             norm_path("qmd://learnings/20260429 0-85eaf018.md"),
             norm_path("qmd://learnings/20260429-0-85eaf018.md"),

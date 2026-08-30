@@ -1,4 +1,3 @@
-mod ab;
 mod activity;
 mod bm25;
 mod config;
@@ -10,6 +9,7 @@ mod dashboard_theme;
 mod embed;
 mod eval;
 mod evaluation_log;
+mod global;
 mod hook;
 mod hook_config;
 mod journal;
@@ -29,7 +29,7 @@ mod util;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
-/// Korean-aware markdown search — qmd-compatible CLI.
+/// Korean-aware search over notes, past sessions, and project source.
 #[derive(Parser)]
 #[command(name = "kmd", version, about)]
 struct Cli {
@@ -57,7 +57,20 @@ enum Command {
         /// Restrict to a collection
         #[arg(short, long)]
         collection: Option<String>,
-        /// JSON output (qmd-compatible schema)
+        /// JSON output (docid/score/file/title/context/snippet)
+        #[arg(long)]
+        json: bool,
+    },
+    /// Cross-axis search over knowledge, past sessions, and project source
+    Global {
+        query: String,
+        /// Max results per axis
+        #[arg(short = 'n', long, default_value_t = 5)]
+        limit: usize,
+        /// Restrict to one axis: knowledge | session | project
+        #[arg(short, long)]
+        axis: Option<String>,
+        /// JSON output
         #[arg(long)]
         json: bool,
     },
@@ -149,9 +162,6 @@ enum Command {
         /// Cutoff k for Recall@k / MRR
         #[arg(short = 'k', long, default_value_t = 5)]
         k: usize,
-        /// Also run each query against qmd for side-by-side comparison
-        #[arg(long)]
-        compare_qmd: bool,
         /// known-item: only evaluate Korean-derived queries
         #[arg(long)]
         hangul: bool,
@@ -178,21 +188,6 @@ enum Command {
         /// Include synthetic sessions and auto prompts (task-notification, etc.)
         #[arg(long)]
         all: bool,
-        /// JSON output
-        #[arg(long)]
-        json: bool,
-    },
-    /// A/B blind comparison (L3): kmd vs qmd context, proxy or external judge
-    Ab {
-        /// Prompts file (one per line) for building A/B pairs
-        #[arg(long)]
-        prompts: Option<std::path::PathBuf>,
-        /// Emit blind pairs to this file (+ .key.jsonl) for external judging
-        #[arg(long)]
-        emit: Option<std::path::PathBuf>,
-        /// Tally external verdicts.jsonl ({id,winner}); needs --prompts <pairs.jsonl>
-        #[arg(long)]
-        judge: Option<std::path::PathBuf>,
         /// JSON output
         #[arg(long)]
         json: bool,
@@ -296,6 +291,12 @@ fn main() -> Result<()> {
             collection,
             json,
         } => cmd_search(&query, limit, collection.as_deref(), json),
+        Command::Global {
+            query,
+            limit,
+            axis,
+            json,
+        } => cmd_global(&query, limit, axis.as_deref(), json),
         Command::Rag { hook, prompt } => cmd_rag(hook, prompt.as_deref()),
         Command::Stats { hours } => stats::print_stats(hours.map(|h| h * 3600)),
         Command::Log { count, follow } => stats::print_log(count, follow),
@@ -327,12 +328,11 @@ fn main() -> Result<()> {
             collection,
             sample,
             k,
-            compare_qmd,
             hangul,
             json,
         } => {
             if let Some(path) = gold {
-                eval::gold(&path, k, compare_qmd, json)
+                eval::gold(&path, k, json)
             } else {
                 let colls = if collection.is_empty() {
                     rag::CLAUDE_COLLECTIONS
@@ -342,7 +342,7 @@ fn main() -> Result<()> {
                 } else {
                     collection
                 };
-                eval::known_item(colls, sample, k, compare_qmd, hangul, json)
+                eval::known_item(colls, sample, k, hangul, json)
             }
         }
         Command::Util { hours, json } => util::print_utilization(hours.map(|h| h * 3600), json),
@@ -352,12 +352,6 @@ fn main() -> Result<()> {
             all,
             json,
         } => util::show(session.as_deref(), limit, all, json),
-        Command::Ab {
-            prompts,
-            emit,
-            judge,
-            json,
-        } => ab::run(prompts.as_deref(), emit.as_deref(), judge.as_deref(), json),
         Command::LearningsExtract {
             session,
             recent,
@@ -425,9 +419,25 @@ fn cmd_update(force: bool, r#async: bool) -> Result<()> {
     }
     let indexed = bm25::index_dirty(&config::tantivy_dir(), &mut store)?;
     eprintln!(
-        "scanned {} files ({} added, {} updated, {} removed), bm25 indexed {}",
-        stats.seen, stats.added, stats.updated, stats.removed, indexed
+        "scanned {} files ({} added, {} updated, {} removed, {} skipped), bm25 indexed {}",
+        stats.seen, stats.added, stats.updated, stats.removed, stats.skipped, indexed
     );
+    Ok(())
+}
+
+fn cmd_global(query: &str, limit: usize, axis: Option<&str>, json: bool) -> Result<()> {
+    let cfg = config::load()?;
+    if let Some(a) = axis
+        && !global::AXES.contains(&a)
+    {
+        anyhow::bail!("unknown axis {:?} — expected one of {:?}", a, global::AXES);
+    }
+    let axes = global::search(&config::tantivy_dir(), &cfg, query, limit, axis)?;
+    if json {
+        println!("{}", output::axes_to_json(&axes)?);
+    } else {
+        output::print_axes(&axes);
+    }
     Ok(())
 }
 

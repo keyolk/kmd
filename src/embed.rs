@@ -1,4 +1,4 @@
-//! 임베딩 + 벡터 검색 — embeddinggemma-300M GGUF(qmd 모델 재활용).
+//! 임베딩 + 벡터 검색 — embeddinggemma-300M GGUF.
 //!
 //! - `kmd embed`: dirty가 아닌 활성 문서 중 임베딩 없는 것을 청크 단위로 임베딩
 //! - 저장: SQLite `embeddings` 테이블 (BLOB f32-le), 브루트포스 코사인 검색
@@ -29,8 +29,7 @@ pub fn model_path() -> PathBuf {
     if let Ok(p) = std::env::var("KMD_EMBED_MODEL") {
         return PathBuf::from(p);
     }
-    PathBuf::from(std::env::var("HOME").expect("HOME not set"))
-        .join(".cache/qmd/models/hf_ggml-org_embeddinggemma-300M-Q8_0.gguf")
+    crate::config::models_dir().join("hf_ggml-org_embeddinggemma-300M-Q8_0.gguf")
 }
 
 pub struct Embedder {
@@ -171,10 +170,15 @@ fn blob_to_vec(b: &[u8]) -> Vec<f32> {
 pub fn embed_pending(store: &mut Store, limit: Option<usize>) -> Result<usize> {
     ensure_schema(store)?;
 
-    // 임베딩 없는 활성 문서 목록
+    // 임베딩 없는 활성 문서 목록.
+    //
+    // 본문 미저장 문서(abspath IS NOT NULL — project 축)는 제외한다. 코드 38만 건
+    // 임베딩은 비용이 비현실적이고, 코드 검색은 식별자 정확 매칭이 지배적이라
+    // BM25로 충분하다. 벡터 검색은 knowledge/session 축에만 적용된다.
     let mut stmt = store.conn.prepare(
         "SELECT d.id, d.title, d.body FROM documents d
          WHERE d.active = 1
+           AND d.abspath IS NULL
            AND NOT EXISTS (SELECT 1 FROM embeddings e WHERE e.doc_id = d.id)
          ORDER BY d.id",
     )?;

@@ -16,6 +16,7 @@ use std::time::Instant;
 pub enum SimulatorMode {
     Rag,
     Search,
+    Global,
 }
 
 impl SimulatorMode {
@@ -23,13 +24,15 @@ impl SimulatorMode {
         match self {
             Self::Rag => "RAG pipeline",
             Self::Search => "BM25 search",
+            Self::Global => "Global (per-axis)",
         }
     }
 
     pub fn toggle(self) -> Self {
         match self {
             Self::Rag => Self::Search,
-            Self::Search => Self::Rag,
+            Self::Search => Self::Global,
+            Self::Global => Self::Rag,
         }
     }
 }
@@ -41,6 +44,12 @@ pub struct SimulatorResult {
     pub hits: Vec<SearchHit>,
     pub context: Option<String>,
     pub latency_ms: u64,
+    /// Global 모드에서 `hits`가 어느 축에서 왔는지 — (축 이름, 그 축의 hit 수)를
+    /// `hits` 순서대로 나열한다. 다른 모드에서는 비어 있다.
+    ///
+    /// hits를 축별로 중첩하지 않고 평평하게 두는 이유: 리스트 선택(j/k)과 상세
+    /// 패널이 이미 평평한 인덱스로 동작한다. 축은 렌더링 시 헤더로만 끼워 넣는다.
+    pub axes: Vec<(String, usize)>,
 }
 
 /// Execute the same retrieval paths exposed by the CLI without writing RAG logs.
@@ -56,6 +65,7 @@ pub fn execute(mode: SimulatorMode, input: &str, limit: usize) -> Result<Simulat
                 hits: outcome.hits,
                 context: outcome.context,
                 latency_ms: outcome.latency_ms,
+                axes: Vec::new(),
             })
         }
         SimulatorMode::Search => {
@@ -70,6 +80,35 @@ pub fn execute(mode: SimulatorMode, input: &str, limit: usize) -> Result<Simulat
                 hits,
                 context: None,
                 latency_ms: started.elapsed().as_millis() as u64,
+                axes: Vec::new(),
+            })
+        }
+        SimulatorMode::Global => {
+            let started = Instant::now();
+            let config = crate::config::load()?;
+            // 축마다 쿼터를 주므로 축 수로 나눠 전체 개수를 리스트 크기에 맞춘다.
+            let per_axis = (limit / crate::global::AXES.len().max(1)).max(2);
+            let grouped = crate::global::search(
+                &crate::config::tantivy_dir(),
+                &config,
+                input,
+                per_axis,
+                None,
+            )?;
+            let mut hits = Vec::new();
+            let mut axes = Vec::new();
+            for group in grouped {
+                axes.push((group.axis, group.hits.len()));
+                hits.extend(group.hits);
+            }
+            Ok(SimulatorResult {
+                mode,
+                query: input.to_string(),
+                gate_reason: None,
+                hits,
+                context: None,
+                latency_ms: started.elapsed().as_millis() as u64,
+                axes,
             })
         }
     }
@@ -339,7 +378,7 @@ fn draw(f: &mut Frame, app: &App) {
     let ctx = Paragraph::new(ctx_text).wrap(Wrap { trim: false }).block(
         Block::default()
             .borders(Borders::ALL)
-            .title(" injected <qmd-context> "),
+            .title(" injected <kmd-context> "),
     );
     f.render_widget(ctx, body_chunks[1]);
 
