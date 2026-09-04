@@ -170,6 +170,15 @@ fn tokens(s: &str) -> HashSet<String> {
 /// 채택률 임계 — 답변이 재사용한 스니펫 고유토큰 비율이 이 이상이면 "활용됨".
 const UTILIZED_THRESHOLD: f64 = 0.15;
 
+/// 히트 파일의 컬렉션 이름. 옛 `qmd://` 스킴도 받는다(과거 로그가 그 스킴이다).
+fn collection_of(file: &str) -> String {
+    file.strip_prefix("qmd://")
+        .or_else(|| file.strip_prefix("kmd://"))
+        .and_then(|rest| rest.split('/').next())
+        .unwrap_or("?")
+        .to_string()
+}
+
 pub fn print_utilization(since_secs: Option<u64>, json: bool) -> Result<()> {
     let log = rag_log_path();
     let raw = match std::fs::read_to_string(&log) {
@@ -208,16 +217,17 @@ pub fn print_utilization(since_secs: Option<u64>, json: bool) -> Result<()> {
     let mut coll_count: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
     for e in &entries {
         for h in &e.hits {
-            let coll = h
-                .file
-                .strip_prefix("qmd://")
-                .or_else(|| h.file.strip_prefix("kmd://"))
-                .and_then(|r| r.split('/').next())
-                .unwrap_or("?")
-                .to_string();
-            *coll_count.entry(coll).or_default() += 1;
+            *coll_count.entry(collection_of(&h.file)).or_default() += 1;
         }
     }
+    // 컬렉션별 활용 기여 — 활용된 프롬프트에 그 컬렉션이 주입됐는지.
+    //
+    // 주입 점유율만으로는 배분이 옳은지 알 수 없다. 실측 learnings가 주입의
+    // 89%를 차지하는데, 코퍼스 자체가 1,431건 대 정제 지식 98건(93% 대 7%)이라
+    // 그 점유율은 규모를 그대로 따른 것일 수 있다. 활용된 프롬프트에서의 분포와
+    // 비교해야 "많이 주입돼서 많이 쓰인 것"과 "쓸모가 있어서 쓰인 것"이 갈린다.
+    let mut coll_utilized: std::collections::BTreeMap<String, usize> =
+        std::collections::BTreeMap::new();
 
     for e in &entries {
         // 주입 스니펫은 로그에 파일만 남으므로, 조인 키로 답변을 찾은 뒤
@@ -264,6 +274,15 @@ pub fn print_utilization(since_secs: Option<u64>, json: bool) -> Result<()> {
             utilized += 1;
             if e.hangul {
                 korean_util += 1;
+            }
+            // 한 프롬프트에 같은 컬렉션이 여러 번 주입될 수 있으므로 dedup —
+            // 세는 단위는 "그 컬렉션이 기여한 프롬프트 수"다.
+            let mut seen = HashSet::new();
+            for h in &e.hits {
+                let coll = collection_of(&h.file);
+                if seen.insert(coll.clone()) {
+                    *coll_utilized.entry(coll).or_default() += 1;
+                }
             }
         }
         examples.push((overlap, format!("{:.0}% {}", overlap * 100.0, short(&e.prompt))));
@@ -317,6 +336,28 @@ pub fn print_utilization(since_secs: Option<u64>, json: bool) -> Result<()> {
         ranked.sort_by(|a, b| b.1.cmp(a.1));
         for (coll, n) in ranked {
             println!("  {:<18} {:>4}  ({:.0}%)", coll, n, pct(*n, total_files));
+        }
+        if utilized > 0 {
+            // 주입 점유율과 활용 기여율을 나란히 놓는다. 코퍼스 규모 차이 때문에
+            // 점유율만으로는 배분이 옳은지 알 수 없다 (learnings 1,431건 대 정제
+            // 지식 98건). 활용 쪽 비율이 더 높은 컬렉션은 규모에 비해 값을 하는
+            // 것이고, 낮은 컬렉션은 자리만 차지하는 것이다.
+            println!(
+                "\n활용된 {}개 프롬프트에 어느 컬렉션이 기여했나 (컬렉션당 프롬프트 수):",
+                utilized
+            );
+            let mut util_ranked: Vec<_> = coll_utilized.iter().collect();
+            util_ranked.sort_by(|a, b| b.1.cmp(a.1));
+            for (coll, n) in util_ranked {
+                let injected_share = coll_count.get(coll).copied().unwrap_or(0);
+                println!(
+                    "  {:<18} {:>4}  ({:.0}% of utilized | {:.0}% of injected files)",
+                    coll,
+                    n,
+                    pct(*n, utilized),
+                    pct(injected_share, total_files)
+                );
+            }
         }
         if !examples.is_empty() {
             println!("\n상위 활용 예시:");

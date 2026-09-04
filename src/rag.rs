@@ -180,13 +180,43 @@ fn is_structural_noise(p: &str) -> bool {
 /// 직접 반영될 가치가 높아 부스트하고, learnings(과거 세션 로그)는 배경 참고
 /// 성격이라 약간 낮춘다. kmd show/util 실측에서 주입의 97%가 learnings로 쏠려
 /// 정제 지식이 묻히는 걸 완화한다. BM25 점수에 곱해 재정렬한다.
+/// 컬렉션 가중 — 검색 점수에 곱해 재정렬한다.
+///
+/// `KMD_CURATED_WEIGHT`로 덮을 수 있다. 스윕 없이 값을 고르면 근거가 없고,
+/// 재빌드 없이 스윕하려면 런타임 값이어야 한다.
 fn collection_weight(coll: &str) -> f32 {
     match coll {
         "claude-memory" | "claude-skills" | "claude-agents" | "claude-rules"
-        | "claude-contexts" => 1.3,
+        | "claude-contexts" => curated_weight(),
         "learnings" => 0.75,
         _ => 1.0,
     }
+}
+
+/// 정제 지식 가중의 기본값.
+///
+/// **측정 결과 이 값은 실효가 없다.** 1.0에서 5.0까지 스윕해도 gold 55케이스의
+/// 정답률이 31%로 한 자리도 움직이지 않는다. 주입 결과 자체는 7건에서 바뀌지만
+/// (learnings 하나가 skills로 교체되는 식) 그 교체가 정답 판정을 넘나들지
+/// 않는다. 즉 상위 3건 안에서 순서만 섞이고, 정답이 3건 밖에 있으면 가중으로는
+/// 끌어올 수 없다.
+///
+/// 그래도 값을 남기는 이유는 `kmd util`이 정제 지식의 값어치를 보여주기
+/// 때문이다: 주입 파일의 10%인데 활용된 프롬프트의 31%에 기여한다
+/// (skills 6%→15%, memory 3%→12%, rules 1%→4%). 규모 차이가 원인이고
+/// (learnings 1,431건 대 정제 지식 98건), 배분을 고치려면 가중이 아니라
+/// 검색 자체가 정답을 3건 안에 넣어야 한다.
+///
+/// `KMD_CURATED_WEIGHT`로 덮을 수 있으니, 코퍼스 균형이 달라지면 다시 스윕할
+/// 것 — 지금 무효라는 것이 앞으로도 그렇다는 뜻은 아니다.
+const DEFAULT_CURATED_WEIGHT: f32 = 1.3;
+
+fn curated_weight() -> f32 {
+    std::env::var("KMD_CURATED_WEIGHT")
+        .ok()
+        .and_then(|v| v.parse::<f32>().ok())
+        .filter(|w| *w > 0.0)
+        .unwrap_or(DEFAULT_CURATED_WEIGHT)
 }
 
 fn collection_of(file: &str) -> &str {
