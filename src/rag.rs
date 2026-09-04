@@ -45,6 +45,17 @@ const SKIP_PREFIXES: &[&str] = &["/", "yes", "no", "ok", "sure", "thanks", "than
 
 /// 주입 대상 컬렉션. memory/rules는 CLAUDE.md로 상시 로드되므로 제외 대상 후보지만
 /// 지금은 qmd_rag.py와 동일하게 유지 — stats로 실측 후 조정한다.
+///
+/// `KMD_INJECT_COLLECTIONS`(쉼표 구분)로 덮을 수 있다. 이 목록은 qmd에서
+/// 물려받은 것이고 위 주석이 조정을 예고해 두었는데, 조정하려면 후보를
+/// 넣고 빼며 재보는 수밖에 없다.
+///
+/// `wiki`(916건)를 넣어 봤고 **넣지 않기로 했다.** gold 전체로는 42%→47%로
+/// 올라가지만, 그 이득이 전부 wiki 앵커 케이스 6건(TCP·oncall)에서 나온다.
+/// 그 6건을 뺀 49건에서는 47%→45%로 **내려간다** — wiki가 노이즈로 작동한다.
+/// gold의 wiki 앵커 비중(11%)이 실제 프롬프트 분포를 대표한다는 근거가 없어,
+/// 순이득 3건을 근거로 채택하지 않는다. 다시 판단하려면 실사용 프롬프트에서
+/// wiki 문서의 채택률을 재야 한다.
 pub const CLAUDE_COLLECTIONS: &[&str] = &[
     "claude-memory",
     "claude-rules",
@@ -53,6 +64,19 @@ pub const CLAUDE_COLLECTIONS: &[&str] = &[
     "claude-contexts",
     "learnings",
 ];
+
+/// 실제로 주입에 쓸 컬렉션 목록.
+pub fn inject_collections() -> Vec<String> {
+    match std::env::var("KMD_INJECT_COLLECTIONS") {
+        Ok(v) if !v.trim().is_empty() => v
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect(),
+        _ => CLAUDE_COLLECTIONS.iter().map(|s| s.to_string()).collect(),
+    }
+}
 
 const STOP_WORDS: &[&str] = &[
     "a", "an", "the", "is", "it", "in", "on", "at", "to", "for", "of", "and", "or", "but", "not",
@@ -310,6 +334,8 @@ fn search_candidates(
     #[cfg(feature = "embed")] warm: Option<&crate::embed::Embedder>,
     #[cfg(not(feature = "embed"))] warm: Option<&()>,
 ) -> Result<Vec<SearchHit>> {
+    let scope = inject_collections();
+    let scope_refs: Vec<&str> = scope.iter().map(String::as_str).collect();
     #[cfg(feature = "embed")]
     if let Some(embedder) = warm {
         let store = crate::store::Store::open(&config::store_path())?;
@@ -319,7 +345,7 @@ fn search_candidates(
             cfg,
             query,
             limit,
-            Some(CLAUDE_COLLECTIONS),
+            Some(&scope_refs),
             Some(embedder),
         );
         // hybrid가 실패하면(임베딩 테이블 없음 등) BM25로 내려간다. 훅은
@@ -330,13 +356,7 @@ fn search_candidates(
     }
     #[cfg(not(feature = "embed"))]
     let _ = warm;
-    bm25::search_in(
-        &config::tantivy_dir(),
-        cfg,
-        query,
-        limit,
-        Some(CLAUDE_COLLECTIONS),
-    )
+    bm25::search_in(&config::tantivy_dir(), cfg, query, limit, Some(&scope_refs))
 }
 
 pub fn filter_hits(hits: Vec<SearchHit>) -> Vec<SearchHit> {
@@ -344,12 +364,13 @@ pub fn filter_hits(hits: Vec<SearchHit>) -> Vec<SearchHit> {
     // 줄인다. pageindex::load_sessions가 파일을 읽어야 하므로 매 호출마다 약간의
     // I/O 비용이 있지만, 훅 1회당 한 번이고 181세션 메타 파싱은 ~10ms 수준이다.
     let id_axes = crate::pageindex::load_session_axes().unwrap_or_default();
+    let allowed = inject_collections();
     let mut seen = std::collections::HashSet::new();
     let mut kept: Vec<SearchHit> = hits
         .into_iter()
         .filter(|h| {
             let coll = collection_of(&h.file);
-            if !CLAUDE_COLLECTIONS.contains(&coll) {
+            if !allowed.iter().any(|c| c == coll) {
                 return false;
             }
             if coll == "learnings" && is_l0_covered(&h.file, &id_axes) {
