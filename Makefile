@@ -21,13 +21,17 @@ build-embed:
 	$(CARGO) build --release $(FEATURES)
 
 # Copy the binary into $(PREFIX)/bin. Real file copy, not a symlink.
+# 벡터 검색을 포함해 설치한다. RAG 훅이 hybrid를 쓰려면 데몬 바이너리에
+# embed 피처가 있어야 하고, 없으면 BM25로 조용히 내려가 개선이 사라진다.
 .PHONY: install
-install: build
+install: build-embed
 	@mkdir -p $(PREFIX)/bin
 	@rm -f $(INSTALL_BIN)
 	@cp $(BIN) $(INSTALL_BIN)
 	@chmod +x $(INSTALL_BIN)
 	@echo "installed -> $(INSTALL_BIN)"
+	@echo "restart the daemon so it picks up the new binary:"
+	@echo "  launchctl kickstart -k gui/$$(id -u)/ai.kmd.daemon"
 
 # ── L1: 검색 품질 (retrieval quality) ────────────────────────────────
 
