@@ -90,6 +90,14 @@ pub enum Engine {
     Vector,
     /// BM25 + 벡터 RRF 융합
     Hybrid,
+    /// RAG 훅이 실제로 주입하는 것 — 검색 + `rag::filter_hits`.
+    ///
+    /// 다른 세 엔진은 **원시 검색 결과**를 잰다. 훅은 그 위에 컬렉션 가중
+    /// 재정렬, L0 커버 제외, 3건 절단을 얹는데 그것들이 `filter_hits`에 있어서
+    /// 원시 측정으로는 보이지 않는다. 실측: `KMD_CURATED_WEIGHT`를 1.0에서
+    /// 5.0까지 바꿔도 gold 점수가 한 자리도 안 움직였다 — 그 가중을 쓰는
+    /// 코드를 eval이 아예 지나가지 않았기 때문이다.
+    Pipeline,
 }
 
 impl Engine {
@@ -98,6 +106,7 @@ impl Engine {
             Engine::Bm25 => "bm25",
             Engine::Vector => "vector",
             Engine::Hybrid => "hybrid",
+            Engine::Pipeline => "pipeline",
         }
     }
 
@@ -110,7 +119,8 @@ impl Engine {
     /// `--compare`는 R@5 52%, `--engine hybrid`는 44%가 나왔다 — 엔진이 아니라
     /// 모집단이 달랐던 것이다.
     fn reads_embeddings(self) -> bool {
-        matches!(self, Engine::Vector | Engine::Hybrid)
+        // pipeline은 embed 피처가 있으면 hybrid로 검색하므로 벡터를 읽는다.
+        matches!(self, Engine::Vector | Engine::Hybrid | Engine::Pipeline)
     }
 }
 
@@ -129,10 +139,24 @@ fn run_engine(
     cfg: &config::IndexConfig,
     store: &crate::store::Store,
     query: &str,
+    prompt: &str,
     k: usize,
     collections: Option<&[&str]>,
 ) -> Result<Vec<crate::bm25::SearchHit>> {
     match engine {
+        // 훅과 같은 경로. **원본 프롬프트**를 넘긴다 — 다른 엔진은 호출부가
+        // 미리 키워드를 뽑아 `query`로 주지만, `run_pipeline`은 게이트와 키워드
+        // 추출을 스스로 한다. 추출된 쿼리를 넘기면 그것이 다시 게이트에 들어가
+        // `too_short`로 대부분 걸린다(실측: gold 55케이스 중 통과가 16%뿐이었고,
+        // 그래서 어떤 가중을 줘도 점수가 한 자리도 움직이지 않았다).
+        //
+        // `filter_hits`가 컬렉션 범위와 결과 수(3건)를 스스로 정하므로 k와
+        // collections도 쓰지 않는다. 훅이 실제 하는 일을 재는 것이 이 엔진의
+        // 목적이고, 파라미터를 끼워넣으면 그게 아니게 된다.
+        Engine::Pipeline => {
+            let outcome = crate::rag::run_pipeline(prompt)?;
+            Ok(outcome.hits)
+        }
         Engine::Bm25 => crate::bm25::search_in(&config::tantivy_dir(), cfg, query, k, collections),
         #[cfg(feature = "embed")]
         Engine::Vector => crate::embed::vsearch_in(store, query, k, collections),
@@ -159,6 +183,9 @@ fn run_engine(
 /// `--engine` / `--compare` 조합을 실제로 돌릴 엔진 목록으로 바꾼다.
 fn engines_for(engine: Option<Engine>, compare: bool) -> Vec<Engine> {
     if compare {
+        // pipeline은 `--compare`에 넣지 않는다. 나머지 셋은 같은 조건에서 겨루는
+        // 검색 엔진이지만 pipeline은 그 위의 필터·절단까지 포함한 다른 층위여서,
+        // 한 표에 놓으면 엔진 비교로 오독된다. `--engine pipeline`으로 따로 잰다.
         vec![Engine::Bm25, Engine::Vector, Engine::Hybrid]
     } else {
         vec![engine.unwrap_or(Engine::Bm25)]
@@ -411,7 +438,10 @@ pub fn known_item(
         };
         for s in &samples {
             let t = Instant::now();
-            let hits = run_engine(*eng, &cfg, &store, &s.query, k, scope_ref)?;
+            // known-item 샘플은 문서 본문에서 만든 쿼리뿐이고 원본 프롬프트가
+            // 없다. pipeline 엔진에는 그 쿼리를 프롬프트로 준다 — 게이트를
+            // 통과하지 못하면 히트가 비고, 그건 이 모드에서 정직한 결과다.
+            let hits = run_engine(*eng, &cfg, &store, &s.query, &s.query, k, scope_ref)?;
             let lat = t.elapsed().as_millis();
             let files: Vec<String> = hits.iter().map(|h| h.file.clone()).collect();
             let rank = rank_kmd(&s.file, &files);
@@ -524,7 +554,7 @@ pub fn gold(
             let hangul = rag::has_hangul(&c.prompt);
 
             let t = Instant::now();
-            let hits = run_engine(*eng, &cfg, &store, &query, k, scope_ref)?;
+            let hits = run_engine(*eng, &cfg, &store, &query, &c.prompt, k, scope_ref)?;
             let lat = t.elapsed().as_millis();
             let rank =
                 gold_rank(&c.expect_any, hits.iter().map(|h| (h.file.as_str(), h.title.as_str())));

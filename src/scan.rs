@@ -24,6 +24,19 @@ pub struct ScanStats {
     pub skipped: usize,
 }
 
+/// 설정과 무관하게 항상 제외하는 경로.
+///
+/// 평가 세트는 질문과 정답 앵커를 나란히 담고 있어서, 인덱싱되면 자기 질문을
+/// 자기가 최고 점수로 찾는다 — 실측: gold 프롬프트 20건 중 18건에서 평가
+/// 파일이 top-5에 들었고, 한 케이스는 144점으로 실제 정답 후보(57점)를
+/// 압도했다. 그 상태로 잰 검색 품질 수치는 무엇을 재는지 정해지지 않는다.
+///
+/// 사용자 설정에 맡기지 않는 이유: 이건 kmd 자신의 성질이다. kmd 저장소를
+/// (또는 kmd를 포크한 무엇이든) `source: git-repos`로 인덱싱하는 사람이면
+/// 누구나 같은 오염을 겪고, 그 사실을 알아야 exclude를 쓸 수 있다.
+const ALWAYS_EXCLUDE: &[&str] = &["**/eval/gold.yaml", "**/eval/prompts.txt"];
+
+
 pub fn update(cfg: &IndexConfig, store: &mut Store, force: bool) -> Result<ScanStats> {
     let mut stats = ScanStats::default();
 
@@ -41,6 +54,9 @@ pub fn update(cfg: &IndexConfig, store: &mut Store, force: bool) -> Result<ScanS
         for pat in &coll.exclude {
             ex.add(Glob::new(pat)?);
         }
+        for pat in ALWAYS_EXCLUDE {
+            ex.add(Glob::new(pat)?);
+        }
         let exclude = ex.build()?;
 
         let context = coll.root_context().map(str::to_string);
@@ -53,7 +69,7 @@ pub fn update(cfg: &IndexConfig, store: &mut Store, force: bool) -> Result<ScanS
 
         for rel in files {
             // exclude는 glob 패턴과 달리 상대경로 전체에 매칭
-            if !coll.exclude.is_empty() && exclude.is_match(&rel) {
+            if exclude.is_match(&rel) {
                 continue;
             }
             let abs = coll.path.join(&rel);
@@ -394,6 +410,54 @@ mod tests {
     }
 
     #[test]
+    /// 평가 세트는 설정과 무관하게 인덱싱되지 않는다.
+    ///
+    /// 이 파일이 인덱스에 들어가면 검색 품질 측정이 자기 자신을 찾는다.
+    /// 회귀하면 수치가 조용히 부풀고, 그게 오염인지 개선인지 구분되지 않는다.
+    #[test]
+    fn eval_sets_are_never_indexed() {
+        let tmp = TmpDir::new("always-exclude");
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("eval")).unwrap();
+        std::fs::write(root.join("eval/gold.yaml"), "- prompt: \"x\"\n").unwrap();
+        std::fs::write(root.join("eval/prompts.txt"), "x\n").unwrap();
+        std::fs::write(root.join("keep.md"), "kept\n").unwrap();
+
+        // exclude를 하나도 설정하지 않은 컬렉션에서도 빠져야 한다.
+        let cfg: IndexConfig = serde_yaml::from_str(&format!(
+            "collections:\n  c:\n    path: {}\n    pattern: \"**/*.{{md,yaml,txt}}\"\n",
+            root.display()
+        ))
+        .unwrap();
+        let store_dir = TmpDir::new("always-exclude-store");
+        let mut store = Store::open(&store_dir.path().join("s.sqlite")).unwrap();
+        update(&cfg, &mut store, false).unwrap();
+
+        let paths: Vec<String> = store
+            .conn
+            .prepare("SELECT relpath FROM documents WHERE active = 1")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        assert!(
+            paths.iter().any(|p| p.contains("keep.md")),
+            "an ordinary file is still indexed: {:?}",
+            paths
+        );
+        assert!(
+            !paths.iter().any(|p| p.contains("gold.yaml")),
+            "gold.yaml must never be indexed: {:?}",
+            paths
+        );
+        assert!(
+            !paths.iter().any(|p| p.contains("prompts.txt")),
+            "prompts.txt must never be indexed: {:?}",
+            paths
+        );
+    }
+
     fn exclude_patterns_drop_matching_paths() {
         let tmp = TmpDir::new("exclude");
         let root = tmp.path();

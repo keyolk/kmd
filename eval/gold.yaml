@@ -247,3 +247,38 @@
 - prompt: "cutting down a query that keeps timing out"
   expect_any:
     - "o11y"
+
+# ── learnings 앵커 (2026-09-04) ─────────────────────────────
+#
+# 위의 모든 케이스는 정제 지식(claude-memory/rules/skills)을 정답으로 삼는다.
+# 그래서 정제 지식 가중(`KMD_CURATED_WEIGHT`)을 이 파일로 스윕하면 순환이다 —
+# 가중을 올리면 무조건 점수가 오른다. 아래는 **과거 세션 기록이 정답**인
+# 케이스로, 가중을 과하게 올리면 여기가 먼저 깨진다. 두 구간이 함께 있어야
+# 가중 스윕에 상한이 생긴다.
+#
+# 앵커는 파일명 날짜 접두어다. 세션 id는 세션마다 다르지만 날짜는 안정적이고,
+# 같은 사건을 다룬 세션이 여러 개면 어느 쪽이 와도 맞다.
+
+- prompt: "vmselect가 메모리 부족으로 죽었던 사건이 언제였지"
+  expect_any:
+    - "learnings/202609"
+
+- prompt: "KEDA 트리거 때문에 스케일이 잘못 잡혔던 문제"
+  expect_any:
+    - "learnings/202609"
+
+- prompt: "NLB이 안 지워져서 서비스가 고착된 건"
+  expect_any:
+    - "learnings/202609"
+
+- prompt: "ClickHouse 알림이 오탐이었고 실제 원인이 달랐던 조사"
+  expect_any:
+    - "learnings/202609"
+
+- prompt: "the incident where vmselect ran out of memory"
+  expect_any:
+    - "learnings/202609"
+
+- prompt: "a service wedged because its load balancer would not delete"
+  expect_any:
+    - "learnings/202609"
