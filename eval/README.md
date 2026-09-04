@@ -58,6 +58,33 @@ make eval-gold
 
 ---
 
+## 엔진 대조 — BM25 vs 벡터 vs hybrid (`--compare`)
+
+`kmd eval`은 기본적으로 BM25만 잰다. `--compare`는 같은 쿼리를 세 엔진에
+돌려 나란히 출력한다. `--engine {bm25|vector|hybrid}`로 하나만 고를 수도 있다.
+
+```sh
+make eval-compare        # known-item 200 쿼리
+make eval-compare-gold   # gold set
+```
+
+벡터/hybrid는 `embed` 피처가 필요하다(`make build-embed`). 임베딩은
+`kmd embed`로 미리 채워야 하고, `--collection`으로 대상을 좁힐 수 있다 —
+필터가 없으면 id가 가장 작은 `exp`(대상의 95%)가 먼저 처리되어 훅이 실제로
+읽는 컬렉션이 맨 뒤로 밀린다.
+
+### 대조에서 검색 범위를 좁히는 이유
+
+단독 평가는 전 인덱스를 대상으로 한다(retrievability ceiling). `--compare`는
+그러지 않고 **본문을 store에 저장하는 컬렉션**으로 범위를 좁힌다.
+
+`project` 축(git 저장소 36만 건)은 `store_body: false`라서 임베딩 대상이 아니다.
+범위를 그대로 두면 BM25만 그 36만 건과 경쟁하고 벡터는 경쟁 문서가 없는
+모집단에서 검색한다. 그건 벡터가 더 잘 찾은 게 아니라 상대가 없었던 것이므로,
+그 조건에서 나온 우열은 근거로 쓸 수 없다.
+
+---
+
 ## L2 — 주입 채택률 (`kmd util`)
 
 `rag.jsonl`(주입 기록)과 Claude Code transcript(실제 답변)를 세션+프롬프트로 조인해,

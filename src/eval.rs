@@ -79,6 +79,145 @@ pub struct EngineReport {
     pub english: Metrics,
 }
 
+// ------------------------------------------------------------ 검색 엔진 ----
+
+/// 평가할 검색 엔진. `--engine`으로 고르거나 `--compare`로 전부 돌린다.
+#[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum Engine {
+    /// lindera ko-dic BM25 (embed 피처 없이도 동작)
+    Bm25,
+    /// embeddinggemma 코사인 유사도
+    Vector,
+    /// BM25 + 벡터 RRF 융합
+    Hybrid,
+}
+
+impl Engine {
+    fn label(self) -> &'static str {
+        match self {
+            Engine::Bm25 => "bm25",
+            Engine::Vector => "vector",
+            Engine::Hybrid => "hybrid",
+        }
+    }
+}
+
+/// 한 쿼리를 한 엔진으로 검색한다.
+///
+/// 세 엔진이 같은 컬렉션 집합을 보게 하는 것이 이 함수의 존재 이유다. BM25는
+/// tantivy 쿼리에서, 벡터는 SQL WHERE에서 각각 필터하므로 호출부가 같은
+/// `collections`를 넘겨야 모집단이 일치한다.
+fn run_engine(
+    engine: Engine,
+    cfg: &config::IndexConfig,
+    store: &crate::store::Store,
+    query: &str,
+    k: usize,
+    collections: Option<&[&str]>,
+) -> Result<Vec<crate::bm25::SearchHit>> {
+    match engine {
+        Engine::Bm25 => crate::bm25::search_in(&config::tantivy_dir(), cfg, query, k, collections),
+        #[cfg(feature = "embed")]
+        Engine::Vector => crate::embed::vsearch_in(store, query, k, collections),
+        #[cfg(feature = "embed")]
+        Engine::Hybrid => crate::embed::hybrid_in(
+            store,
+            &config::tantivy_dir(),
+            cfg,
+            query,
+            k,
+            collections,
+        ),
+        #[cfg(not(feature = "embed"))]
+        Engine::Vector | Engine::Hybrid => {
+            let _ = store;
+            anyhow::bail!(
+                "engine {} needs the 'embed' feature — rebuild with: cargo build --release --features embed",
+                engine.label()
+            )
+        }
+    }
+}
+
+/// `--engine` / `--compare` 조합을 실제로 돌릴 엔진 목록으로 바꾼다.
+fn engines_for(engine: Option<Engine>, compare: bool) -> Vec<Engine> {
+    if compare {
+        vec![Engine::Bm25, Engine::Vector, Engine::Hybrid]
+    } else {
+        vec![engine.unwrap_or(Engine::Bm25)]
+    }
+}
+
+/// 임베딩이 존재할 수 있는 컬렉션 — 본문을 store에 복사하는 것들.
+///
+/// `embed_pending`이 `abspath IS NULL`로 거르는 것과 같은 집합을 설정 쪽에서
+/// 표현한다. 두 조건이 갈라지면 비교가 조용히 편향되므로 근거를 여기 남긴다.
+fn embedded_collections(cfg: &config::IndexConfig) -> Vec<String> {
+    cfg.collections
+        .iter()
+        .filter(|(_, c)| c.stores_body())
+        .map(|(name, _)| name.clone())
+        .collect()
+}
+
+/// 대조 범위의 임베딩 커버리지를 재고, 완전하지 않으면 경고한다.
+///
+/// 부분 커버리지는 **양방향으로** 결과를 왜곡하는데, 어느 쪽으로 왜곡되는지는
+/// 어느 문서가 빠졌는지에 달려 있어 수치만 보고는 구분되지 않는다.
+///
+/// - 정답 문서에 임베딩이 없으면 벡터는 그 쿼리를 절대 못 맞힌다 (과소평가).
+/// - 경쟁 문서에 임베딩이 없으면 벡터만 상대가 적은 모집단에서 검색한다 (과대평가).
+///
+/// 그래서 커버리지를 리포트에 같이 싣는다. 100%가 아닌 대조 결과는 엔진 우열의
+/// 근거로 쓸 수 없다 — 숫자는 나오지만 무엇을 재는지가 정해지지 않는다.
+fn embedding_coverage(
+    store: &crate::store::Store,
+    collections: &[&str],
+) -> Result<(i64, i64)> {
+    if collections.is_empty() {
+        return Ok((0, 0));
+    }
+    let placeholders = vec!["?"; collections.len()].join(",");
+    let sql = format!(
+        "SELECT COUNT(*),
+                SUM(CASE WHEN EXISTS (SELECT 1 FROM embeddings e WHERE e.doc_id = d.id)
+                         THEN 1 ELSE 0 END)
+         FROM documents d
+         WHERE d.active = 1 AND d.abspath IS NULL AND d.collection IN ({})",
+        placeholders
+    );
+    let params: Vec<&dyn rusqlite::ToSql> = collections
+        .iter()
+        .map(|c| c as &dyn rusqlite::ToSql)
+        .collect();
+    let (total, embedded): (i64, Option<i64>) = store
+        .conn
+        .query_row(&sql, params.as_slice(), |r| Ok((r.get(0)?, r.get(1)?)))?;
+    Ok((total, embedded.unwrap_or(0)))
+}
+
+/// 커버리지가 완전하지 않을 때 stderr에 경고를 낸다. 반환값은 리포트에 실을 수치.
+fn warn_partial_coverage(
+    store: &crate::store::Store,
+    scope: Option<&[&str]>,
+) -> Result<Option<(i64, i64)>> {
+    let Some(cols) = scope else {
+        return Ok(None);
+    };
+    let (total, embedded) = embedding_coverage(store, cols)?;
+    if total > 0 && embedded < total {
+        eprintln!(
+            "warning: embedding coverage {}/{} ({:.0}%) over the compared scope — \
+             vector/hybrid numbers are not a fair comparison yet. \
+             Run `kmd embed` to completion first.",
+            embedded,
+            total,
+            100.0 * embedded as f64 / total as f64
+        );
+    }
+    Ok(Some((total, embedded)))
+}
+
 // ---------------------------------------------------------- 검색 어댑터 ----
 
 /// kmd BM25 검색 → expected 파일의 rank.
@@ -210,6 +349,8 @@ pub fn known_item(
     sample: usize,
     k: usize,
     hangul_only: bool,
+    engine: Option<Engine>,
+    compare: bool,
     json: bool,
 ) -> Result<()> {
     let cfg = config::load()?;
@@ -217,39 +358,62 @@ pub fn known_item(
     if samples.is_empty() {
         anyhow::bail!("no eval samples — check collections / index");
     }
+    let store = crate::store::Store::open(&config::store_path())?;
+    let engines = engines_for(engine, compare);
 
-    let mut kmd = EngineReport {
-        engine: "kmd".into(),
-        ..Default::default()
+    // 여러 엔진을 비교할 때는 검색 범위를 샘플 컬렉션으로 좁힌다.
+    //
+    // BM25 단독 평가는 전 인덱스를 대상으로 했다(retrievability ceiling). 그 범위를
+    // 그대로 두면 비교가 성립하지 않는다: 벡터 인덱스에는 project 축 36만 건이
+    // 아예 없어서, 벡터 엔진만 경쟁 문서가 적은 모집단에서 검색하게 된다. 그건
+    // 벡터가 더 잘 찾은 게 아니라 상대가 없었던 것이다.
+    let scope: Option<Vec<&str>> = if engines.len() > 1 {
+        Some(collections.iter().map(String::as_str).collect())
+    } else {
+        None
     };
-    for s in &samples {
-        // kmd
-        let t = Instant::now();
-        let hits = crate::bm25::search(&config::tantivy_dir(), &cfg, &s.query, k, None)?;
-        let lat = t.elapsed().as_millis();
-        let files: Vec<String> = hits.iter().map(|h| h.file.clone()).collect();
-        let rank = rank_kmd(&s.file, &files);
-        kmd.all.record(rank, lat);
-        if s.hangul {
-            kmd.korean.record(rank, lat);
-        } else {
-            kmd.english.record(rank, lat);
+    let scope_ref = scope.as_deref();
+    let coverage = warn_partial_coverage(&store, scope_ref)?;
+
+    let mut reports_owned: Vec<EngineReport> = Vec::new();
+    for eng in &engines {
+        let mut rep = EngineReport {
+            engine: eng.label().into(),
+            ..Default::default()
+        };
+        for s in &samples {
+            let t = Instant::now();
+            let hits = run_engine(*eng, &cfg, &store, &s.query, k, scope_ref)?;
+            let lat = t.elapsed().as_millis();
+            let files: Vec<String> = hits.iter().map(|h| h.file.clone()).collect();
+            let rank = rank_kmd(&s.file, &files);
+            rep.all.record(rank, lat);
+            if s.hangul {
+                rep.korean.record(rank, lat);
+            } else {
+                rep.english.record(rank, lat);
+            }
         }
+        reports_owned.push(rep);
     }
 
-    let reports: Vec<&EngineReport> = vec![&kmd];
+    let reports: Vec<&EngineReport> = reports_owned.iter().collect();
+    let head = &reports_owned[0];
     crate::evaluation_log::record(
         "eval-known-item",
         format!(
-            "{} queries · R@5 {:.0}% · MRR {:.3}",
-            kmd.all.queries,
-            Metrics::pct(kmd.all.recall_at_5, kmd.all.queries),
-            kmd.all.mrr()
+            "{} queries · {} R@5 {:.0}% · MRR {:.3}",
+            head.all.queries,
+            head.engine,
+            Metrics::pct(head.all.recall_at_5, head.all.queries),
+            head.all.mrr()
         ),
         serde_json::json!({
             "mode": "known-item",
             "collections": &collections,
             "k": k,
+            "scoped": scope.is_some(),
+            "embedding_coverage": coverage.map(|(t, e)| serde_json::json!({"total": t, "embedded": e})),
             "reports": &reports,
         }),
     );
@@ -287,7 +451,13 @@ struct GoldCase {
     expect_any: Vec<String>,
 }
 
-pub fn gold(path: &Path, k: usize, json: bool) -> Result<()> {
+pub fn gold(
+    path: &Path,
+    k: usize,
+    engine: Option<Engine>,
+    compare: bool,
+    json: bool,
+) -> Result<()> {
     let raw = std::fs::read_to_string(path)
         .with_context(|| format!("cannot read gold file {}", path.display()))?;
     let cases: Vec<GoldCase> =
@@ -296,44 +466,67 @@ pub fn gold(path: &Path, k: usize, json: bool) -> Result<()> {
         anyhow::bail!("gold file has no cases");
     }
     let cfg = config::load()?;
+    let store = crate::store::Store::open(&config::store_path())?;
+    let engines = engines_for(engine, compare);
 
-    let mut kmd = EngineReport {
-        engine: "kmd".into(),
-        ..Default::default()
+    // 비교 시에는 임베딩이 존재하는 컬렉션으로 범위를 좁힌다. gold 단독 모드가
+    // 전 인덱스를 보는 것은 의도(retrievability ceiling)지만, project 축은
+    // 임베딩 대상이 아니므로 비교에서는 BM25만 그 36만 건과 경쟁하게 된다.
+    let embedded = embedded_collections(&cfg);
+    let scope: Option<Vec<&str>> = if engines.len() > 1 {
+        Some(embedded.iter().map(String::as_str).collect())
+    } else {
+        None
     };
-    for c in &cases {
-        // 실제 훅과 동일하게 프롬프트에서 키워드 추출.
-        let query = match rag::gate(&c.prompt) {
-            Ok(q) => q,
-            Err(_) => c.prompt.clone(),
-        };
-        let hangul = rag::has_hangul(&c.prompt);
+    let scope_ref = scope.as_deref();
+    let coverage = warn_partial_coverage(&store, scope_ref)?;
 
-        let t = Instant::now();
-        let hits = crate::bm25::search(&config::tantivy_dir(), &cfg, &query, k, None)?;
-        let lat = t.elapsed().as_millis();
-        let rank = gold_rank(&c.expect_any, hits.iter().map(|h| (h.file.as_str(), h.title.as_str())));
-        kmd.all.record(rank, lat);
-        if hangul {
-            kmd.korean.record(rank, lat);
-        } else {
-            kmd.english.record(rank, lat);
+    let mut reports_owned: Vec<EngineReport> = Vec::new();
+    for eng in &engines {
+        let mut rep = EngineReport {
+            engine: eng.label().into(),
+            ..Default::default()
+        };
+        for c in &cases {
+            // 실제 훅과 동일하게 프롬프트에서 키워드 추출.
+            let query = match rag::gate(&c.prompt) {
+                Ok(q) => q,
+                Err(_) => c.prompt.clone(),
+            };
+            let hangul = rag::has_hangul(&c.prompt);
+
+            let t = Instant::now();
+            let hits = run_engine(*eng, &cfg, &store, &query, k, scope_ref)?;
+            let lat = t.elapsed().as_millis();
+            let rank =
+                gold_rank(&c.expect_any, hits.iter().map(|h| (h.file.as_str(), h.title.as_str())));
+            rep.all.record(rank, lat);
+            if hangul {
+                rep.korean.record(rank, lat);
+            } else {
+                rep.english.record(rank, lat);
+            }
         }
+        reports_owned.push(rep);
     }
 
-    let reports: Vec<&EngineReport> = vec![&kmd];
+    let reports: Vec<&EngineReport> = reports_owned.iter().collect();
+    let head = &reports_owned[0];
     crate::evaluation_log::record(
         "eval-gold",
         format!(
-            "{} cases · R@5 {:.0}% · MRR {:.3}",
-            kmd.all.queries,
-            Metrics::pct(kmd.all.recall_at_5, kmd.all.queries),
-            kmd.all.mrr()
+            "{} cases · {} R@5 {:.0}% · MRR {:.3}",
+            head.all.queries,
+            head.engine,
+            Metrics::pct(head.all.recall_at_5, head.all.queries),
+            head.all.mrr()
         ),
         serde_json::json!({
             "mode": "gold",
             "path": path,
             "k": k,
+            "scoped": scope.is_some(),
+            "embedding_coverage": coverage.map(|(t, e)| serde_json::json!({"total": t, "embedded": e})),
             "reports": &reports,
         }),
     );

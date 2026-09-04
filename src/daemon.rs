@@ -167,7 +167,8 @@ fn handle_conn(
                         // 신규/변경 문서 임베딩 — 한 사이클에 200개 캡 (백그라운드 시간 바운드)
                         #[cfg(feature = "embed")]
                         {
-                            if let Err(e) = crate::embed::embed_pending(&mut store, Some(200)) {
+                            if let Err(e) = crate::embed::embed_pending(&mut store, Some(200), &[])
+                            {
                                 eprintln!("daemon embed failed (non-fatal): {}", e);
                             }
                         }

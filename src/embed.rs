@@ -167,7 +167,15 @@ fn blob_to_vec(b: &[u8]) -> Vec<f32> {
 }
 
 /// 활성 문서 중 임베딩이 없거나 오래된 것을 임베딩. 처리한 문서 수 반환.
-pub fn embed_pending(store: &mut Store, limit: Option<usize>) -> Result<usize> {
+///
+/// `collections`가 비어 있지 않으면 그 컬렉션만 임베딩한다. 대상은 id 순으로
+/// 처리되는데 `exp`가 대상의 95%를 차지하면서 id도 가장 작아, 필터 없이는
+/// 훅이 실제로 읽는 컬렉션(learnings/claude-*)이 맨 뒤로 밀린다.
+pub fn embed_pending(
+    store: &mut Store,
+    limit: Option<usize>,
+    collections: &[String],
+) -> Result<usize> {
     ensure_schema(store)?;
 
     // 임베딩 없는 활성 문서 목록.
@@ -175,15 +183,22 @@ pub fn embed_pending(store: &mut Store, limit: Option<usize>) -> Result<usize> {
     // 본문 미저장 문서(abspath IS NOT NULL — project 축)는 제외한다. 코드 38만 건
     // 임베딩은 비용이 비현실적이고, 코드 검색은 식별자 정확 매칭이 지배적이라
     // BM25로 충분하다. 벡터 검색은 knowledge/session 축에만 적용된다.
-    let mut stmt = store.conn.prepare(
+    let mut sql = String::from(
         "SELECT d.id, d.title, d.body FROM documents d
          WHERE d.active = 1
            AND d.abspath IS NULL
-           AND NOT EXISTS (SELECT 1 FROM embeddings e WHERE e.doc_id = d.id)
-         ORDER BY d.id",
-    )?;
+           AND NOT EXISTS (SELECT 1 FROM embeddings e WHERE e.doc_id = d.id)",
+    );
+    if !collections.is_empty() {
+        let placeholders = vec!["?"; collections.len()].join(",");
+        sql.push_str(&format!(" AND d.collection IN ({})", placeholders));
+    }
+    sql.push_str(" ORDER BY d.id");
+    let mut stmt = store.conn.prepare(&sql)?;
+    let params: Vec<&dyn rusqlite::ToSql> =
+        collections.iter().map(|c| c as &dyn rusqlite::ToSql).collect();
     let docs: Vec<(i64, String, String)> = stmt
-        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+        .query_map(params.as_slice(), |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
         .collect::<std::result::Result<_, _>>()?;
     drop(stmt);
 
@@ -240,17 +255,40 @@ pub fn purge_stale(store: &Store, dirty_ids: &[i64]) -> Result<()> {
 
 /// 벡터 검색 — 쿼리 임베딩 후 브루트포스 코사인 top-k.
 pub fn vsearch(store: &Store, query: &str, limit: usize) -> Result<Vec<SearchHit>> {
+    vsearch_in(store, query, limit, None)
+}
+
+/// 컬렉션 집합으로 좁힌 벡터 검색. `collections`가 None이면 전 인덱스.
+///
+/// BM25 쪽 `search_in`과 짝을 이룬다. 훅과 eval은 특정 컬렉션만 보는데, 필터가
+/// 없으면 두 엔진이 서로 다른 모집단을 검색해 비교가 성립하지 않는다.
+pub fn vsearch_in(
+    store: &Store,
+    query: &str,
+    limit: usize,
+    collections: Option<&[&str]>,
+) -> Result<Vec<SearchHit>> {
     ensure_schema(store)?;
     let embedder = Embedder::load()?;
     let qv = embedder.embed(&query_prompt(query))?;
 
-    let mut stmt = store.conn.prepare(
+    let mut sql = String::from(
         "SELECT e.doc_id, e.chunk_idx, e.chunk_text, e.vector,
                 d.collection, d.relpath, d.title, d.context
          FROM embeddings e JOIN documents d ON d.id = e.doc_id
          WHERE d.active = 1",
-    )?;
-    let rows = stmt.query_map([], |r| {
+    );
+    let filter: Vec<String> = collections
+        .map(|c| c.iter().map(|s| s.to_string()).collect())
+        .unwrap_or_default();
+    if !filter.is_empty() {
+        let placeholders = vec!["?"; filter.len()].join(",");
+        sql.push_str(&format!(" AND d.collection IN ({})", placeholders));
+    }
+    let mut stmt = store.conn.prepare(&sql)?;
+    let params: Vec<&dyn rusqlite::ToSql> =
+        filter.iter().map(|c| c as &dyn rusqlite::ToSql).collect();
+    let rows = stmt.query_map(params.as_slice(), |r| {
         Ok((
             r.get::<_, i64>(0)?,
             r.get::<_, i64>(1)?,
@@ -304,9 +342,22 @@ pub fn hybrid(
     query: &str,
     limit: usize,
 ) -> Result<Vec<SearchHit>> {
+    hybrid_in(store, tantivy_dir, cfg, query, limit, None)
+}
+
+/// 컬렉션 집합으로 좁힌 hybrid.
+pub fn hybrid_in(
+    store: &Store,
+    tantivy_dir: &std::path::Path,
+    cfg: &config::IndexConfig,
+    query: &str,
+    limit: usize,
+    collections: Option<&[&str]>,
+) -> Result<Vec<SearchHit>> {
     const K: f32 = 60.0;
-    let bm = crate::bm25::search(tantivy_dir, cfg, query, limit * 2, None).unwrap_or_default();
-    let vs = vsearch(store, query, limit * 2).unwrap_or_default();
+    let bm = crate::bm25::search_in(tantivy_dir, cfg, query, limit * 2, collections)
+        .unwrap_or_default();
+    let vs = vsearch_in(store, query, limit * 2, collections).unwrap_or_default();
 
     use std::collections::HashMap;
     let mut fused: HashMap<String, (f32, SearchHit)> = HashMap::new();
@@ -341,8 +392,11 @@ pub fn embedding_counts(store: &Store) -> Result<(i64, i64)> {
     let vectors: i64 = store
         .conn
         .query_row("SELECT COUNT(*) FROM embeddings", [], |r| r.get(0))?;
+    // `abspath IS NULL`은 embed_pending의 대상 조건과 같아야 한다. 없으면 임베딩
+    // 대상이 아닌 project 축 코드 36만 건이 "pending"으로 보고된다.
     let pending: i64 = store.conn.query_row(
         "SELECT COUNT(*) FROM documents d WHERE d.active = 1
+           AND d.abspath IS NULL
            AND NOT EXISTS (SELECT 1 FROM embeddings e WHERE e.doc_id = d.id)",
         [],
         |r| r.get(0),
