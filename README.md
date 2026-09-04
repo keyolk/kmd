@@ -23,6 +23,39 @@ qmd has since been removed from this environment; the comparison numbers above a
 kept as the historical record that motivated kmd, and are no longer reproducible
 locally.
 
+The `~82ms` above is a synthetic figure and was never what the hook cost in
+practice. Measured against the live daemon on prompts that pass the gate, the
+BM25 pipeline took **437ms** (median), of which 366ms was `filter_hits`
+re-parsing all 1,428 learning files — 167MB — on every single call. With that
+parse cached and search moved to hybrid, the same prompts cost **273ms**. See
+[Search engine](#search-engine).
+
+## Search engine
+
+The RAG hook searches with hybrid retrieval (BM25 + vector, fused by RRF) when
+the daemon has an embedding model resident, and falls back to BM25 when it does
+not. Both the quality and the latency case are measured:
+
+| | BM25 | hybrid |
+|---|---|---|
+| gold R@5 (49 paraphrase cases) | 33% | **43%** |
+| gold R@5, Korean (36 cases) | 22% | **33%** |
+| gold MRR | 0.251 | **0.328** |
+| hook latency, median | 437ms | **273ms** |
+
+The quality gap comes from what real prompts look like. `eval/gold.yaml`'s
+paraphrase section asks about each document in words the document does not use
+("노드가 안 뜨는데 어디를 봐야 하지" for `k8s.md`), and BM25 cannot reach a
+document it shares no vocabulary with — narrowing the search to that one
+collection does not help. `kmd eval --compare` prints all three engines; see
+[`eval/README.md`](eval/README.md).
+
+Hybrid being *faster* is not intuition, it is two fixes. The model stays
+resident in the daemon (220-420ms of load per call, gone), and `filter_hits`
+caches its learning-file parse. Vector search remains linear in chunk count —
+that is the brute-force scan and no amount of process reuse changes it — so the
+hook narrows to the collections it actually injects from (82k chunks of 296k).
+
 ## Usage
 
 ```sh
@@ -234,7 +267,7 @@ trip first, whereas `Bash(kmd:*)` is callable immediately.
 
 - [x] vector search (embeddinggemma GGUF via llama-cpp-2, `embed` feature)
 - [x] hybrid RRF (`kmd query`)
-- [x] warm daemon (unix socket) for sub-100ms hook latency
+- [x] warm daemon (unix socket) holding the Tantivy reader and embedding model
 
 ## Evaluation
 

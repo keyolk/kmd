@@ -224,6 +224,43 @@ fn is_l0_covered(
 }
 
 /// 검색 결과를 claude 컬렉션으로 필터 + 파일 단위 dedupe + 컬렉션 가중 재정렬.
+/// 후보 검색 — 임베더가 있으면 hybrid, 없으면 BM25.
+fn search_candidates(
+    cfg: &config::IndexConfig,
+    query: &str,
+    limit: usize,
+    #[cfg(feature = "embed")] warm: Option<&crate::embed::Embedder>,
+    #[cfg(not(feature = "embed"))] warm: Option<&()>,
+) -> Result<Vec<SearchHit>> {
+    #[cfg(feature = "embed")]
+    if let Some(embedder) = warm {
+        let store = crate::store::Store::open(&config::store_path())?;
+        let hybrid = crate::embed::hybrid_with(
+            &store,
+            &config::tantivy_dir(),
+            cfg,
+            query,
+            limit,
+            Some(CLAUDE_COLLECTIONS),
+            Some(embedder),
+        );
+        // hybrid가 실패하면(임베딩 테이블 없음 등) BM25로 내려간다. 훅은
+        // 검색 품질보다 응답 자체가 먼저다.
+        if let Ok(hits) = hybrid {
+            return Ok(hits);
+        }
+    }
+    #[cfg(not(feature = "embed"))]
+    let _ = warm;
+    bm25::search_in(
+        &config::tantivy_dir(),
+        cfg,
+        query,
+        limit,
+        Some(CLAUDE_COLLECTIONS),
+    )
+}
+
 pub fn filter_hits(hits: Vec<SearchHit>) -> Vec<SearchHit> {
     // L0 page index가 커버하는 learnings hit은 주입에서 제외 — 중복 주입 비용을
     // 줄인다. pageindex::load_sessions가 파일을 읽어야 하므로 매 호출마다 약간의
@@ -331,6 +368,29 @@ pub struct RagOutcome {
 
 /// 프롬프트 하나에 대해 전체 파이프라인 실행 (로깅 없이).
 pub fn run_pipeline(prompt: &str) -> Result<RagOutcome> {
+    run_pipeline_with(prompt, None)
+}
+
+/// 상주 임베더를 받는 파이프라인. 데몬이 넘긴다.
+///
+/// 임베더가 있으면 hybrid(BM25 + 벡터 RRF)로, 없으면 BM25로 검색한다. 훅은
+/// 매 프롬프트에 도는 경로이므로 hybrid로 바꾸는 근거를 남긴다:
+///
+/// - 품질: gold 49케이스(문서 어휘를 쓰지 않는 패러프레이즈 질의)에서 hybrid가
+///   BM25를 크게 앞선다 — 전체 R@5 43% 대 33%, 한국어 33% 대 22%, MRR 0.328 대
+///   0.251. 훅의 실제 프롬프트가 이 모양이다.
+/// - 지연: 상주 임베더 + session 축으로 좁힌 hybrid가 276ms인데, 지금 BM25
+///   파이프라인이 425ms다(같은 프롬프트, 살아 있는 데몬에 직접 측정). 벡터가
+///   느리다는 통념은 모델 로드(220~420ms)를 매번 내는 CLI 경로에서 온 것이고,
+///   데몬에서는 그 비용이 없다.
+///
+/// 임베더가 없으면(모델 미설치, embed 피처 없는 빌드) BM25로 조용히 내려간다 —
+/// 훅은 절대 실패하면 안 되는 경로다.
+pub fn run_pipeline_with(
+    prompt: &str,
+    #[cfg(feature = "embed")] warm: Option<&crate::embed::Embedder>,
+    #[cfg(not(feature = "embed"))] warm: Option<&()>,
+) -> Result<RagOutcome> {
     let started = Instant::now();
     let query = match gate(prompt) {
         Ok(q) => q,
@@ -344,12 +404,31 @@ pub fn run_pipeline(prompt: &str) -> Result<RagOutcome> {
             });
         }
     };
+    let timing = std::env::var("KMD_RAG_TIMING").is_ok();
+    let t_gate = started.elapsed();
     let cfg = config::load()?;
     // 컬렉션 가중 재정렬이 실효를 내려면 후보를 넉넉히 가져와야 한다.
-    // (정제 지식이 원 BM25 top-3 밖이어도 부스트로 올라올 여지 확보)
-    let raw = bm25::search(&config::tantivy_dir(), &cfg, &query, 30, None)?;
+    // (정제 지식이 원 top-3 밖이어도 부스트로 올라올 여지 확보)
+    //
+    // 검색 범위를 CLAUDE_COLLECTIONS로 좁힌다. filter_hits가 어차피 그 밖을
+    // 버리므로 결과는 같지만, 벡터 경로에서는 스캔량이 곧 지연이다 — 전
+    // 임베딩(295k 청크) 대 이 범위(82k)에서 hybrid가 718ms 대 276ms였다.
+    let t_cfg = started.elapsed();
+    let raw = search_candidates(&cfg, &query, 30, warm)?;
+    let t_search = started.elapsed();
     let hits = filter_hits(raw);
+    let t_filter = started.elapsed();
     let context = format_context(&hits);
+    if timing {
+        eprintln!(
+            "rag timing: gate {:?}, cfg {:?}, search {:?}, filter {:?}, format {:?}",
+            t_gate,
+            t_cfg - t_gate,
+            t_search - t_cfg,
+            t_filter - t_search,
+            started.elapsed() - t_filter
+        );
+    }
     Ok(RagOutcome {
         gate_reason: None,
         query: Some(query),

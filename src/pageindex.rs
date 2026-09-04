@@ -326,20 +326,67 @@ fn parse_one(path: &PathBuf) -> Option<SessionEntry> {
     })
 }
 
-fn load_learning_files() -> Result<Vec<SessionEntry>> {
-    let dir = learnings_dir();
-    let Ok(entries) = fs::read_dir(&dir) else {
-        return Ok(Vec::new());
+/// 파싱한 learning 엔트리를 프로세스 안에 캐시한다.
+///
+/// `parse_one`은 파일 전문을 읽는다(`**User**:` 줄 전부와 `bytes`가 필요하다).
+/// 이 코퍼스는 1,428파일 167MB이고, `rag::filter_hits`가 매 훅 호출마다 전부
+/// 파싱했다 — 실측 366ms로, 그 시점 검색 자체(231ms)보다 비쌌다. 코드 주석은
+/// 이 비용을 "~10ms"로 적고 있었다.
+///
+/// 데몬은 프로세스가 오래 살아 있으므로 캐시가 맞다. 무효화는 디렉터리
+/// 엔트리의 (경로, mtime, 크기) 목록으로 한다 — 파일이 추가·수정·삭제되면
+/// 그 목록이 달라지므로 다시 파싱한다. CLI 경로는 프로세스가 한 번 돌고
+/// 끝나므로 캐시가 있으나 없으나 같다.
+type LearningCache = (Vec<(PathBuf, u64, u64)>, Vec<SessionEntry>);
+static LEARNING_CACHE: std::sync::Mutex<Option<LearningCache>> = std::sync::Mutex::new(None);
+
+/// 캐시 유효성을 판정하는 디렉터리 지문. 파싱 없이 stat만 한다.
+fn learning_fingerprint(dir: &std::path::Path) -> Vec<(PathBuf, u64, u64)> {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return Vec::new();
     };
-    Ok(entries
+    let mut out: Vec<(PathBuf, u64, u64)> = entries
         .flatten()
         .filter_map(|entry| {
             let path = entry.path();
-            (path.extension().and_then(|value| value.to_str()) == Some("md"))
-                .then(|| parse_one(&path))
-                .flatten()
+            if path.extension().and_then(|v| v.to_str()) != Some("md") {
+                return None;
+            }
+            let meta = entry.metadata().ok()?;
+            let mtime = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            Some((path, mtime, meta.len()))
         })
-        .collect())
+        .collect();
+    // read_dir 순서는 보장되지 않으므로 정렬해야 지문이 안정된다.
+    out.sort();
+    out
+}
+
+fn load_learning_files() -> Result<Vec<SessionEntry>> {
+    let dir = learnings_dir();
+    let fingerprint = learning_fingerprint(&dir);
+
+    if let Ok(cache) = LEARNING_CACHE.lock()
+        && let Some((cached_fp, entries)) = cache.as_ref()
+        && *cached_fp == fingerprint
+    {
+        return Ok(entries.clone());
+    }
+
+    let parsed: Vec<SessionEntry> = fingerprint
+        .iter()
+        .filter_map(|(path, _, _)| parse_one(path))
+        .collect();
+
+    if let Ok(mut cache) = LEARNING_CACHE.lock() {
+        *cache = Some((fingerprint, parsed.clone()));
+    }
+    Ok(parsed)
 }
 
 /// 모든 learning 파일을 날짜별 이력을 보존해 읽는다. 같은 세션·같은 날짜의
@@ -698,6 +745,53 @@ pub fn run_hook() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 캐시 무효화의 근거인 디렉터리 지문이 실제 변화를 잡아내는지.
+    ///
+    /// 지문이 변화를 놓치면 캐시가 조용히 낡는다 — 새 learning이 인덱싱돼도
+    /// `filter_hits`가 옛 축 목록으로 판정하므로, 새 세션 hit이 L0 커버로
+    /// 오판되거나 반대로 중복 주입된다. 어느 쪽도 에러를 내지 않는다.
+    ///
+    /// 전역 캐시 자체는 프로세스 단위라 테스트 간 오염이 생기므로, 판정
+    /// 근거인 지문 함수를 직접 검증한다.
+    #[test]
+    fn the_fingerprint_changes_when_files_do() {
+        let dir = std::env::temp_dir().join(format!("kmd-fp-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let empty = learning_fingerprint(&dir);
+        assert!(empty.is_empty(), "an empty directory has an empty fingerprint");
+
+        let a = dir.join("20260101-aaaaaaaa.md");
+        fs::write(&a, "Date: 20260101 0000
+").unwrap();
+        let one = learning_fingerprint(&dir);
+        assert_eq!(one.len(), 1, "a new file appears");
+        assert_ne!(one, empty);
+
+        // 내용이 커지면 크기가 달라진다 — mtime 해상도가 1초라 크기가 더 확실하다.
+        fs::write(&a, "Date: 20260101 0000
+**User**: something longer
+").unwrap();
+        let grown = learning_fingerprint(&dir);
+        assert_ne!(grown, one, "an edited file changes the fingerprint");
+
+        // .md 아닌 파일은 무시한다 — 그 디렉터리에 다른 것이 생겨도 재파싱하지 않는다.
+        fs::write(dir.join("notes.txt"), "x").unwrap();
+        assert_eq!(
+            learning_fingerprint(&dir),
+            grown,
+            "a non-markdown file does not invalidate the cache"
+        );
+
+        fs::remove_file(&a).unwrap();
+        assert!(
+            learning_fingerprint(&dir).is_empty(),
+            "a deleted file leaves the fingerprint"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn hook_payload_declares_session_start_event() {

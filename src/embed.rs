@@ -316,13 +316,35 @@ pub fn vsearch_in(
     limit: usize,
     collections: Option<&[&str]>,
 ) -> Result<Vec<SearchHit>> {
+    vsearch_with(store, query, limit, collections, None)
+}
+
+/// 이미 로드된 임베더를 재사용하는 벡터 검색.
+///
+/// 데몬용이다. 모델 로드는 콜드에서 420ms, 웜에서 220ms 드는데 프로세스가
+/// 살아 있는 동안은 한 번만 내면 되는 비용이다. `None`이면 이 호출 안에서
+/// 로드한다(CLI 경로).
+pub fn vsearch_with(
+    store: &Store,
+    query: &str,
+    limit: usize,
+    collections: Option<&[&str]>,
+    warm: Option<&Embedder>,
+) -> Result<Vec<SearchHit>> {
     ensure_schema(store)?;
     // KMD_VSEARCH_TIMING=1이면 단계별 시간을 stderr에 낸다. 훅 지연을 줄이려면
     // 모델 로드와 브루트포스 스캔 중 어느 쪽이 지배적인지 알아야 하고, 둘은
     // 대응이 완전히 다르다(데몬 상주 대 인덱스 구조 변경).
     let timing = std::env::var("KMD_VSEARCH_TIMING").is_ok();
     let t0 = std::time::Instant::now();
-    let embedder = Embedder::load()?;
+    let owned;
+    let embedder = match warm {
+        Some(e) => e,
+        None => {
+            owned = Embedder::load()?;
+            &owned
+        }
+    };
     let qv = embedder.embed(&query_prompt(query))?;
     let t_model = t0.elapsed();
 
@@ -453,25 +475,44 @@ pub fn hybrid_in(
     limit: usize,
     collections: Option<&[&str]>,
 ) -> Result<Vec<SearchHit>> {
+    hybrid_with(store, tantivy_dir, cfg, query, limit, collections, None)
+}
+
+/// 이미 로드된 임베더를 재사용하는 hybrid. 데몬용 — `vsearch_with`와 같은 이유다.
+#[allow(clippy::too_many_arguments)]
+pub fn hybrid_with(
+    store: &Store,
+    tantivy_dir: &std::path::Path,
+    cfg: &config::IndexConfig,
+    query: &str,
+    limit: usize,
+    collections: Option<&[&str]>,
+    warm: Option<&Embedder>,
+) -> Result<Vec<SearchHit>> {
     const K: f32 = 60.0;
     // 후보를 최종 limit보다 훨씬 넓게 가져온다. RRF는 두 리스트를 대칭으로
     // 합산하므로, 후보창이 좁으면 양쪽에 흔하게 걸친 무관 문서가 한쪽에만
     // 있는 정답을 이긴다 — limit*2(=10)에서는 양쪽 10위 문서(2/(60+10)=0.029)가
     // 벡터 1위 정답(1/61=0.016)보다 높다. 창을 넓히면 정답의 순위가 상대적으로
     // 앞서므로 그 역전이 줄어든다.
-    // 스윕 가능하게 환경변수로 뺀다. 기본값은 측정으로 정한다 — 후보창을
-    // 넓히면 gold(패러프레이즈)가 좋아지고 known-item(어휘 완전 일치)이
-    // 나빠지는 트레이드오프가 있어서, 한쪽만 보고 정하면 다른 쪽이 회귀한다.
+    // 후보창은 최종 limit의 배수이되 상한을 둔다.
+    //
+    // 배수만 쓰면 큰 limit에서 폭발한다: RAG 훅은 컬렉션 가중 재정렬을 위해
+    // limit=30으로 부르는데, factor 8이면 후보 240건이 되고 그 각각에
+    // 스니펫 조회가 붙어 hybrid가 286ms(limit=5)에서 700ms(limit=30)로 뛴다.
+    // 넓은 창이 필요한 이유는 대칭 RRF의 역전을 줄이는 것이고, 그건 절대
+    // 후보 수의 문제이므로 최종 limit에 비례할 필요가 없다.
     const CANDIDATE_FACTOR: usize = 8;
+    const CANDIDATE_CAP: usize = 60;
     let factor = std::env::var("KMD_RRF_FACTOR")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|n| *n >= 1)
         .unwrap_or(CANDIDATE_FACTOR);
-    let pool = limit * factor;
+    let pool = (limit * factor).min(limit.max(CANDIDATE_CAP));
     let bm = crate::bm25::search_in(tantivy_dir, cfg, query, pool, collections)
         .unwrap_or_default();
-    let vs = vsearch_in(store, query, pool, collections).unwrap_or_default();
+    let vs = vsearch_with(store, query, pool, collections, warm).unwrap_or_default();
 
     Ok(fuse_rrf(bm, vs, limit, K))
 }
@@ -529,6 +570,14 @@ fn fuse_rrf(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 데몬이 임베더를 상주시키려면 스레드 경계를 넘어야 한다.
+    /// 컴파일되면 통과 — llama.cpp 바인딩이 Send를 잃으면 여기서 깨진다.
+    #[test]
+    fn embedder_is_send_and_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<Embedder>();
+    }
 
     fn hit(file: &str) -> SearchHit {
         SearchHit {
