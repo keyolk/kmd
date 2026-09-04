@@ -100,6 +100,23 @@ impl Engine {
             Engine::Hybrid => "hybrid",
         }
     }
+
+    /// 이 엔진이 임베딩을 읽는가.
+    ///
+    /// 검색 범위를 좁힐지 정하는 기준이다. 엔진 **개수**가 아니라 어느 엔진을
+    /// 쓰는지가 기준이어야 한다: `--engine hybrid` 단독은 엔진이 하나여도
+    /// 벡터를 읽으므로, 범위를 안 좁히면 임베딩이 없는 project 축 36만 건이
+    /// BM25 쪽에만 후보로 들어와 융합이 왜곡된다. 실측으로 같은 factor에서
+    /// `--compare`는 R@5 52%, `--engine hybrid`는 44%가 나왔다 — 엔진이 아니라
+    /// 모집단이 달랐던 것이다.
+    fn reads_embeddings(self) -> bool {
+        matches!(self, Engine::Vector | Engine::Hybrid)
+    }
+}
+
+/// 검색 범위를 좁혀야 하는가 — 임베딩을 읽는 엔진이 하나라도 있으면 그렇다.
+fn needs_embedded_scope(engines: &[Engine]) -> bool {
+    engines.iter().any(|e| e.reads_embeddings())
 }
 
 /// 한 쿼리를 한 엔진으로 검색한다.
@@ -262,6 +279,17 @@ struct DocSample {
 /// 문서 본문에서 검색 쿼리를 만든다.
 /// 한글 문서: 한글이 가장 많은 라인을 골라 rag와 동일 키워드 추출.
 /// 그 외: 제목/본문 앞부분에서 영어 키워드 추출.
+///
+/// **이 쿼리는 문서와 어휘가 완전히 겹친다.** 실측하면 상당수가 문서의 제목
+/// 줄 그대로다(`# AWS Accounts & Kubernetes Contexts`로 그 문서를 찾는 꼴).
+/// 그래서 known-item 모드는 BM25가 설계상 가장 강한 조건에서 측정하며, 의미
+/// 검색이 기여할 여지가 거의 없다 — 실측 BM25 R@5 90% 대 vector 69%.
+///
+/// 그 수치를 엔진 우열로 읽으면 안 된다. known-item이 재는 것은 "인덱스가
+/// 이 문서를 되찾을 수 있는가"(라벨 없이 수백 쿼리로 재현 가능한 회귀 지표)이고,
+/// "사용자의 말로 이 문서에 닿을 수 있는가"는 재지 않는다. 후자는
+/// `eval/gold.yaml`의 패러프레이즈 구간이 재며, 거기서는 순서가 뒤집힌다
+/// (한국어 BM25 6% 대 vector 39%). 두 모드는 서로 다른 질문에 답한다.
 fn make_query(title: &str, body: &str) -> Option<(String, bool)> {
     // 후보 라인: 코드/헤더 기호 걷어내고 어느 정도 긴 라인만.
     let best_ko = body
@@ -361,13 +389,13 @@ pub fn known_item(
     let store = crate::store::Store::open(&config::store_path())?;
     let engines = engines_for(engine, compare);
 
-    // 여러 엔진을 비교할 때는 검색 범위를 샘플 컬렉션으로 좁힌다.
+    // 임베딩을 읽는 엔진이 끼면 검색 범위를 샘플 컬렉션으로 좁힌다.
     //
-    // BM25 단독 평가는 전 인덱스를 대상으로 했다(retrievability ceiling). 그 범위를
-    // 그대로 두면 비교가 성립하지 않는다: 벡터 인덱스에는 project 축 36만 건이
+    // BM25 단독 평가는 전 인덱스를 대상으로 한다(retrievability ceiling). 그 범위를
+    // 벡터에 그대로 쓰면 비교가 성립하지 않는다: 벡터 인덱스에는 project 축 36만 건이
     // 아예 없어서, 벡터 엔진만 경쟁 문서가 적은 모집단에서 검색하게 된다. 그건
     // 벡터가 더 잘 찾은 게 아니라 상대가 없었던 것이다.
-    let scope: Option<Vec<&str>> = if engines.len() > 1 {
+    let scope: Option<Vec<&str>> = if needs_embedded_scope(&engines) {
         Some(collections.iter().map(String::as_str).collect())
     } else {
         None
@@ -469,11 +497,11 @@ pub fn gold(
     let store = crate::store::Store::open(&config::store_path())?;
     let engines = engines_for(engine, compare);
 
-    // 비교 시에는 임베딩이 존재하는 컬렉션으로 범위를 좁힌다. gold 단독 모드가
-    // 전 인덱스를 보는 것은 의도(retrievability ceiling)지만, project 축은
-    // 임베딩 대상이 아니므로 비교에서는 BM25만 그 36만 건과 경쟁하게 된다.
+    // 임베딩을 읽는 엔진이 끼면 임베딩이 존재하는 컬렉션으로 범위를 좁힌다.
+    // BM25 단독 gold가 전 인덱스를 보는 것은 의도(retrievability ceiling)지만,
+    // project 축은 임베딩 대상이 아니므로 그 범위에서 벡터를 재면 안 된다.
     let embedded = embedded_collections(&cfg);
-    let scope: Option<Vec<&str>> = if engines.len() > 1 {
+    let scope: Option<Vec<&str>> = if needs_embedded_scope(&engines) {
         Some(embedded.iter().map(String::as_str).collect())
     } else {
         None

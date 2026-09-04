@@ -64,3 +64,74 @@
   expect_any:
     - "istio-release"
     - "istio"
+
+# ── 패러프레이즈 질의 (2026-09-04 추가) ─────────────────────
+#
+# 위 케이스들은 문서의 어휘를 상당히 물려받는다("인증서 SAN", "istio proxy
+# envoy fork"). 아래는 의도적으로 그 겹침을 끊었다 — 그게 이 파일이
+# known-item 모드와 다른 것을 재는 이유다.
+#
+# known-item은 문서 본문에서 뽑은 구절을 쿼리로 쓰므로 어휘가 문서와 정확히
+# 겹치고, 그 조건은 BM25가 설계상 가장 강한 자리다. 실제 사용자는 문서에
+# 없는 말로 묻는다 — "노드가 안 뜨는데"는 어느 문서에도 그렇게 적혀 있지
+# 않다. 두 모드가 반대 결과를 냈을 때 어느 쪽이 실사용에 가까운지 판단할
+# 근거가 이 구간이다.
+#
+# 앵커는 모두 인덱스에 존재함을 확인했다.
+
+- prompt: "노드가 안 뜨는데 어디를 봐야 하지"
+  expect_any:
+    - "k8s"
+
+- prompt: "리전 짧은 이름을 실제 AWS 리전으로 어떻게 바꾸지"
+  expect_any:
+    - "accounts"
+
+- prompt: "파드 로그는 어느 백엔드에서 찾아야 하나"
+  expect_any:
+    - "o11y"
+
+- prompt: "메모리 사용량 그래프를 어디서 뽑지"
+  expect_any:
+    - "o11y"
+
+- prompt: "커밋 메시지를 어떤 형식으로 써야 하나"
+  expect_any:
+    - "git"
+
+- prompt: "실수로 올리면 안 되는 게 뭐가 있지"
+  expect_any:
+    - "git"
+    - "security"
+
+- prompt: "프론트엔드를 바이너리에 넣었는데 저장할 때마다 반영이 안 돼"
+  expect_any:
+    - "golang"
+
+- prompt: "화면 전환이 사용자 클릭을 되돌려버리는 문제"
+  expect_any:
+    - "svelte"
+
+- prompt: "출력이 너무 길어서 컨텍스트가 터진다"
+  expect_any:
+    - "command"
+
+- prompt: "버그 찾기 전에 먼저 확인해야 할 게 있었는데"
+  expect_any:
+    - "debugging"
+
+- prompt: "테라폼 레포가 어떻게 나뉘어 있지"
+  expect_any:
+    - "infrastructure"
+
+- prompt: "how do I pick between Loki and ClickHouse for logs"
+  expect_any:
+    - "o11y"
+
+- prompt: "why does my embedded frontend not reload on save"
+  expect_any:
+    - "golang"
+
+- prompt: "what breaks when an effect fights a user click"
+  expect_any:
+    - "svelte"
