@@ -183,7 +183,37 @@ Git repository, and touched-file overlap. New learnings persist their creation `
 older learnings recover it from the original transcript or infer it from touched files.
 
 `--json` output keeps the docid/score/file/title/context/snippet shape inherited
-from qmd, so scripts written against the old format still work.
+from qmd, so scripts written against the old format still work, plus an `abspath`
+field: a hit's `file` is a `kmd://<collection>/<relpath>` URI, and `abspath` is
+the real path to open. It is absent only when the hit's collection is no longer
+in `index.yml`, in which case no path can be derived and saying so beats guessing.
+
+## MCP (other clients)
+
+Claude Code reaches kmd two ways already — the `UserPromptSubmit` hook injects
+context automatically, and the `kmd` skill runs the CLI. Neither is available in
+Claude Desktop, Cursor, or Codex, which speak MCP instead.
+
+```sh
+claude mcp add --scope user kmd kmd mcp   # or the equivalent for your client
+```
+
+`kmd mcp` speaks JSON-RPC over stdio and exposes two tools:
+
+| Tool | Purpose |
+|---|---|
+| `kmd_search` | Cross-axis search; `axis` narrows to session/knowledge/project |
+| `kmd_status` | What the index holds — tells an empty index from a missed query |
+
+Search goes through the daemon when one is running, so the warm Tantivy reader
+is reused rather than reopened per client-spawned process; it falls back
+in-process otherwise. Results are rendered as text, not JSON — an MCP response
+lands verbatim in the model's context, and JSON punctuation costs tokens without
+helping it read. Each hit carries `abspath` so the client can open the file.
+
+Do not add this to Claude Code on top of the hook and skill. With this many MCP
+servers registered, tools arrive deferred: using one costs a `ToolSearch` round
+trip first, whereas `Bash(kmd:*)` is callable immediately.
 
 ## Layout
 
@@ -193,6 +223,7 @@ from qmd, so scripts written against the old format still work.
 - `src/tokenize.rs` — lindera ko-dic (Korean) + lowercase/stemmer (English)
 - `src/bm25.rs` — tantivy index, dual ko/en fields, search + snippets
 - `src/global.rs` — cross-axis search (`kmd global`)
+- `src/mcp.rs` — MCP server over stdio (`kmd mcp`), for non-Claude-Code clients
 - `src/output.rs` — JSON / CLI output, per-axis rendering
 - `src/dashboard.rs` — operations TUI, JSON snapshot, checks and evaluation history
 - `src/evaluation_log.rs` — bounded history for successful L1/L2/L3 evaluation runs

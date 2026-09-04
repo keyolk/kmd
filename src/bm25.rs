@@ -4,7 +4,7 @@ use crate::config::IndexConfig;
 use crate::store::Store;
 use crate::tokenize;
 use anyhow::Result;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::path::Path;
 use tantivy::collector::TopDocs;
 use tantivy::query::{BooleanQuery, Occur, Query, QueryParser, TermQuery};
@@ -14,7 +14,9 @@ use tantivy::schema::{
 };
 use tantivy::{Index, IndexWriter, TantivyDocument, Term, doc};
 
-#[derive(Debug, Serialize)]
+// Deserialize도 구현한다: MCP 서버가 데몬 응답을 되읽는다. 생략 필드
+// (`skip_serializing_if`)는 역직렬화 시 기본값이 필요하므로 Default를 붙인다.
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub struct SearchHit {
     pub docid: String,
     pub score: f32,
@@ -24,12 +26,12 @@ pub struct SearchHit {
     /// 열려면 호출자가 index.yml에서 컬렉션 `path`를 찾아 조인해야 한다.
     /// 검색은 이미 그 경로를 알고 있으므로(본문 미저장 문서는 스니펫을 거기서
     /// 읽는다) 그냥 실어 보낸다 — 에이전트가 히트를 바로 Read할 수 있다.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub abspath: Option<String>,
     pub title: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub snippet: Option<String>,
 }
 

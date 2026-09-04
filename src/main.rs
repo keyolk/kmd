@@ -15,6 +15,7 @@ mod hook_config;
 mod journal;
 mod learnings;
 mod locality;
+mod mcp;
 mod output;
 mod pageindex;
 mod palette;
@@ -134,6 +135,8 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Serve MCP over stdio (for clients that cannot use hooks or skills)
+    Mcp,
     /// Run the warm daemon (unix socket server)
     Daemon {
         /// Write launchd plist and print load instructions
@@ -323,6 +326,7 @@ fn main() -> Result<()> {
         Command::Embed { limit, collection } => cmd_embed(limit, &collection),
         Command::Vsearch { query, limit, json } => cmd_vsearch(&query, limit, json),
         Command::Query { query, limit, json } => cmd_query(&query, limit, json),
+        Command::Mcp => mcp::serve(),
         Command::Daemon { install } => {
             if install {
                 daemon::install_launchd()

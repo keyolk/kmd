@@ -3,6 +3,7 @@
 //! 프로토콜: JSON Lines. 요청 한 줄 → 응답 한 줄.
 //!   {"cmd":"rag","prompt":"...","session_id":"..."}   → {"context":"...","hits":[...],...}
 //!   {"cmd":"search","query":"...","limit":10}          → {"hits":[...]}
+//!   {"cmd":"global","query":"...","limit":5,"axis":"…"} → {"axes":[{axis,hits}]}
 //!   {"cmd":"update"}                                   → {"ok":true,...}  (백그라운드 큐)
 //!   {"cmd":"ping"}                                     → {"ok":true}
 //!
@@ -35,6 +36,9 @@ struct Request {
     query: String,
     #[serde(default = "default_limit")]
     limit: usize,
+    /// `global` 커맨드에서 한 축만 질의할 때. 비면 세 축 전부.
+    #[serde(default)]
+    axis: Option<String>,
 }
 
 fn default_limit() -> usize {
@@ -140,6 +144,26 @@ fn handle_conn(
                         None,
                     )?;
                     Ok(serde_json::json!({"ok": true, "hits": hits}).to_string())
+                })();
+                match result {
+                    Ok(json) => writeln!(writer, "{}", json)?,
+                    Err(e) => writeln!(writer, r#"{{"ok":false,"error":{:?}}}"#, e.to_string())?,
+                }
+            }
+            "global" => {
+                // MCP 서버가 쓰는 경로. tantivy reader가 이 프로세스에 warm하게
+                // 있으므로, 클라이언트가 매번 새로 띄우는 MCP 프로세스보다
+                // 여기서 검색하는 편이 빠르다.
+                let result = (|| -> Result<String> {
+                    let cfg = crate::config::load()?;
+                    let axes = crate::global::search(
+                        &crate::config::tantivy_dir(),
+                        &cfg,
+                        &req.query,
+                        req.limit,
+                        req.axis.as_deref(),
+                    )?;
+                    Ok(serde_json::json!({"ok": true, "axes": axes}).to_string())
                 })();
                 match result {
                     Ok(json) => writeln!(writer, "{}", json)?,
