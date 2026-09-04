@@ -23,6 +23,39 @@ qmd has since been removed from this environment; the comparison numbers above a
 kept as the historical record that motivated kmd, and are no longer reproducible
 locally.
 
+The `~82ms` above is a synthetic figure and was never what the hook cost in
+practice. Measured against the live daemon on prompts that pass the gate, the
+BM25 pipeline took **437ms** (median), of which 366ms was `filter_hits`
+re-parsing all 1,428 learning files — 167MB — on every single call. With that
+parse cached and search moved to hybrid, the same prompts cost **273ms**. See
+[Search engine](#search-engine).
+
+## Search engine
+
+The RAG hook searches with hybrid retrieval (BM25 + vector, fused by RRF) when
+the daemon has an embedding model resident, and falls back to BM25 when it does
+not. Both the quality and the latency case are measured:
+
+| | BM25 | hybrid |
+|---|---|---|
+| gold R@5 (49 paraphrase cases) | 33% | **43%** |
+| gold R@5, Korean (36 cases) | 22% | **33%** |
+| gold MRR | 0.251 | **0.328** |
+| hook latency, median | 437ms | **273ms** |
+
+The quality gap comes from what real prompts look like. `eval/gold.yaml`'s
+paraphrase section asks about each document in words the document does not use
+("노드가 안 뜨는데 어디를 봐야 하지" for `k8s.md`), and BM25 cannot reach a
+document it shares no vocabulary with — narrowing the search to that one
+collection does not help. `kmd eval --compare` prints all three engines; see
+[`eval/README.md`](eval/README.md).
+
+Hybrid being *faster* is not intuition, it is two fixes. The model stays
+resident in the daemon (220-420ms of load per call, gone), and `filter_hits`
+caches its learning-file parse. Vector search remains linear in chunk count —
+that is the brute-force scan and no amount of process reuse changes it — so the
+hook narrows to the collections it actually injects from (82k chunks of 296k).
+
 ## Usage
 
 ```sh
@@ -183,7 +216,37 @@ Git repository, and touched-file overlap. New learnings persist their creation `
 older learnings recover it from the original transcript or infer it from touched files.
 
 `--json` output keeps the docid/score/file/title/context/snippet shape inherited
-from qmd, so scripts written against the old format still work.
+from qmd, so scripts written against the old format still work, plus an `abspath`
+field: a hit's `file` is a `kmd://<collection>/<relpath>` URI, and `abspath` is
+the real path to open. It is absent only when the hit's collection is no longer
+in `index.yml`, in which case no path can be derived and saying so beats guessing.
+
+## MCP (other clients)
+
+Claude Code reaches kmd two ways already — the `UserPromptSubmit` hook injects
+context automatically, and the `kmd` skill runs the CLI. Neither is available in
+Claude Desktop, Cursor, or Codex, which speak MCP instead.
+
+```sh
+claude mcp add --scope user kmd kmd mcp   # or the equivalent for your client
+```
+
+`kmd mcp` speaks JSON-RPC over stdio and exposes two tools:
+
+| Tool | Purpose |
+|---|---|
+| `kmd_search` | Cross-axis search; `axis` narrows to session/knowledge/project |
+| `kmd_status` | What the index holds — tells an empty index from a missed query |
+
+Search goes through the daemon when one is running, so the warm Tantivy reader
+is reused rather than reopened per client-spawned process; it falls back
+in-process otherwise. Results are rendered as text, not JSON — an MCP response
+lands verbatim in the model's context, and JSON punctuation costs tokens without
+helping it read. Each hit carries `abspath` so the client can open the file.
+
+Do not add this to Claude Code on top of the hook and skill. With this many MCP
+servers registered, tools arrive deferred: using one costs a `ToolSearch` round
+trip first, whereas `Bash(kmd:*)` is callable immediately.
 
 ## Layout
 
@@ -193,6 +256,7 @@ from qmd, so scripts written against the old format still work.
 - `src/tokenize.rs` — lindera ko-dic (Korean) + lowercase/stemmer (English)
 - `src/bm25.rs` — tantivy index, dual ko/en fields, search + snippets
 - `src/global.rs` — cross-axis search (`kmd global`)
+- `src/mcp.rs` — MCP server over stdio (`kmd mcp`), for non-Claude-Code clients
 - `src/output.rs` — JSON / CLI output, per-axis rendering
 - `src/dashboard.rs` — operations TUI, JSON snapshot, checks and evaluation history
 - `src/evaluation_log.rs` — bounded history for successful L1/L2/L3 evaluation runs
@@ -203,7 +267,7 @@ from qmd, so scripts written against the old format still work.
 
 - [x] vector search (embeddinggemma GGUF via llama-cpp-2, `embed` feature)
 - [x] hybrid RRF (`kmd query`)
-- [x] warm daemon (unix socket) for sub-100ms hook latency
+- [x] warm daemon (unix socket) holding the Tantivy reader and embedding model
 
 ## Evaluation
 

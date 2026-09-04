@@ -583,6 +583,7 @@ mod tests {
             docid: "#000001".into(),
             score: 1.0,
             file: file.into(),
+            abspath: None,
             title: "t".into(),
             context: None,
             snippet: None,

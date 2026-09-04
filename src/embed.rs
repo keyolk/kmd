@@ -25,6 +25,23 @@ const CHUNK_CHARS: usize = 2000; // ~500 tokens
 const CHUNK_OVERLAP: usize = 200;
 const CTX_TOKENS: u32 = 2048;
 
+/// 한 문서에서 임베딩할 청크 수 상한.
+///
+/// 임베딩은 청크당 수십 ms의 GPU 연산이므로 비용이 문서 길이에 선형이고, 긴
+/// 문서일수록 그 비용을 정당화하기 어렵다 — `exp` 컬렉션의 55MB짜리
+/// `argocd-apps.json`은 약 27,500 청크로 몇 시간을 쓰는데, 덤프 JSON에서
+/// 의미 검색이 건질 것은 거의 없다. 실측: 이 파일 하나가 전체 코퍼스 임베딩
+/// 작업을 438건 남은 지점에서 멈춰 세웠다.
+///
+/// 상한을 넘는 문서는 **앞부분만** 임베딩한다. 건너뛰지 않는 이유는 문서
+/// 앞머리가 대개 그 문서가 무엇인지 말해 주고(제목, 헤더, 서론), 그거라도
+/// 있으면 의미 검색으로 도달할 수 있기 때문이다. BM25는 어차피 전문을
+/// 인덱싱하므로 뒷부분도 키워드로는 찾힌다.
+///
+/// 64청크 ≈ 128KB. 이 코퍼스에서 이 선을 넘는 문서는 407건(전체의 0.7%)이고
+/// 대부분 상태 덤프와 데이터셋이다.
+const MAX_CHUNKS_PER_DOC: usize = 64;
+
 pub fn model_path() -> PathBuf {
     if let Ok(p) = std::env::var("KMD_EMBED_MODEL") {
         return PathBuf::from(p);
@@ -167,7 +184,15 @@ fn blob_to_vec(b: &[u8]) -> Vec<f32> {
 }
 
 /// 활성 문서 중 임베딩이 없거나 오래된 것을 임베딩. 처리한 문서 수 반환.
-pub fn embed_pending(store: &mut Store, limit: Option<usize>) -> Result<usize> {
+///
+/// `collections`가 비어 있지 않으면 그 컬렉션만 임베딩한다. 대상은 id 순으로
+/// 처리되는데 `exp`가 대상의 95%를 차지하면서 id도 가장 작아, 필터 없이는
+/// 훅이 실제로 읽는 컬렉션(learnings/claude-*)이 맨 뒤로 밀린다.
+pub fn embed_pending(
+    store: &mut Store,
+    limit: Option<usize>,
+    collections: &[String],
+) -> Result<usize> {
     ensure_schema(store)?;
 
     // 임베딩 없는 활성 문서 목록.
@@ -175,15 +200,22 @@ pub fn embed_pending(store: &mut Store, limit: Option<usize>) -> Result<usize> {
     // 본문 미저장 문서(abspath IS NOT NULL — project 축)는 제외한다. 코드 38만 건
     // 임베딩은 비용이 비현실적이고, 코드 검색은 식별자 정확 매칭이 지배적이라
     // BM25로 충분하다. 벡터 검색은 knowledge/session 축에만 적용된다.
-    let mut stmt = store.conn.prepare(
+    let mut sql = String::from(
         "SELECT d.id, d.title, d.body FROM documents d
          WHERE d.active = 1
            AND d.abspath IS NULL
-           AND NOT EXISTS (SELECT 1 FROM embeddings e WHERE e.doc_id = d.id)
-         ORDER BY d.id",
-    )?;
+           AND NOT EXISTS (SELECT 1 FROM embeddings e WHERE e.doc_id = d.id)",
+    );
+    if !collections.is_empty() {
+        let placeholders = vec!["?"; collections.len()].join(",");
+        sql.push_str(&format!(" AND d.collection IN ({})", placeholders));
+    }
+    sql.push_str(" ORDER BY d.id");
+    let mut stmt = store.conn.prepare(&sql)?;
+    let params: Vec<&dyn rusqlite::ToSql> =
+        collections.iter().map(|c| c as &dyn rusqlite::ToSql).collect();
     let docs: Vec<(i64, String, String)> = stmt
-        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+        .query_map(params.as_slice(), |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
         .collect::<std::result::Result<_, _>>()?;
     drop(stmt);
 
@@ -207,14 +239,37 @@ pub fn embed_pending(store: &mut Store, limit: Option<usize>) -> Result<usize> {
     let mut ctx = embedder.make_context()?;
 
     let mut done = 0usize;
+    let mut truncated = 0usize;
     for (id, title, body) in docs.into_iter().take(todo) {
-        let chunks = chunk_body(&body);
-        let tx = store.conn.unchecked_transaction()?;
-        for (idx, text) in &chunks {
-            let v = embedder.embed_with(&mut ctx, &doc_prompt(&title, text))?;
+        let mut chunks = chunk_body(&body);
+        if chunks.len() > MAX_CHUNKS_PER_DOC {
+            truncated += 1;
+            chunks.truncate(MAX_CHUNKS_PER_DOC);
+        }
+
+        // 임베딩은 트랜잭션 **밖에서** 계산한다. 문서당 수백 ms가 걸리는 GPU
+        // 연산이라, 트랜잭션 안에서 돌리면 그 시간 내내 쓰기 락을 물고 있게 되고
+        // 데몬의 주기적 embed 사이클이나 다른 kmd 프로세스가 그 락에 걸린다.
+        let vectors: Vec<(i64, &str, Vec<f32>)> = chunks
+            .iter()
+            .map(|(idx, text)| {
+                embedder
+                    .embed_with(&mut ctx, &doc_prompt(&title, text))
+                    .map(|v| (*idx as i64, text.as_str(), v))
+            })
+            .collect::<Result<_>>()?;
+
+        // IMMEDIATE로 시작한다. DEFERRED(=`unchecked_transaction`의 기본)는 읽기로
+        // 시작해 쓰기로 승격하는데, SQLite는 그 승격에서만 `busy_timeout`을
+        // 무시하고 즉시 SQLITE_BUSY를 반환한다(데드락 회피). 30초 타임아웃을
+        // 걸어 두고도 동시 실행이 "database is locked"로 즉사한 실제 원인이다.
+        let tx = store
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        for (idx, text, v) in &vectors {
             tx.execute(
                 "INSERT OR REPLACE INTO embeddings (doc_id, chunk_idx, chunk_text, vector) VALUES (?1,?2,?3,?4)",
-                params![id, *idx as i64, text, vec_to_blob(&v)],
+                params![id, idx, text, vec_to_blob(v)],
             )?;
         }
         tx.commit()?;
@@ -222,6 +277,14 @@ pub fn embed_pending(store: &mut Store, limit: Option<usize>) -> Result<usize> {
         if done % 50 == 0 {
             eprintln!("  {}/{}", done, todo);
         }
+    }
+    // 절단은 조용히 넘기지 않는다. 그 문서들은 뒷부분이 벡터 검색에 없으므로,
+    // "임베딩 완료"가 곧 "전문이 의미 검색 대상"을 뜻하지 않는다.
+    if truncated > 0 {
+        eprintln!(
+            "  {} document(s) exceeded {} chunks and were embedded head-only",
+            truncated, MAX_CHUNKS_PER_DOC
+        );
     }
     Ok(done)
 }
@@ -240,60 +303,156 @@ pub fn purge_stale(store: &Store, dirty_ids: &[i64]) -> Result<()> {
 
 /// 벡터 검색 — 쿼리 임베딩 후 브루트포스 코사인 top-k.
 pub fn vsearch(store: &Store, query: &str, limit: usize) -> Result<Vec<SearchHit>> {
-    ensure_schema(store)?;
-    let embedder = Embedder::load()?;
-    let qv = embedder.embed(&query_prompt(query))?;
+    vsearch_in(store, query, limit, None)
+}
 
-    let mut stmt = store.conn.prepare(
-        "SELECT e.doc_id, e.chunk_idx, e.chunk_text, e.vector,
-                d.collection, d.relpath, d.title, d.context
+/// 컬렉션 집합으로 좁힌 벡터 검색. `collections`가 None이면 전 인덱스.
+///
+/// BM25 쪽 `search_in`과 짝을 이룬다. 훅과 eval은 특정 컬렉션만 보는데, 필터가
+/// 없으면 두 엔진이 서로 다른 모집단을 검색해 비교가 성립하지 않는다.
+pub fn vsearch_in(
+    store: &Store,
+    query: &str,
+    limit: usize,
+    collections: Option<&[&str]>,
+) -> Result<Vec<SearchHit>> {
+    vsearch_with(store, query, limit, collections, None)
+}
+
+/// 이미 로드된 임베더를 재사용하는 벡터 검색.
+///
+/// 데몬용이다. 모델 로드는 콜드에서 420ms, 웜에서 220ms 드는데 프로세스가
+/// 살아 있는 동안은 한 번만 내면 되는 비용이다. `None`이면 이 호출 안에서
+/// 로드한다(CLI 경로).
+pub fn vsearch_with(
+    store: &Store,
+    query: &str,
+    limit: usize,
+    collections: Option<&[&str]>,
+    warm: Option<&Embedder>,
+) -> Result<Vec<SearchHit>> {
+    ensure_schema(store)?;
+    // KMD_VSEARCH_TIMING=1이면 단계별 시간을 stderr에 낸다. 훅 지연을 줄이려면
+    // 모델 로드와 브루트포스 스캔 중 어느 쪽이 지배적인지 알아야 하고, 둘은
+    // 대응이 완전히 다르다(데몬 상주 대 인덱스 구조 변경).
+    let timing = std::env::var("KMD_VSEARCH_TIMING").is_ok();
+    let t0 = std::time::Instant::now();
+    let owned;
+    let embedder = match warm {
+        Some(e) => e,
+        None => {
+            owned = Embedder::load()?;
+            &owned
+        }
+    };
+    let qv = embedder.embed(&query_prompt(query))?;
+    let t_model = t0.elapsed();
+
+    // 스코어링 패스는 doc_id, chunk_idx, vector만 읽는다.
+    //
+    // 코사인 점수에 필요한 것은 벡터뿐이고, chunk_text와 문서 메타는 top-k가
+    // 정해진 뒤 그 몇 건에만 필요하다. 그런데 이 쿼리는 매번 임베딩 테이블
+    // 전체를 훑으므로(브루트포스), 함께 select하면 그 바이트를 전부 읽는다 —
+    // 실측 이 코퍼스에서 vector 866MB 대 chunk_text 488MB로, 텍스트를 빼면
+    // 읽는 양이 36% 줄어든다. 페이지 캐시가 식은 콜드 경로에서 이 차이가 크다.
+    let mut sql = String::from(
+        "SELECT e.doc_id, e.chunk_idx, e.vector
          FROM embeddings e JOIN documents d ON d.id = e.doc_id
          WHERE d.active = 1",
-    )?;
-    let rows = stmt.query_map([], |r| {
+    );
+    let filter: Vec<String> = collections
+        .map(|c| c.iter().map(|s| s.to_string()).collect())
+        .unwrap_or_default();
+    if !filter.is_empty() {
+        let placeholders = vec!["?"; filter.len()].join(",");
+        sql.push_str(&format!(" AND d.collection IN ({})", placeholders));
+    }
+    let mut stmt = store.conn.prepare(&sql)?;
+    let params: Vec<&dyn rusqlite::ToSql> =
+        filter.iter().map(|c| c as &dyn rusqlite::ToSql).collect();
+    let rows = stmt.query_map(params.as_slice(), |r| {
         Ok((
             r.get::<_, i64>(0)?,
             r.get::<_, i64>(1)?,
-            r.get::<_, String>(2)?,
-            r.get::<_, Vec<u8>>(3)?,
-            r.get::<_, String>(4)?,
-            r.get::<_, String>(5)?,
-            r.get::<_, String>(6)?,
-            r.get::<_, Option<String>>(7)?,
+            r.get::<_, Vec<u8>>(2)?,
         ))
     })?;
 
-    // 문서별 최고 청크 점수만 유지
+    // 문서별 최고 청크 점수와 그 청크 번호만 유지. 청크 번호를 들고 가는 이유는
+    // 스니펫을 뒤에서 그 청크로 되찾아야 하기 때문이다.
     use std::collections::HashMap;
-    let mut best: HashMap<i64, (f32, String, String, String, String, Option<String>)> =
-        HashMap::new();
+    let mut best: HashMap<i64, (f32, i64)> = HashMap::new();
     for row in rows {
-        let (doc_id, _idx, text, blob, coll, relpath, title, context) = row?;
+        let (doc_id, idx, blob) = row?;
         let v = blob_to_vec(&blob);
         let score: f32 = qv.iter().zip(v.iter()).map(|(a, b)| a * b).sum();
-        let entry = best.entry(doc_id).or_insert_with(|| {
-            (f32::MIN, String::new(), coll.clone(), relpath.clone(), title.clone(), context.clone())
-        });
+        let entry = best.entry(doc_id).or_insert((f32::MIN, 0));
         if score > entry.0 {
-            *entry = (score, text, coll, relpath, title, context);
+            *entry = (score, idx);
         }
     }
 
+    let t_scan = t0.elapsed() - t_model;
     let mut scored: Vec<_> = best.into_iter().collect();
-    scored.sort_by(|a, b| b.1.0.partial_cmp(&a.1.0).unwrap_or(std::cmp::Ordering::Equal));
+    // 코사인 점수 내림차순, 동점은 doc_id로 결정적으로 깬다. `best`가 HashMap이고
+    // `sort_by`가 안정 정렬이라, 타이브레이크가 없으면 같은 점수 문서의 순서가
+    // 프로세스별 해시 시드를 따라 실행마다 바뀐다 — 실측: 같은 쿼리의 3위가
+    // 실행마다 다른 파일로 나왔다. f32 코사인은 동점이 흔하다.
+    scored.sort_by(|a, b| {
+        b.1.0
+            .partial_cmp(&a.1.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
+    });
     scored.truncate(limit);
 
-    Ok(scored
-        .into_iter()
-        .map(|(doc_id, (score, text, coll, relpath, title, context))| SearchHit {
+    // top-k가 정해진 뒤에야 그 몇 건의 텍스트와 메타를 읽는다.
+    let cfg = config::load()?;
+    let mut detail = store.conn.prepare(
+        "SELECT e.chunk_text, d.collection, d.relpath, d.title, d.context, d.abspath
+         FROM embeddings e JOIN documents d ON d.id = e.doc_id
+         WHERE e.doc_id = ?1 AND e.chunk_idx = ?2",
+    )?;
+    let mut out = Vec::with_capacity(scored.len());
+    for (doc_id, (score, chunk_idx)) in scored {
+        let row = detail.query_row(params![doc_id, chunk_idx], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, Option<String>>(4)?,
+                r.get::<_, Option<String>>(5)?,
+            ))
+        });
+        // 스코어링과 이 조회 사이에 문서가 지워졌으면(동시 update) 그 히트는 버린다.
+        let Ok((text, coll, relpath, title, context, abspath)) = row else {
+            continue;
+        };
+        out.push(SearchHit {
             docid: format!("#{:06x}", doc_id),
             score,
             file: format!("kmd://{}/{}", coll, relpath),
+            abspath: crate::bm25::resolve_abspath(
+                &cfg,
+                abspath.as_deref().unwrap_or(""),
+                &coll,
+                &relpath,
+            ),
             title,
             context,
             snippet: Some(text.chars().take(300).collect()),
-        })
-        .collect())
+        });
+    }
+    if timing {
+        eprintln!(
+            "vsearch timing: model+query-embed {:?}, brute-force scan {:?}, detail {:?}",
+            t_model,
+            t_scan,
+            t0.elapsed() - t_model - t_scan
+        );
+    }
+    Ok(out)
 }
 
 /// hybrid: BM25 + 벡터를 RRF(reciprocal rank fusion)로 융합.
@@ -304,36 +463,208 @@ pub fn hybrid(
     query: &str,
     limit: usize,
 ) -> Result<Vec<SearchHit>> {
-    const K: f32 = 60.0;
-    let bm = crate::bm25::search(tantivy_dir, cfg, query, limit * 2, None).unwrap_or_default();
-    let vs = vsearch(store, query, limit * 2).unwrap_or_default();
+    hybrid_in(store, tantivy_dir, cfg, query, limit, None)
+}
 
+/// 컬렉션 집합으로 좁힌 hybrid.
+pub fn hybrid_in(
+    store: &Store,
+    tantivy_dir: &std::path::Path,
+    cfg: &config::IndexConfig,
+    query: &str,
+    limit: usize,
+    collections: Option<&[&str]>,
+) -> Result<Vec<SearchHit>> {
+    hybrid_with(store, tantivy_dir, cfg, query, limit, collections, None)
+}
+
+/// 이미 로드된 임베더를 재사용하는 hybrid. 데몬용 — `vsearch_with`와 같은 이유다.
+#[allow(clippy::too_many_arguments)]
+pub fn hybrid_with(
+    store: &Store,
+    tantivy_dir: &std::path::Path,
+    cfg: &config::IndexConfig,
+    query: &str,
+    limit: usize,
+    collections: Option<&[&str]>,
+    warm: Option<&Embedder>,
+) -> Result<Vec<SearchHit>> {
+    const K: f32 = 60.0;
+    // 후보를 최종 limit보다 훨씬 넓게 가져온다. RRF는 두 리스트를 대칭으로
+    // 합산하므로, 후보창이 좁으면 양쪽에 흔하게 걸친 무관 문서가 한쪽에만
+    // 있는 정답을 이긴다 — limit*2(=10)에서는 양쪽 10위 문서(2/(60+10)=0.029)가
+    // 벡터 1위 정답(1/61=0.016)보다 높다. 창을 넓히면 정답의 순위가 상대적으로
+    // 앞서므로 그 역전이 줄어든다.
+    // 후보창은 최종 limit의 배수이되 상한을 둔다.
+    //
+    // 배수만 쓰면 큰 limit에서 폭발한다: RAG 훅은 컬렉션 가중 재정렬을 위해
+    // limit=30으로 부르는데, factor 8이면 후보 240건이 되고 그 각각에
+    // 스니펫 조회가 붙어 hybrid가 286ms(limit=5)에서 700ms(limit=30)로 뛴다.
+    // 넓은 창이 필요한 이유는 대칭 RRF의 역전을 줄이는 것이고, 그건 절대
+    // 후보 수의 문제이므로 최종 limit에 비례할 필요가 없다.
+    const CANDIDATE_FACTOR: usize = 8;
+    const CANDIDATE_CAP: usize = 60;
+    let factor = std::env::var("KMD_RRF_FACTOR")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|n| *n >= 1)
+        .unwrap_or(CANDIDATE_FACTOR);
+    let pool = (limit * factor).min(limit.max(CANDIDATE_CAP));
+    let bm = crate::bm25::search_in(tantivy_dir, cfg, query, pool, collections)
+        .unwrap_or_default();
+    let vs = vsearch_with(store, query, pool, collections, warm).unwrap_or_default();
+
+    Ok(fuse_rrf(bm, vs, limit, K))
+}
+
+/// 두 랭킹을 RRF로 융합한다. 순수 함수 — 모델도 인덱스도 필요 없으므로
+/// 테스트할 수 있다.
+///
+/// RRF는 두 리스트를 **대칭으로** 합산한다. 그래서 한쪽에만 있는 정답은
+/// 기여를 한 번 받고, 양쪽에 흔하게 걸친 무관 문서는 두 번 받는다. 후보창이
+/// 좁으면 이 산술이 뒤집힌다 — `pool=10`에서 양쪽 10위 문서(2/(60+10)=0.029)가
+/// 벡터 1위 정답(1/61=0.016)을 이긴다. 창을 넓히는 것이 호출부의 대응이다.
+fn fuse_rrf(
+    bm: Vec<SearchHit>,
+    vs: Vec<SearchHit>,
+    limit: usize,
+    k: f32,
+) -> Vec<SearchHit> {
     use std::collections::HashMap;
     let mut fused: HashMap<String, (f32, SearchHit)> = HashMap::new();
-    for (rank, hit) in bm.into_iter().enumerate() {
-        let rr = 1.0 / (K + rank as f32 + 1.0);
-        fused
-            .entry(hit.file.clone())
-            .and_modify(|e| e.0 += rr)
-            .or_insert((rr, hit));
-    }
-    for (rank, hit) in vs.into_iter().enumerate() {
-        let rr = 1.0 / (K + rank as f32 + 1.0);
-        fused
-            .entry(hit.file.clone())
-            .and_modify(|e| e.0 += rr)
-            .or_insert((rr, hit));
+    for list in [bm, vs] {
+        for (rank, hit) in list.into_iter().enumerate() {
+            let rr = 1.0 / (k + rank as f32 + 1.0);
+            fused
+                .entry(hit.file.clone())
+                .and_modify(|e| e.0 += rr)
+                .or_insert((rr, hit));
+        }
     }
     let mut out: Vec<_> = fused.into_values().collect();
-    out.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-    Ok(out
-        .into_iter()
+    // RRF 점수 내림차순, 동점은 파일 경로로 결정적으로 깬다.
+    //
+    // 동점 타이브레이크가 없으면 순위가 실행마다 바뀐다: `fused`는 HashMap이고
+    // Rust의 해시는 프로세스마다 시드가 다르므로 순회 순서가 매번 다르며,
+    // `sort_by`는 안정 정렬이라 동점 문서의 상대 순서가 그 순회 순서를 그대로
+    // 물려받는다. 후보창을 넓히면 동점(양쪽 리스트에서 대칭 위치에 있는 문서)이
+    // 많아져 이 비결정성이 지표에까지 드러난다 — 실측: 같은 입력에 대해 gold
+    // R@5가 52%와 56% 사이에서, MRR이 0.369~0.380 사이에서 흔들렸다.
+    //
+    // 순위가 흔들리는 검색은 평가할 수 없다. 어느 순서가 "옳은지"는 정의되지
+    // 않으므로 안정성만 확보한다.
+    out.sort_by(|a, b| {
+        b.0.partial_cmp(&a.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.1.file.cmp(&b.1.file))
+    });
+    out.into_iter()
         .take(limit)
         .map(|(rrf, mut hit)| {
             hit.score = rrf;
             hit
         })
-        .collect())
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 데몬이 임베더를 상주시키려면 스레드 경계를 넘어야 한다.
+    /// 컴파일되면 통과 — llama.cpp 바인딩이 Send를 잃으면 여기서 깨진다.
+    #[test]
+    fn embedder_is_send_and_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<Embedder>();
+    }
+
+    fn hit(file: &str) -> SearchHit {
+        SearchHit {
+            file: file.into(),
+            ..Default::default()
+        }
+    }
+
+    /// 동점 순위가 실행마다 흔들리면 안 된다.
+    ///
+    /// `fused`는 HashMap이고 Rust의 해시는 프로세스마다 시드가 다르다.
+    /// `sort_by`는 안정 정렬이라, 타이브레이크가 없으면 동점 문서의 상대 순서가
+    /// 그 순회 순서를 그대로 물려받는다. 이 테스트는 한 프로세스 안에서 도는
+    /// 탓에 시드가 고정돼 있어 그 자체로 재현하지 못하므로, 대신 **동점 집합의
+    /// 순서가 정해진 규칙(파일 경로)을 따르는지**를 고정한다.
+    #[test]
+    fn ties_break_deterministically_by_path() {
+        // b와 c는 (1위, 3위)와 (3위, 1위)로 정확히 같은 점수를 받는다.
+        // a는 (2위, 2위)라 근소하게 낮다 — 1/61+1/63 > 2/62. 볼록성 때문이고,
+        // 여기서 확인하려는 것은 그 서열이 아니라 **동점 b/c의 순서**다.
+        let bm = vec![hit("kmd://c/b.md"), hit("kmd://c/a.md"), hit("kmd://c/c.md")];
+        let vs = vec![hit("kmd://c/c.md"), hit("kmd://c/a.md"), hit("kmd://c/b.md")];
+        let out = fuse_rrf(bm, vs, 3, 60.0);
+        let files: Vec<&str> = out.iter().map(|h| h.file.as_str()).collect();
+        assert_eq!(
+            &files[..2],
+            &["kmd://c/b.md", "kmd://c/c.md"],
+            "tied documents are ordered by path, not by hash iteration order"
+        );
+        assert_eq!(files[2], "kmd://c/a.md", "a scores lowest by RRF convexity");
+    }
+
+    /// 한쪽에만 있는 1위 정답이 양쪽에 걸친 하위 문서에게 밀리는 조건을 고정한다.
+    ///
+    /// 이것이 RRF의 대칭 합산이 만드는 실제 실패이며, 후보창을 넓히는 이유다.
+    /// 좁은 창에서 역전이 일어남을 명시적으로 남겨 두면, 나중에 창을 다시
+    /// 좁히려는 변경이 무엇을 되돌리는지 알 수 있다.
+    #[test]
+    fn a_single_list_winner_loses_to_a_document_in_both_lists() {
+        let answer = "kmd://c/answer.md";
+        let filler: Vec<SearchHit> = (0..10)
+            .map(|i| hit(&format!("kmd://c/f{:02}.md", i)))
+            .collect();
+        // 벡터는 정답을 1위로 올린다. BM25는 정답을 아예 못 찾는다.
+        let mut vs = vec![hit(answer)];
+        vs.extend(filler.iter().map(|h| hit(&h.file)));
+        let bm: Vec<SearchHit> = filler.iter().map(|h| hit(&h.file)).collect();
+
+        let out = fuse_rrf(bm, vs, 5, 60.0);
+        let files: Vec<&str> = out.iter().map(|h| h.file.as_str()).collect();
+        assert_ne!(
+            files[0], answer,
+            "symmetric RRF puts documents present in both lists above a              single-list winner — this is the failure the candidate window              width mitigates"
+        );
+        assert!(
+            files.contains(&answer) == false,
+            "with 10 both-list fillers the answer is pushed out of the top 5              entirely: {:?}",
+            files
+        );
+    }
+
+    /// 한쪽 리스트가 비어도 나머지가 그대로 나온다.
+    #[test]
+    fn an_empty_list_does_not_erase_the_other() {
+        let out = fuse_rrf(vec![], vec![hit("kmd://c/only.md")], 5, 60.0);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].file, "kmd://c/only.md");
+    }
+
+    /// 같은 문서가 양쪽에 있으면 점수가 합산되고 히트는 하나만 남는다.
+    #[test]
+    fn a_document_in_both_lists_appears_once_with_summed_score() {
+        let out = fuse_rrf(
+            vec![hit("kmd://c/x.md")],
+            vec![hit("kmd://c/x.md")],
+            5,
+            60.0,
+        );
+        assert_eq!(out.len(), 1, "no duplicate entry for the same file");
+        let expected = 2.0 / 61.0;
+        assert!(
+            (out[0].score - expected).abs() < 1e-6,
+            "score {} is not the sum of both contributions ({})",
+            out[0].score,
+            expected
+        );
+    }
 }
 
 pub fn embedding_counts(store: &Store) -> Result<(i64, i64)> {
@@ -341,8 +672,11 @@ pub fn embedding_counts(store: &Store) -> Result<(i64, i64)> {
     let vectors: i64 = store
         .conn
         .query_row("SELECT COUNT(*) FROM embeddings", [], |r| r.get(0))?;
+    // `abspath IS NULL`은 embed_pending의 대상 조건과 같아야 한다. 없으면 임베딩
+    // 대상이 아닌 project 축 코드 36만 건이 "pending"으로 보고된다.
     let pending: i64 = store.conn.query_row(
         "SELECT COUNT(*) FROM documents d WHERE d.active = 1
+           AND d.abspath IS NULL
            AND NOT EXISTS (SELECT 1 FROM embeddings e WHERE e.doc_id = d.id)",
         [],
         |r| r.get(0),

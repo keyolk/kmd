@@ -4,7 +4,7 @@ use crate::config::IndexConfig;
 use crate::store::Store;
 use crate::tokenize;
 use anyhow::Result;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::path::Path;
 use tantivy::collector::TopDocs;
 use tantivy::query::{BooleanQuery, Occur, Query, QueryParser, TermQuery};
@@ -14,16 +14,24 @@ use tantivy::schema::{
 };
 use tantivy::{Index, IndexWriter, TantivyDocument, Term, doc};
 
-#[derive(Debug, Serialize)]
+// Deserialize도 구현한다: MCP 서버가 데몬 응답을 되읽는다. 생략 필드
+// (`skip_serializing_if`)는 역직렬화 시 기본값이 필요하므로 Default를 붙인다.
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub struct SearchHit {
     pub docid: String,
     pub score: f32,
     /// kmd URI: kmd://collection/relpath
     pub file: String,
+    /// 읽을 수 있는 절대경로. `file`은 컬렉션 상대 URI라, 그것만으로 파일을
+    /// 열려면 호출자가 index.yml에서 컬렉션 `path`를 찾아 조인해야 한다.
+    /// 검색은 이미 그 경로를 알고 있으므로(본문 미저장 문서는 스니펫을 거기서
+    /// 읽는다) 그냥 실어 보낸다 — 에이전트가 히트를 바로 Read할 수 있다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub abspath: Option<String>,
     pub title: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub snippet: Option<String>,
 }
 
@@ -139,7 +147,7 @@ pub fn search(
 /// `kmd global`이 한 축(여러 컬렉션)을 한 번에 질의하려고 쓴다.
 pub fn search_in(
     dir: &Path,
-    _cfg: &IndexConfig,
+    cfg: &IndexConfig,
     query: &str,
     limit: usize,
     collections: Option<&[&str]>,
@@ -219,10 +227,14 @@ pub fn search_in(
             let c = get_str(f.context);
             if c.is_empty() { None } else { Some(c) }
         };
+        let relpath = get_str(f.relpath);
         hits.push(SearchHit {
             docid: format!("#{:06x}", doc_id),
             score,
-            file: format!("kmd://{}/{}", coll, get_str(f.relpath)),
+            file: format!("kmd://{}/{}", coll, relpath),
+            // 본문 미저장 문서는 인덱스가 절대경로를 들고 있다. 본문 저장
+            // 문서는 컬렉션 루트 + relpath로 만든다.
+            abspath: resolve_abspath(cfg, &abspath, &coll, &relpath),
             title: get_str(f.title),
             context,
             snippet: Some(make_snippet(&body, query, 300)),
@@ -232,6 +244,24 @@ pub fn search_in(
         }
     }
     Ok(hits)
+}
+
+/// 히트의 읽을 수 있는 절대경로.
+///
+/// 인덱스에 abspath가 있으면(본문 미저장 컬렉션) 그것이 진실이다. 없으면
+/// 컬렉션 루트에 relpath를 붙인다. 설정에 없는 컬렉션(이름이 바뀐 뒤 남은
+/// 인덱스)이면 None — 추측한 경로를 주는 것보다 없다고 말하는 편이 낫다.
+pub(crate) fn resolve_abspath(
+    cfg: &IndexConfig,
+    indexed: &str,
+    collection: &str,
+    relpath: &str,
+) -> Option<String> {
+    if !indexed.is_empty() {
+        return Some(indexed.to_string());
+    }
+    let root = &cfg.collections.get(collection)?.path;
+    Some(root.join(relpath).to_string_lossy().into_owned())
 }
 
 /// 쿼리 토큰이 처음 등장하는 주변 ±window 문자를 스니펫으로.
@@ -420,6 +450,98 @@ mod tests {
         assert!(
             hits[0].snippet.as_deref().unwrap().contains("uniquetoken"),
             "snippet is read back from the original file"
+        );
+    }
+
+    /// 히트는 읽을 수 있는 절대경로를 들고 온다.
+    ///
+    /// 두 경로가 서로 다르게 유도되므로 둘 다 검증한다: 본문 미저장 문서는
+    /// 인덱스에 박힌 abspath를 그대로 쓰고, 본문 저장 문서는 설정의 컬렉션
+    /// 루트에 relpath를 붙인다. 한쪽만 테스트하면 다른 쪽이 조용히 None을
+    /// 반환해도 통과한다 — abspath는 Option이라 빠져도 타입이 막아주지 않는다.
+    #[test]
+    fn hits_carry_a_readable_abspath() {
+        let src = TmpDir::new("src-abs");
+        let store_dir = TmpDir::new("store-abs2");
+        let index_dir = TmpDir::new("index-abs2");
+
+        let on_disk = src.path().join("code.go");
+        std::fs::write(&on_disk, "package main\n// findme lives here\n").unwrap();
+
+        let mut store = Store::open(&store_dir.path().join("s.sqlite")).unwrap();
+        // 본문 미저장 — abspath가 인덱스에 있다.
+        store
+            .upsert_doc(
+                "project",
+                "code.go",
+                "code.go",
+                "",
+                None,
+                0,
+                0,
+                "h1",
+                Some(on_disk.to_str().unwrap()),
+            )
+            .unwrap();
+        // 본문 저장 — abspath는 컬렉션 루트에서 유도해야 한다.
+        store
+            .upsert_doc(
+                "notes",
+                "n.md",
+                "n.md",
+                "findme in a note",
+                None,
+                0,
+                0,
+                "h2",
+                None,
+            )
+            .unwrap();
+        index_dirty(index_dir.path(), &mut store).unwrap();
+
+        let cfg: IndexConfig = serde_yaml::from_str(&format!(
+            "collections:\n  notes:\n    path: {}\n",
+            src.path().display()
+        ))
+        .unwrap();
+        let hits = search_in(index_dir.path(), &cfg, "findme", 5, None).unwrap();
+        assert_eq!(hits.len(), 2, "both documents match");
+
+        let project = hits.iter().find(|h| h.file.contains("project")).unwrap();
+        assert_eq!(
+            project.abspath.as_deref(),
+            on_disk.to_str(),
+            "a body-less doc reports the abspath the index already holds"
+        );
+
+        let note = hits.iter().find(|h| h.file.contains("notes")).unwrap();
+        assert_eq!(
+            note.abspath.as_deref(),
+            src.path().join("n.md").to_str(),
+            "a stored-body doc reports collection root + relpath"
+        );
+    }
+
+    /// 설정에 없는 컬렉션은 경로를 추측하지 않는다.
+    ///
+    /// 컬렉션 이름이 바뀌었거나 index.yml에서 빠진 뒤 남은 인덱스가 이 경우다.
+    /// 존재하지 않는 경로를 그럴듯하게 돌려주면 호출자가 Read에 실패하는 이유를
+    /// 알 수 없으므로, 모른다고 말한다.
+    #[test]
+    fn unknown_collection_yields_no_abspath() {
+        let store_dir = TmpDir::new("store-abs3");
+        let index_dir = TmpDir::new("index-abs3");
+        let mut store = Store::open(&store_dir.path().join("s.sqlite")).unwrap();
+        store
+            .upsert_doc("orphan", "n.md", "n.md", "findme", None, 0, 0, "h", None)
+            .unwrap();
+        index_dirty(index_dir.path(), &mut store).unwrap();
+
+        let hits = search_in(index_dir.path(), &empty_cfg(), "findme", 5, None).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert!(
+            hits[0].abspath.is_none(),
+            "a collection absent from the config reports no path, not a guessed one"
         );
     }
 

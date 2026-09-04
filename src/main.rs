@@ -15,6 +15,7 @@ mod hook_config;
 mod journal;
 mod learnings;
 mod locality;
+mod mcp;
 mod output;
 mod pageindex;
 mod palette;
@@ -114,6 +115,9 @@ enum Command {
         /// Max documents to embed this run
         #[arg(short = 'n', long)]
         limit: Option<usize>,
+        /// Only embed these collections (repeatable). Default: all body-storing collections.
+        #[arg(long)]
+        collection: Vec<String>,
     },
     /// Semantic vector search (requires 'embed' feature)
     Vsearch {
@@ -131,6 +135,8 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Serve MCP over stdio (for clients that cannot use hooks or skills)
+    Mcp,
     /// Run the warm daemon (unix socket server)
     Daemon {
         /// Write launchd plist and print load instructions
@@ -165,6 +171,12 @@ enum Command {
         /// known-item: only evaluate Korean-derived queries
         #[arg(long)]
         hangul: bool,
+        /// Search engine to evaluate (default: bm25)
+        #[arg(long, value_enum)]
+        engine: Option<eval::Engine>,
+        /// Evaluate bm25, vector, and hybrid side by side
+        #[arg(long)]
+        compare: bool,
         /// JSON output
         #[arg(long)]
         json: bool,
@@ -311,9 +323,10 @@ fn main() -> Result<()> {
                 sim::tui()
             }
         }
-        Command::Embed { limit } => cmd_embed(limit),
+        Command::Embed { limit, collection } => cmd_embed(limit, &collection),
         Command::Vsearch { query, limit, json } => cmd_vsearch(&query, limit, json),
         Command::Query { query, limit, json } => cmd_query(&query, limit, json),
+        Command::Mcp => mcp::serve(),
         Command::Daemon { install } => {
             if install {
                 daemon::install_launchd()
@@ -329,10 +342,12 @@ fn main() -> Result<()> {
             sample,
             k,
             hangul,
+            engine,
+            compare,
             json,
         } => {
             if let Some(path) = gold {
-                eval::gold(&path, k, json)
+                eval::gold(&path, k, engine, compare, json)
             } else {
                 let colls = if collection.is_empty() {
                     rag::CLAUDE_COLLECTIONS
@@ -342,7 +357,7 @@ fn main() -> Result<()> {
                 } else {
                     collection
                 };
-                eval::known_item(colls, sample, k, hangul, json)
+                eval::known_item(colls, sample, k, hangul, engine, compare, json)
             }
         }
         Command::Util { hours, json } => util::print_utilization(hours.map(|h| h * 3600), json),
@@ -486,9 +501,9 @@ fn cmd_status() -> Result<()> {
 }
 
 #[cfg(feature = "embed")]
-fn cmd_embed(limit: Option<usize>) -> Result<()> {
+fn cmd_embed(limit: Option<usize>, collections: &[String]) -> Result<()> {
     let mut store = store::Store::open(&config::store_path())?;
-    let n = embed::embed_pending(&mut store, limit)?;
+    let n = embed::embed_pending(&mut store, limit, collections)?;
     let (vectors, pending) = embed::embedding_counts(&store)?;
     eprintln!(
         "embedded {} docs — {} chunks total, {} docs pending",
@@ -523,7 +538,7 @@ fn cmd_query(query: &str, limit: usize, json: bool) -> Result<()> {
 }
 
 #[cfg(not(feature = "embed"))]
-fn cmd_embed(_limit: Option<usize>) -> Result<()> {
+fn cmd_embed(_limit: Option<usize>, _collections: &[String]) -> Result<()> {
     anyhow::bail!(
         "built without 'embed' feature — rebuild with: cargo build --release --features embed"
     )

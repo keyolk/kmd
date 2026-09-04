@@ -10,7 +10,7 @@
 use crate::bm25::{self, SearchHit};
 use crate::config::IndexConfig;
 use anyhow::Result;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 pub const KNOWLEDGE: &str = "knowledge";
@@ -20,7 +20,8 @@ pub const PROJECT: &str = "project";
 /// 표시 순서 — 좁은 것부터 넓은 것으로.
 pub const AXES: &[&str] = &[SESSION, KNOWLEDGE, PROJECT];
 
-#[derive(Debug, Serialize)]
+// Deserialize도 구현한다: MCP 서버가 데몬 응답(같은 타입의 JSON)을 되읽는다.
+#[derive(Debug, Serialize, Deserialize)]
 pub struct AxisResults {
     pub axis: String,
     pub hits: Vec<SearchHit>,
