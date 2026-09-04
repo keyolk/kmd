@@ -10,8 +10,37 @@ use std::io::Read;
 use std::path::PathBuf;
 use std::time::Instant;
 
+/// 프롬프트 최소 길이 — 영어 기준.
 pub const MIN_PROMPT_LENGTH: usize = 20;
-pub const MAX_RESULTS: usize = 3;
+
+/// 한글 프롬프트의 최소 길이.
+///
+/// 같은 내용을 한국어는 영어보다 짧게 쓴다. 20자 기준은 실제 질문을 막았다:
+/// "노드가 안 뜨는데 어디를 봐야 하지"(19자), "메모리 사용량 그래프를 어디서
+/// 뽑지"(19자), "테라폼 레포가 어떻게 나뉘어 있지"(18자) — 완결된 질문인데
+/// too_short로 차단된다. 대응하는 영어 질문은 36~50자다.
+///
+/// 실측: `too_short`로 차단된 한국어 프롬프트 1,599건 중 303건(고유)이
+/// 15~19자 구간이고, 그중 88건이 질문형이다. 나머지는 짧은 작업 지시와
+/// 이미지 참조로 검색 가치가 낮지만, 키워드 추출 후 5자 미만을 거르는
+/// `query_too_short` 2차 게이트가 그것들을 다시 막는다 — 1차를 낮춰도
+/// 무의미한 검색이 그대로 통과하지는 않는다.
+pub const MIN_PROMPT_LENGTH_HANGUL: usize = 15;
+
+/// 훅이 주입하는 히트 수의 기본값.
+///
+/// `KMD_MAX_RESULTS`로 덮을 수 있다. 이 값이 정답률의 상한을 정한다 —
+/// 컬렉션 가중은 이 창 안에서 순서만 바꾸므로, 정답이 창 밖이면 어떤 가중도
+/// 끌어올 수 없다. 그래서 창 크기가 가중보다 먼저 재야 할 파라미터다.
+const DEFAULT_MAX_RESULTS: usize = 3;
+
+pub fn max_results() -> usize {
+    std::env::var("KMD_MAX_RESULTS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|n| *n >= 1)
+        .unwrap_or(DEFAULT_MAX_RESULTS)
+}
 const SKIP_PREFIXES: &[&str] = &["/", "yes", "no", "ok", "sure", "thanks", "thank"];
 
 /// 주입 대상 컬렉션. memory/rules는 CLAUDE.md로 상시 로드되므로 제외 대상 후보지만
@@ -103,16 +132,35 @@ pub fn extract_keywords(prompt: &str) -> String {
         .to_lowercase()
         .split_whitespace()
         .map(|w| w.trim_matches(strip))
-        .filter(|w| !STOP_WORDS.contains(w) && w.chars().count() > 2)
+        .filter(|w| !STOP_WORDS.contains(w) && is_meaningful_token(w))
         .take(12)
         .collect::<Vec<_>>()
         .join(" ")
 }
 
+/// 토큰이 검색어로 쓸 만한 길이인가.
+///
+/// 영어는 3글자 미만을 버린다(관사·전치사 제거가 목적이다). 한글에는 그 기준을
+/// 쓸 수 없다 — 한국어 내용어는 대개 2글자다. "버그 찾기 전에 먼저 확인해야 할
+/// 게 있었는데"가 `> 2` 필터를 지나면 **"확인해야 있었는데"**만 남고 "버그"와
+/// "찾기"가 사라진다. 정작 문서를 특정하는 단어가 버려지는 것이다.
+///
+/// 한글 토큰은 2글자부터 살린다. 1글자는 조사·의존명사("안", "할", "게")여서
+/// 버리는 편이 맞고, tantivy 쪽 lindera 형태소 분석이 조사를 어차피 분리한다.
+fn is_meaningful_token(w: &str) -> bool {
+    let n = w.chars().count();
+    if has_hangul(w) { n >= 2 } else { n > 2 }
+}
+
 /// 게이팅. 통과하면 검색 쿼리를 반환.
 pub fn gate(prompt: &str) -> std::result::Result<String, &'static str> {
     let p = prompt.trim();
-    if p.chars().count() < MIN_PROMPT_LENGTH {
+    let min_len = if has_hangul(p) {
+        MIN_PROMPT_LENGTH_HANGUL
+    } else {
+        MIN_PROMPT_LENGTH
+    };
+    if p.chars().count() < min_len {
         return Err("too_short");
     }
     // 사람이 실제로 물은 게 아닌 구조적 노이즈는 검색하지 않는다.
@@ -316,7 +364,7 @@ pub fn filter_hits(hits: Vec<SearchHit>) -> Vec<SearchHit> {
         let wb = b.score * collection_weight(collection_of(&b.file));
         wb.partial_cmp(&wa).unwrap_or(std::cmp::Ordering::Equal)
     });
-    kept.truncate(MAX_RESULTS);
+    kept.truncate(max_results());
     kept
 }
 
@@ -619,6 +667,49 @@ mod tests {
             gate("https://github.com/sendbird/ops-k8s/pull/7357 이 코멘트가 왜 반복되는지 봐줘")
                 .is_ok()
         );
+    }
+
+    /// 한글 프롬프트는 영어보다 짧은 임계값을 쓴다.
+    ///
+    /// 20자 기준이 실제 질문을 막았다. 회귀하면 이 케이스들이 다시 차단되고,
+    /// 훅은 조용히 아무것도 주입하지 않는다 — 에러가 아니라 침묵이라 눈에
+    /// 띄지 않는다.
+    #[test]
+    fn the_hangul_gate_admits_short_but_complete_questions() {
+        for q in [
+            "노드가 안 뜨는데 어디를 봐야 하지",     // 19자
+            "메모리 사용량 그래프를 어디서 뽑지",     // 19자
+            "테라폼 레포가 어떻게 나뉘어 있지",       // 18자
+        ] {
+            assert!(
+                gate(q).is_ok(),
+                "{} ({}자) should pass the Hangul gate",
+                q,
+                q.chars().count()
+            );
+        }
+        // 영어는 그대로 20자 기준 — 짧은 영어는 대개 응답이지 질문이 아니다.
+        assert_eq!(gate("what about it").unwrap_err(), "too_short");
+        // 한글이라도 15자 미만은 막힌다.
+        assert_eq!(gate("이거 왜 안돼").unwrap_err(), "too_short");
+    }
+
+    /// 키워드 추출이 한국어 2글자 내용어를 버리지 않는다.
+    ///
+    /// `chars().count() > 2`는 영어 관사·전치사를 겨냥한 조건인데, 한국어
+    /// 내용어는 대개 2글자여서 정작 문서를 특정하는 단어가 사라졌다.
+    #[test]
+    fn keyword_extraction_keeps_two_character_hangul_words() {
+        let q = extract_keywords("버그 찾기 전에 먼저 확인해야 할 게 있었는데");
+        assert!(q.contains("버그"), "핵심 명사가 살아야 한다: {}", q);
+        assert!(q.contains("찾기"), "핵심 명사가 살아야 한다: {}", q);
+        // 1글자는 조사·의존명사이므로 계속 버린다.
+        assert!(!q.split_whitespace().any(|w| w == "할"), "{}", q);
+        assert!(!q.split_whitespace().any(|w| w == "게"), "{}", q);
+        // 영어 2글자는 여전히 버린다.
+        let en = extract_keywords("go to the node and check it");
+        assert!(!en.split_whitespace().any(|w| w == "go"), "{}", en);
+        assert!(en.contains("node"), "{}", en);
     }
 
     fn hit(file: &str, score: f32) -> SearchHit {
