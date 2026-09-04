@@ -224,12 +224,30 @@ pub fn embed_pending(
     let mut done = 0usize;
     for (id, title, body) in docs.into_iter().take(todo) {
         let chunks = chunk_body(&body);
-        let tx = store.conn.unchecked_transaction()?;
-        for (idx, text) in &chunks {
-            let v = embedder.embed_with(&mut ctx, &doc_prompt(&title, text))?;
+
+        // 임베딩은 트랜잭션 **밖에서** 계산한다. 문서당 수백 ms가 걸리는 GPU
+        // 연산이라, 트랜잭션 안에서 돌리면 그 시간 내내 쓰기 락을 물고 있게 되고
+        // 데몬의 주기적 embed 사이클이나 다른 kmd 프로세스가 그 락에 걸린다.
+        let vectors: Vec<(i64, &str, Vec<f32>)> = chunks
+            .iter()
+            .map(|(idx, text)| {
+                embedder
+                    .embed_with(&mut ctx, &doc_prompt(&title, text))
+                    .map(|v| (*idx as i64, text.as_str(), v))
+            })
+            .collect::<Result<_>>()?;
+
+        // IMMEDIATE로 시작한다. DEFERRED(=`unchecked_transaction`의 기본)는 읽기로
+        // 시작해 쓰기로 승격하는데, SQLite는 그 승격에서만 `busy_timeout`을
+        // 무시하고 즉시 SQLITE_BUSY를 반환한다(데드락 회피). 30초 타임아웃을
+        // 걸어 두고도 동시 실행이 "database is locked"로 즉사한 실제 원인이다.
+        let tx = store
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        for (idx, text, v) in &vectors {
             tx.execute(
                 "INSERT OR REPLACE INTO embeddings (doc_id, chunk_idx, chunk_text, vector) VALUES (?1,?2,?3,?4)",
-                params![id, *idx as i64, text, vec_to_blob(&v)],
+                params![id, idx, text, vec_to_blob(v)],
             )?;
         }
         tx.commit()?;
@@ -274,7 +292,7 @@ pub fn vsearch_in(
 
     let mut sql = String::from(
         "SELECT e.doc_id, e.chunk_idx, e.chunk_text, e.vector,
-                d.collection, d.relpath, d.title, d.context
+                d.collection, d.relpath, d.title, d.context, d.abspath
          FROM embeddings e JOIN documents d ON d.id = e.doc_id
          WHERE d.active = 1",
     );
@@ -298,22 +316,31 @@ pub fn vsearch_in(
             r.get::<_, String>(5)?,
             r.get::<_, String>(6)?,
             r.get::<_, Option<String>>(7)?,
+            r.get::<_, Option<String>>(8)?,
         ))
     })?;
 
     // 문서별 최고 청크 점수만 유지
     use std::collections::HashMap;
-    let mut best: HashMap<i64, (f32, String, String, String, String, Option<String>)> =
-        HashMap::new();
+    type Best = (f32, String, String, String, String, Option<String>, Option<String>);
+    let mut best: HashMap<i64, Best> = HashMap::new();
     for row in rows {
-        let (doc_id, _idx, text, blob, coll, relpath, title, context) = row?;
+        let (doc_id, _idx, text, blob, coll, relpath, title, context, abspath) = row?;
         let v = blob_to_vec(&blob);
         let score: f32 = qv.iter().zip(v.iter()).map(|(a, b)| a * b).sum();
         let entry = best.entry(doc_id).or_insert_with(|| {
-            (f32::MIN, String::new(), coll.clone(), relpath.clone(), title.clone(), context.clone())
+            (
+                f32::MIN,
+                String::new(),
+                coll.clone(),
+                relpath.clone(),
+                title.clone(),
+                context.clone(),
+                abspath.clone(),
+            )
         });
         if score > entry.0 {
-            *entry = (score, text, coll, relpath, title, context);
+            *entry = (score, text, coll, relpath, title, context, abspath);
         }
     }
 
@@ -321,16 +348,25 @@ pub fn vsearch_in(
     scored.sort_by(|a, b| b.1.0.partial_cmp(&a.1.0).unwrap_or(std::cmp::Ordering::Equal));
     scored.truncate(limit);
 
+    let cfg = config::load()?;
     Ok(scored
         .into_iter()
-        .map(|(doc_id, (score, text, coll, relpath, title, context))| SearchHit {
-            docid: format!("#{:06x}", doc_id),
-            score,
-            file: format!("kmd://{}/{}", coll, relpath),
-            title,
-            context,
-            snippet: Some(text.chars().take(300).collect()),
-        })
+        .map(
+            |(doc_id, (score, text, coll, relpath, title, context, abspath))| SearchHit {
+                docid: format!("#{:06x}", doc_id),
+                score,
+                file: format!("kmd://{}/{}", coll, relpath),
+                abspath: crate::bm25::resolve_abspath(
+                    &cfg,
+                    abspath.as_deref().unwrap_or(""),
+                    &coll,
+                    &relpath,
+                ),
+                title,
+                context,
+                snippet: Some(text.chars().take(300).collect()),
+            },
+        )
         .collect())
 }
 

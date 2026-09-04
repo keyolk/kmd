@@ -517,6 +517,7 @@ mod tests {
             docid: "#0".into(),
             score,
             file: file.into(),
+            abspath: None,
             title: String::new(),
             context: None,
             snippet: Some("x".into()),
