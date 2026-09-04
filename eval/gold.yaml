@@ -135,3 +135,115 @@
 - prompt: "what breaks when an effect fights a user click"
   expect_any:
     - "svelte"
+
+# ── 패러프레이즈 2차 확장 (2026-09-04) ──────────────────────
+#
+# 25케이스에서는 vector 39% 대 hybrid 33%의 차이가 노이즈와 구분되지 않았다
+# (한국어 18건 기준 1~2건 차이). 훅의 엔진을 바꿀지 정하려면 표본이 더 필요해
+# 확장했다.
+#
+# 규칙은 위와 같다: 각 문서의 **고유한** 주제를 골라, 문서에 없는 어휘로 묻는다.
+# 두 문서가 함께 정답일 수 있는 질문은 넣지 않는다 — 어느 쪽이 와도 통과하면
+# 엔진의 분별력을 재지 못한다.
+
+- prompt: "쿼리가 자꾸 시간 초과되는데 어떻게 줄이지"
+  expect_any:
+    - "o11y"
+
+- prompt: "리턴값을 밑줄로 버리는 코드가 왜 문제인가"
+  expect_any:
+    - "debugging"
+
+- prompt: "비밀값은 어느 경로로 워크로드까지 전달되나"
+  expect_any:
+    - "security"
+
+- prompt: "테스트가 내 노트북에서만 깨지는 이유"
+  expect_any:
+    - "testing"
+
+- prompt: "파일이 몇 줄을 넘으면 쪼개야 하나"
+  expect_any:
+    - "coding-style"
+
+- prompt: "지금 이 프로젝트에서 얼마나 조심해야 하는지"
+  expect_any:
+    - "phase"
+
+- prompt: "와일드카드 인증서에 빠진 이름 때문에 핸드셰이크가 깨진다"
+  expect_any:
+    - "tls-certs"
+
+- prompt: "노드를 직접 만들지 않고 자동으로 붙게 하는 게 뭐였지"
+  expect_any:
+    - "k8s"
+
+- prompt: "두 스택의 계정이 섞이지 않게 하는 규칙"
+  expect_any:
+    - "accounts"
+    - "CLAUDE"
+
+- prompt: "테스트 먼저 쓰고 통과시키는 흐름"
+  expect_any:
+    - "code"
+
+- prompt: "그라파나에 물어보려면 어떤 도구를 쓰나"
+  expect_any:
+    - "mcp"
+    - "o11y"
+
+- prompt: "포맷 명령이 파일을 건드려서 계획이 더러워진다"
+  expect_any:
+    - "terraform-fmt"
+
+- prompt: "지역 하나를 완전히 걷어내는 순서"
+  expect_any:
+    - "region-shutdown"
+
+- prompt: "리뷰 요청을 팀 채널에 올리는 절차"
+  expect_any:
+    - "slack-review"
+    - "slack"
+
+- prompt: "티켓 번호를 앞에 붙여서 변경을 올리려면"
+  expect_any:
+    - "infra-pr"
+    - "jira"
+
+- prompt: "사람이 읽을 수 있게 문서를 배치하는 원칙"
+  expect_any:
+    - "doc:human"
+    - "human"
+
+- prompt: "예전에 뭘 했었는지 다시 불러오려면"
+  expect_any:
+    - "recall"
+    - "kmd"
+
+- prompt: "터미널 화면을 설계할 때 참고할 것"
+  expect_any:
+    - "tui"
+
+- prompt: "why does gofmt rewriting files break the plan"
+  expect_any:
+    - "terraform-fmt"
+
+- prompt: "how do secrets reach a running workload here"
+  expect_any:
+    - "security"
+
+- prompt: "a test that only fails on my machine"
+  expect_any:
+    - "testing"
+
+- prompt: "how large should one source file get"
+  expect_any:
+    - "coding-style"
+
+- prompt: "tearing down an entire region end to end"
+  expect_any:
+    - "region-shutdown"
+
+- prompt: "cutting down a query that keeps timing out"
+  expect_any:
+    - "o11y"

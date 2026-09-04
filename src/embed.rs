@@ -317,12 +317,24 @@ pub fn vsearch_in(
     collections: Option<&[&str]>,
 ) -> Result<Vec<SearchHit>> {
     ensure_schema(store)?;
+    // KMD_VSEARCH_TIMING=1이면 단계별 시간을 stderr에 낸다. 훅 지연을 줄이려면
+    // 모델 로드와 브루트포스 스캔 중 어느 쪽이 지배적인지 알아야 하고, 둘은
+    // 대응이 완전히 다르다(데몬 상주 대 인덱스 구조 변경).
+    let timing = std::env::var("KMD_VSEARCH_TIMING").is_ok();
+    let t0 = std::time::Instant::now();
     let embedder = Embedder::load()?;
     let qv = embedder.embed(&query_prompt(query))?;
+    let t_model = t0.elapsed();
 
+    // 스코어링 패스는 doc_id, chunk_idx, vector만 읽는다.
+    //
+    // 코사인 점수에 필요한 것은 벡터뿐이고, chunk_text와 문서 메타는 top-k가
+    // 정해진 뒤 그 몇 건에만 필요하다. 그런데 이 쿼리는 매번 임베딩 테이블
+    // 전체를 훑으므로(브루트포스), 함께 select하면 그 바이트를 전부 읽는다 —
+    // 실측 이 코퍼스에서 vector 866MB 대 chunk_text 488MB로, 텍스트를 빼면
+    // 읽는 양이 36% 줄어든다. 페이지 캐시가 식은 콜드 경로에서 이 차이가 크다.
     let mut sql = String::from(
-        "SELECT e.doc_id, e.chunk_idx, e.chunk_text, e.vector,
-                d.collection, d.relpath, d.title, d.context, d.abspath
+        "SELECT e.doc_id, e.chunk_idx, e.vector
          FROM embeddings e JOIN documents d ON d.id = e.doc_id
          WHERE d.active = 1",
     );
@@ -340,40 +352,25 @@ pub fn vsearch_in(
         Ok((
             r.get::<_, i64>(0)?,
             r.get::<_, i64>(1)?,
-            r.get::<_, String>(2)?,
-            r.get::<_, Vec<u8>>(3)?,
-            r.get::<_, String>(4)?,
-            r.get::<_, String>(5)?,
-            r.get::<_, String>(6)?,
-            r.get::<_, Option<String>>(7)?,
-            r.get::<_, Option<String>>(8)?,
+            r.get::<_, Vec<u8>>(2)?,
         ))
     })?;
 
-    // 문서별 최고 청크 점수만 유지
+    // 문서별 최고 청크 점수와 그 청크 번호만 유지. 청크 번호를 들고 가는 이유는
+    // 스니펫을 뒤에서 그 청크로 되찾아야 하기 때문이다.
     use std::collections::HashMap;
-    type Best = (f32, String, String, String, String, Option<String>, Option<String>);
-    let mut best: HashMap<i64, Best> = HashMap::new();
+    let mut best: HashMap<i64, (f32, i64)> = HashMap::new();
     for row in rows {
-        let (doc_id, _idx, text, blob, coll, relpath, title, context, abspath) = row?;
+        let (doc_id, idx, blob) = row?;
         let v = blob_to_vec(&blob);
         let score: f32 = qv.iter().zip(v.iter()).map(|(a, b)| a * b).sum();
-        let entry = best.entry(doc_id).or_insert_with(|| {
-            (
-                f32::MIN,
-                String::new(),
-                coll.clone(),
-                relpath.clone(),
-                title.clone(),
-                context.clone(),
-                abspath.clone(),
-            )
-        });
+        let entry = best.entry(doc_id).or_insert((f32::MIN, 0));
         if score > entry.0 {
-            *entry = (score, text, coll, relpath, title, context, abspath);
+            *entry = (score, idx);
         }
     }
 
+    let t_scan = t0.elapsed() - t_model;
     let mut scored: Vec<_> = best.into_iter().collect();
     // 코사인 점수 내림차순, 동점은 doc_id로 결정적으로 깬다. `best`가 HashMap이고
     // `sort_by`가 안정 정렬이라, 타이브레이크가 없으면 같은 점수 문서의 순서가
@@ -387,26 +384,53 @@ pub fn vsearch_in(
     });
     scored.truncate(limit);
 
+    // top-k가 정해진 뒤에야 그 몇 건의 텍스트와 메타를 읽는다.
     let cfg = config::load()?;
-    Ok(scored
-        .into_iter()
-        .map(
-            |(doc_id, (score, text, coll, relpath, title, context, abspath))| SearchHit {
-                docid: format!("#{:06x}", doc_id),
-                score,
-                file: format!("kmd://{}/{}", coll, relpath),
-                abspath: crate::bm25::resolve_abspath(
-                    &cfg,
-                    abspath.as_deref().unwrap_or(""),
-                    &coll,
-                    &relpath,
-                ),
-                title,
-                context,
-                snippet: Some(text.chars().take(300).collect()),
-            },
-        )
-        .collect())
+    let mut detail = store.conn.prepare(
+        "SELECT e.chunk_text, d.collection, d.relpath, d.title, d.context, d.abspath
+         FROM embeddings e JOIN documents d ON d.id = e.doc_id
+         WHERE e.doc_id = ?1 AND e.chunk_idx = ?2",
+    )?;
+    let mut out = Vec::with_capacity(scored.len());
+    for (doc_id, (score, chunk_idx)) in scored {
+        let row = detail.query_row(params![doc_id, chunk_idx], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, Option<String>>(4)?,
+                r.get::<_, Option<String>>(5)?,
+            ))
+        });
+        // 스코어링과 이 조회 사이에 문서가 지워졌으면(동시 update) 그 히트는 버린다.
+        let Ok((text, coll, relpath, title, context, abspath)) = row else {
+            continue;
+        };
+        out.push(SearchHit {
+            docid: format!("#{:06x}", doc_id),
+            score,
+            file: format!("kmd://{}/{}", coll, relpath),
+            abspath: crate::bm25::resolve_abspath(
+                &cfg,
+                abspath.as_deref().unwrap_or(""),
+                &coll,
+                &relpath,
+            ),
+            title,
+            context,
+            snippet: Some(text.chars().take(300).collect()),
+        });
+    }
+    if timing {
+        eprintln!(
+            "vsearch timing: model+query-embed {:?}, brute-force scan {:?}, detail {:?}",
+            t_model,
+            t_scan,
+            t0.elapsed() - t_model - t_scan
+        );
+    }
+    Ok(out)
 }
 
 /// hybrid: BM25 + 벡터를 RRF(reciprocal rank fusion)로 융합.
