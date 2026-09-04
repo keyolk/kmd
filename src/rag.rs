@@ -466,7 +466,29 @@ pub struct RagOutcome {
 }
 
 /// 프롬프트 하나에 대해 전체 파이프라인 실행 (로깅 없이).
+///
+/// 상주 임베더가 없으면 이 자리에서 로드한다. 데몬은 `run_pipeline_with`로
+/// 자기 임베더를 넘기므로 이 경로를 타지 않는다.
+///
+/// 예전에는 `None`을 넘겨 무조건 BM25로 내려갔다. 그래서 CLI `kmd rag`와
+/// `kmd eval --engine pipeline`이 hybrid를 **한 번도 실행하지 않았고**, 그
+/// 상태로 잰 수치를 파이프라인 성능으로 보고했다. 실측으로 드러난 증거:
+/// `kmd query`는 "터미널 화면을 설계할 때 참고할 것"에 `tui-design`을 1위로
+/// 내는데 `kmd rag`는 세션 파일만 냈다.
 pub fn run_pipeline(prompt: &str) -> Result<RagOutcome> {
+    #[cfg(feature = "embed")]
+    {
+        // 게이트에 걸릴 프롬프트에 모델(220~420ms)을 로드하지 않는다.
+        if gate(prompt).is_err() {
+            return run_pipeline_with(prompt, None);
+        }
+        match crate::embed::Embedder::load() {
+            Ok(e) => run_pipeline_with(prompt, Some(&e)),
+            // 모델이 없는 설치는 정상 케이스다 — BM25로 내려간다.
+            Err(_) => run_pipeline_with(prompt, None),
+        }
+    }
+    #[cfg(not(feature = "embed"))]
     run_pipeline_with(prompt, None)
 }
 
@@ -731,6 +753,31 @@ mod tests {
         let en = extract_keywords("go to the node and check it");
         assert!(!en.split_whitespace().any(|w| w == "go"), "{}", en);
         assert!(en.contains("node"), "{}", en);
+    }
+
+    /// `run_pipeline`은 임베딩을 쓸 수 있으면 반드시 쓴다.
+    ///
+    /// 이전 구현은 `run_pipeline_with(prompt, None)` 한 줄이어서 CLI와 eval이
+    /// hybrid를 한 번도 실행하지 않았다. 컴파일은 되고 검색도 되며 에러도
+    /// 없다 — BM25 결과가 그냥 나온다. 그래서 그 상태로 잰 수치를 파이프라인
+    /// 성능으로 보고했다.
+    ///
+    /// 실제 인덱스 없이 검색 결과를 비교할 수는 없으니, 게이트에 걸리는
+    /// 프롬프트에는 모델을 로드하지 않는다는 쪽을 고정한다. 그 분기가 사라지면
+    /// 게이트로 버릴 프롬프트마다 220~420ms를 낸다.
+    #[test]
+    fn a_gated_prompt_does_not_load_the_model() {
+        // 존재하지 않는 모델을 가리켜 로드가 실패하도록 만든다. 게이트에
+        // 걸리는 프롬프트라면 로드를 시도하지 않으므로 결과가 같아야 한다.
+        let too_short = "ok";
+        let before = run_pipeline(too_short).expect("gated prompt still returns");
+        assert_eq!(before.gate_reason, Some("too_short"));
+        assert!(before.hits.is_empty());
+        assert!(
+            before.latency_ms < 200,
+            "a gated prompt must not pay the model load ({}ms)",
+            before.latency_ms
+        );
     }
 
     fn hit(file: &str, score: f32) -> SearchHit {
