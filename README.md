@@ -32,29 +32,56 @@ parse cached and search moved to hybrid, the same prompts cost **273ms**. See
 
 ## Search engine
 
-The RAG hook searches with hybrid retrieval (BM25 + vector, fused by RRF) when
-the daemon has an embedding model resident, and falls back to BM25 when it does
-not. Both the quality and the latency case are measured:
+The RAG hook searches with hybrid retrieval (BM25 + vector, fused by RRF),
+falling back to BM25 when no embedding model is available. Raw retrieval,
+measured on `eval/gold.yaml`'s 55 paraphrase cases with the eval set excluded
+from the index:
 
-| | BM25 | hybrid |
-|---|---|---|
-| gold R@5 (49 paraphrase cases) | 33% | **43%** |
-| gold R@5, Korean (36 cases) | 22% | **33%** |
-| gold MRR | 0.251 | **0.328** |
-| hook latency, median | 437ms | **273ms** |
+| | bm25 | vector | hybrid |
+|---|---|---|---|
+| R@5 | 31% | 47% | **53%** |
+| R@5, Korean | 22% | 48% | **50%** |
+| MRR | 0.226 | 0.392 | **0.401** |
 
-The quality gap comes from what real prompts look like. `eval/gold.yaml`'s
-paraphrase section asks about each document in words the document does not use
-("노드가 안 뜨는데 어디를 봐야 하지" for `k8s.md`), and BM25 cannot reach a
-document it shares no vocabulary with — narrowing the search to that one
-collection does not help. `kmd eval --compare` prints all three engines; see
-[`eval/README.md`](eval/README.md).
+End to end — does the correct document land in what the hook actually injects:
 
-Hybrid being *faster* is not intuition, it is two fixes. The model stays
-resident in the daemon (220-420ms of load per call, gone), and `filter_hits`
-caches its learning-file parse. Vector search remains linear in chunk count —
-that is the brute-force scan and no amount of process reuse changes it — so the
-hook narrows to the collections it actually injects from (82k chunks of 296k).
+| | correctness |
+|---|---|
+| before this work | 31% |
+| Korean gate + keyword fixes | 42% |
+| hybrid actually running | **55%** |
+
+Hook latency went the other way at the same time: 437ms to 273ms (median,
+measured against the live daemon on prompts that pass the gate). Three things
+did that — the daemon keeps the model resident (220-420ms of load per call,
+gone), `filter_hits` caches its learning-file parse (366ms, gone), and the
+search narrows to the collections the hook injects from (82k chunks of 296k).
+The brute-force scan itself is linear in chunk count and no amount of process
+reuse changes that.
+
+The quality gap comes from what real prompts look like. The paraphrase cases
+ask about each document in words the document does not use ("노드가 안 뜨는데
+어디를 봐야 하지" for `k8s.md`), and BM25 cannot reach a document it shares no
+vocabulary with — narrowing the search to that one collection does not help.
+`kmd eval --compare` prints all three engines, and `--engine pipeline` measures
+what the hook injects; see [`eval/README.md`](eval/README.md).
+
+### What was actually wrong
+
+Four defects, each of which degraded retrieval **without raising an error** —
+which is why they lasted:
+
+- The gate measured Korean prompts by English character counts, so complete
+  questions under 20 characters were dropped ("노드가 안 뜨는데 어디를 봐야 하지"
+  is 19). 303 unique real prompts sat in the blocked 15-19 band.
+- Keyword extraction dropped tokens under 3 characters, which in Korean are
+  content words: "버그 찾기 전에 먼저 확인해야 할 게 있었는데" became "확인해야
+  있었는데".
+- `eval/gold.yaml` was indexed, so it was the top hit for its own questions
+  (18 of 20 gold prompts). `ALWAYS_EXCLUDE` now drops eval sets regardless of
+  config.
+- `run_pipeline` passed `None` for the embedder, so hybrid ran **only** inside
+  the daemon. Every CLI and eval measurement of "the pipeline" was BM25.
 
 ## Usage
 
