@@ -1079,6 +1079,10 @@ const HELP_ROWS: &[(&str, &str)] = &[
     ("x", "Simulator: clear the query"),
     ("?", "toggle this help"),
     ("q", "quit"),
+    (
+        "Ctrl-C",
+        "quit from anywhere, including while typing a query",
+    ),
 ];
 
 fn draw_help(frame: &mut Frame, area: Rect, theme: crate::dashboard_theme::Theme) {
@@ -1201,10 +1205,32 @@ fn draw(frame: &mut Frame, app: &App) {
 }
 
 fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) -> Result<bool> {
+    // Ctrl-C quits from anywhere, ahead of the help overlay and the simulator's
+    // typing mode. It used to quit from nowhere: is_reserved_chord dropped it on
+    // the theory that the terminal would handle it, but ratatui::init puts the
+    // terminal in raw mode with no SIGINT handler, so nothing did.
+    if key
+        .modifiers
+        .contains(crossterm::event::KeyModifiers::CONTROL)
+        && matches!(key.code, KeyCode::Char('c' | 'C'))
+    {
+        return Ok(true);
+    }
+
     // Ctrl/Alt/Super chords belong to the terminal or multiplexer and must pass through.
     if crate::dashboard_simulator::is_reserved_chord(&key) {
         return Ok(false);
     }
+
+    // Under a Korean input source the shortcut keys arrive as jamo (`q` -> `ㅂ`)
+    // and do nothing until the input source is switched back. Rewrite them to
+    // the Latin key at the same physical position -- but not while the simulator
+    // is typing a query, where the jamo IS the input.
+    let key = if app.tab == SIMULATOR_TAB && app.simulator.typing() {
+        key
+    } else {
+        crate::keymap::normalize(key)
+    };
     if app.show_help {
         app.show_help = false;
         return Ok(false);
@@ -1792,5 +1818,158 @@ mod tests {
                 .iter()
                 .any(|cell| cell.symbol() == "●" && cell.fg == Color::Green)
         );
+    }
+}
+
+#[cfg(test)]
+mod key_tests {
+    use super::*;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    /// A dashboard with no data. The key handler only reads `tab`, `simulator`
+    /// and `show_help`, so an empty snapshot is enough to drive it — and it
+    /// keeps these tests off the filesystem the real loader reads.
+    fn app() -> App {
+        App {
+            tab: SESSIONS_TAB,
+            scroll: 0,
+            selected_session: 0,
+            snapshot: DashboardSnapshot {
+                generated_at: String::new(),
+                cwd: String::new(),
+                runtime: RuntimeStatus {
+                    daemon_online: false,
+                    daemon_socket: String::new(),
+                    hooks_installed: 0,
+                    hooks_total: 0,
+                    settings_path: String::new(),
+                    documents: 0,
+                    dirty_documents: 0,
+                    collections: Vec::new(),
+                },
+                activity: Vec::new(),
+                journal: crate::journal::JournalView {
+                    from: String::new(),
+                    to: String::new(),
+                    anchor: crate::locality::Space {
+                        cwd: String::new(),
+                        repo: None,
+                        repo_root: None,
+                        worktree: None,
+                        worktree_root: None,
+                    },
+                    days: Vec::new(),
+                    session_count: 0,
+                    project_count: 0,
+                },
+                rag: RagSummary {
+                    total: 0,
+                    searched: 0,
+                    injected: 0,
+                    gated: 0,
+                    injection_rate_pct: 0.0,
+                    median_latency_ms: 0,
+                    p95_latency_ms: 0,
+                    sessions: Vec::new(),
+                    recent: Vec::new(),
+                },
+                evaluations: Vec::new(),
+                checks: Vec::new(),
+                errors: Vec::new(),
+            },
+            simulator: crate::dashboard_simulator::SimulatorState::new(),
+            theme: crate::dashboard_theme::Theme::colored(),
+            last_refresh: Instant::now(),
+            message: String::new(),
+            show_help: false,
+        }
+    }
+
+    fn jamo(ch: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE)
+    }
+
+    fn ctrl_c() -> KeyEvent {
+        KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)
+    }
+
+    // --- ctrl-c -------------------------------------------------------------
+
+    // Ctrl-C used to quit from nowhere: is_reserved_chord dropped it on the
+    // theory that the terminal would handle it, but ratatui::init puts the
+    // terminal in raw mode with no SIGINT handler, so nothing did.
+    #[test]
+    fn ctrl_c_quits_from_the_sessions_tab() {
+        assert!(handle_key(&mut app(), ctrl_c()).unwrap());
+    }
+
+    #[test]
+    fn ctrl_c_quits_from_the_help_overlay() {
+        let mut app = app();
+        app.show_help = true;
+        assert!(handle_key(&mut app, ctrl_c()).unwrap());
+    }
+
+    // The simulator swallows every character while typing, so ctrl-c is the
+    // only exit that does not depend on its own bindings.
+    #[test]
+    fn ctrl_c_quits_out_of_the_simulator_query() {
+        let mut app = app();
+        app.select_tab(SIMULATOR_TAB);
+        handle_key(&mut app, jamo('i')).unwrap();
+        assert!(app.simulator.typing(), "`i` should start typing");
+        assert!(handle_key(&mut app, ctrl_c()).unwrap());
+    }
+
+    // Other reserved chords still pass through to the terminal / multiplexer.
+    #[test]
+    fn other_ctrl_chords_are_still_reserved() {
+        let mut app = app();
+        assert!(
+            !handle_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Char('z'), KeyModifiers::CONTROL)
+            )
+            .unwrap()
+        );
+    }
+
+    // --- CJK input source ---------------------------------------------------
+
+    // Under a Korean input source every shortcut arrives as a jamo, so without
+    // this mapping the dashboard goes dead until the user switches back.
+    #[test]
+    fn hangul_quits_like_latin_q() {
+        // `ㅂ` sits on the physical `q` key under the 2-set layout.
+        assert!(handle_key(&mut app(), jamo('ㅂ')).unwrap());
+    }
+
+    #[test]
+    fn hangul_advances_the_tab_like_latin_l() {
+        let mut app = app();
+        // `ㅣ` is the physical `l`, which advances the tab.
+        let before = app.tab;
+        handle_key(&mut app, jamo('ㅣ')).unwrap();
+        assert_ne!(app.tab, before, "ㅣ (physical l) must change tab");
+    }
+
+    #[test]
+    fn hangul_starts_the_simulator_query_like_latin_i() {
+        let mut app = app();
+        app.select_tab(SIMULATOR_TAB);
+        // `ㅑ` is the physical `i`, which starts typing a query.
+        handle_key(&mut app, jamo('ㅑ')).unwrap();
+        assert!(app.simulator.typing());
+    }
+
+    // …and once typing, the jamo IS the query: a Korean search term must reach
+    // the input verbatim rather than being rewritten to Latin.
+    #[test]
+    fn the_simulator_query_keeps_hangul_verbatim() {
+        let mut app = app();
+        app.select_tab(SIMULATOR_TAB);
+        handle_key(&mut app, jamo('i')).unwrap();
+        handle_key(&mut app, jamo('ㅂ')).unwrap();
+        assert_eq!(app.simulator.input, "ㅂ");
     }
 }

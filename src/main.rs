@@ -13,6 +13,7 @@ mod global;
 mod hook;
 mod hook_config;
 mod journal;
+mod keymap;
 mod learnings;
 mod locality;
 mod mcp;
