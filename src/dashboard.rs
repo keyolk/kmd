@@ -1,6 +1,8 @@
 //! Operations dashboard for kmd runtime state, activity, journal, RAG, and checks.
 
 use crate::activity::SessionActivity;
+use crate::dashboard_status::{Level, StatusLine};
+use crate::dashboard_worker::Background;
 use anyhow::{Context, Result};
 use chrono::{Local, Utc};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
@@ -599,16 +601,50 @@ pub fn run_checks() -> Result<CheckRun> {
 struct App {
     tab: usize,
     scroll: u16,
+    /// Largest useful `scroll` for the pane drawn last. Layout feedback from
+    /// draw, like ratatui's ListState: the wrapped height is only known there,
+    /// and key handlers need it to scroll back up from `G`.
+    scroll_max: std::cell::Cell<u16>,
     selected_session: usize,
     snapshot: DashboardSnapshot,
     simulator: crate::dashboard_simulator::SimulatorState,
     theme: crate::dashboard_theme::Theme,
     last_refresh: Instant,
-    message: String,
+    refresher: Background<DashboardSnapshot>,
+    checker: Background<CheckRun>,
+    /// A refresh was asked for while one was running; start another when it lands
+    /// so the result reflects state after the request (e.g. a new check run).
+    refresh_again: bool,
+    manual_refresh: bool,
+    status: StatusLine,
     show_help: bool,
 }
 
 impl App {
+    fn new(
+        snapshot: DashboardSnapshot,
+        simulator: crate::dashboard_simulator::SimulatorState,
+    ) -> Self {
+        let mut status = StatusLine::default();
+        status.set("refresh", Level::Info, "auto-refresh every 5s");
+        Self {
+            tab: SESSIONS_TAB,
+            scroll: 0,
+            scroll_max: std::cell::Cell::new(u16::MAX),
+            selected_session: 0,
+            snapshot,
+            simulator,
+            theme: crate::dashboard_theme::Theme::from_env(),
+            last_refresh: Instant::now(),
+            refresher: Background::new(),
+            checker: Background::new(),
+            refresh_again: false,
+            manual_refresh: false,
+            status,
+            show_help: false,
+        }
+    }
+
     fn session_ids(&self) -> Vec<String> {
         merge_session_entries(&self.snapshot.rag.sessions, &self.snapshot.activity)
             .into_iter()
@@ -616,22 +652,112 @@ impl App {
             .collect()
     }
 
-    fn refresh(&mut self) {
-        let selected_id = self.session_ids().get(self.selected_session).cloned();
-        match snapshot() {
-            Ok(snapshot) => {
-                self.snapshot = snapshot;
-                self.selected_session = selected_id
-                    .and_then(|id| {
-                        self.session_ids()
-                            .iter()
-                            .position(|candidate| candidate == &id)
-                    })
-                    .unwrap_or(0);
-                self.last_refresh = Instant::now();
-                self.message = "refreshed".to_string();
+    /// Starts a snapshot on a worker thread. A manual request that finds one
+    /// running is queued rather than dropped.
+    fn request_refresh(&mut self, manual: bool) {
+        self.last_refresh = Instant::now();
+        if manual {
+            self.manual_refresh = true;
+            self.status.set("refresh", Level::Progress, "refreshing…");
+        }
+        if !self.refresher.start(snapshot) && manual {
+            self.refresh_again = true;
+        }
+    }
+
+    fn request_checks(&mut self) {
+        // Switch now, not when the run lands: moving the view under the user
+        // seconds after the key press would steal focus from whatever they did since.
+        self.select_tab(OPERATIONS_TAB);
+        if self.checker.start(run_checks) {
+            self.status
+                .set("checks", Level::Progress, "running self-checks…");
+        } else {
+            self.status
+                .set("checks", Level::Info, "self-checks already running");
+        }
+    }
+
+    /// Applies finished background work. Returns true when the screen changed.
+    fn poll_background(&mut self) -> bool {
+        let mut changed = false;
+        if let Some(result) = self.refresher.poll() {
+            changed = true;
+            match result {
+                Ok(snapshot) => {
+                    self.apply_snapshot(snapshot);
+                    self.status.resolve("refresh");
+                    if std::mem::take(&mut self.manual_refresh) {
+                        self.status.set("refresh", Level::Success, "refreshed");
+                    }
+                }
+                Err(error) => {
+                    self.manual_refresh = false;
+                    // Keep the last good snapshot on screen and say how old it is.
+                    self.status.set(
+                        "refresh",
+                        Level::Error,
+                        format!(
+                            "refresh failed: {error} · showing {}",
+                            local_time(&self.snapshot.generated_at)
+                        ),
+                    );
+                }
             }
-            Err(error) => self.message = format!("refresh failed: {error}"),
+            if std::mem::take(&mut self.refresh_again) {
+                self.request_refresh(false);
+            }
+        }
+        if let Some(result) = self.checker.poll() {
+            changed = true;
+            match result {
+                Ok(run) => {
+                    let level = if run.passed == run.total {
+                        Level::Success
+                    } else {
+                        Level::Warning
+                    };
+                    self.status.set(
+                        "checks",
+                        level,
+                        format!("self-check: {}/{} passed", run.passed, run.total),
+                    );
+                }
+                Err(error) => {
+                    self.status.set(
+                        "checks",
+                        Level::Error,
+                        format!("self-check failed: {error}"),
+                    );
+                }
+            }
+            // The run was appended to check history; pull it into the snapshot.
+            if self.refresher.in_flight() {
+                self.refresh_again = true;
+            } else {
+                self.request_refresh(false);
+            }
+        }
+        changed
+    }
+
+    /// Replaces the snapshot and keeps the selection on the same session. The
+    /// selected id is read here, at apply time, not when the refresh started:
+    /// the user may have moved since.
+    fn apply_snapshot(&mut self, snapshot: DashboardSnapshot) {
+        let selected_id = self.session_ids().get(self.selected_session).cloned();
+        self.snapshot = snapshot;
+        let ids = self.session_ids();
+        match selected_id.and_then(|id| ids.iter().position(|candidate| candidate == &id)) {
+            Some(index) => self.selected_session = index,
+            None => {
+                // The session left the window: keep the slot instead of jumping to
+                // the top, and do not carry its timeline scroll onto another session.
+                self.selected_session = self.selected_session.min(ids.len().saturating_sub(1));
+                if self.tab == SESSIONS_TAB {
+                    self.scroll = 0;
+                }
+            }
         }
     }
 
@@ -646,6 +772,14 @@ impl App {
             self.selected_session = next.min(count - 1);
             self.scroll = 0;
         }
+    }
+
+    fn scroll_down(&mut self, rows: u16) {
+        self.scroll = self.scroll.min(self.scroll_max.get()).saturating_add(rows);
+    }
+
+    fn scroll_up(&mut self, rows: u16) {
+        self.scroll = self.scroll.min(self.scroll_max.get()).saturating_sub(rows);
     }
 }
 
@@ -960,14 +1094,6 @@ fn body_content(app: &App) -> Option<(crate::dashboard_theme::BodyKind, String)>
     }
 }
 
-fn short_summary(value: &str, limit: usize) -> String {
-    if value.chars().count() <= limit {
-        value.to_string()
-    } else {
-        format!("{}…", value.chars().take(limit).collect::<String>())
-    }
-}
-
 fn draw_sessions(frame: &mut Frame, area: Rect, app: &App) {
     let theme = app.theme;
     let entries = merge_session_entries(&app.snapshot.rag.sessions, &app.snapshot.activity);
@@ -996,6 +1122,8 @@ fn draw_sessions(frame: &mut Frame, area: Rect, app: &App) {
         .count();
     let columns =
         Layout::horizontal([Constraint::Percentage(34), Constraint::Percentage(66)]).split(area);
+    // Borders (2), the "> " highlight gutter (2), and the summary indent (2).
+    let summary_width = usize::from(columns[0].width.saturating_sub(6));
     let items = entries
         .iter()
         .map(|entry| {
@@ -1019,7 +1147,10 @@ fn draw_sessions(frame: &mut Frame, area: Rect, app: &App) {
                     Span::styled(format!("{:<9}", entry.origin()), theme.muted()),
                     Span::styled(format!("{} queries", entry.query_count()), theme.muted()),
                 ]),
-                Line::raw(format!("  {}", short_summary(summary, 72))),
+                Line::raw(format!(
+                    "  {}",
+                    crate::dashboard_layout::truncate_to_width(summary, summary_width)
+                )),
             ])
         })
         .collect::<Vec<_>>();
@@ -1046,18 +1177,36 @@ fn draw_sessions(frame: &mut Frame, area: Rect, app: &App) {
         session_details(&entries[selected], now),
         theme,
     );
-    frame.render_widget(
-        Paragraph::new(detail)
-            .scroll((app.scroll, 0))
-            .wrap(Wrap { trim: false })
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_style(theme.border())
-                    .title_style(theme.heading())
-                    .title(format!(" kmd query → results · scroll {} ", app.scroll)),
-            ),
+    draw_scrolled(
+        frame,
         columns[1],
+        app,
+        Paragraph::new(detail).wrap(Wrap { trim: false }),
+        "kmd query → results",
+    );
+}
+
+/// Draws a scrollable pane with its offset clamped to the content, and the
+/// title saying where in the content the view is.
+fn draw_scrolled(frame: &mut Frame, area: Rect, app: &App, paragraph: Paragraph, title: &str) {
+    let theme = app.theme;
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(theme.border())
+        .title_style(theme.heading());
+    let (scroll, max) =
+        crate::dashboard_layout::clamp_scroll(&paragraph, block.inner(area), app.scroll);
+    app.scroll_max.set(max);
+    let position = if max == 0 {
+        String::new()
+    } else {
+        format!(" · {scroll}/{max}")
+    };
+    frame.render_widget(
+        paragraph
+            .scroll((scroll, 0))
+            .block(block.title(format!(" {title}{position} "))),
+        area,
     );
 }
 
@@ -1070,7 +1219,7 @@ const HELP_ROWS: &[(&str, &str)] = &[
     ("r", "refresh the snapshot"),
     ("t", "run the self-check suite"),
     ("i or /", "Simulator: start typing"),
-    ("Esc", "Simulator: stop typing · otherwise quit"),
+    ("Esc", "Simulator: stop typing · closes this help"),
     ("Enter", "Simulator: run the query"),
     ("m", "Simulator: RAG ⇄ BM25 search ⇄ Global"),
     ("j/k", "Simulator: select a hit"),
@@ -1169,16 +1318,8 @@ fn draw(frame: &mut Frame, app: &App) {
         crate::dashboard_simulator::draw(frame, areas[2], &app.simulator);
     } else if let Some((kind, content)) = body_content(app) {
         let body = Paragraph::new(crate::dashboard_theme::style_body(kind, content, theme))
-            .scroll((app.scroll, 0))
-            .wrap(Wrap { trim: false })
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_style(theme.border())
-                    .title_style(theme.heading())
-                    .title(format!(" {} · scroll {} ", TABS[app.tab], app.scroll)),
-            );
-        frame.render_widget(body, areas[2]);
+            .wrap(Wrap { trim: false });
+        draw_scrolled(frame, areas[2], app, body, TABS[app.tab]);
     }
 
     let hints = if app.tab == SIMULATOR_TAB {
@@ -1192,11 +1333,21 @@ fn draw(frame: &mut Frame, app: &App) {
     } else {
         "1-3/Tab: view  j/k: scroll  g/G: top/bottom  r: refresh  t: checks  ?: keys"
     };
-    let footer = Line::from(vec![
-        Span::styled(hints.to_string(), theme.muted()),
-        Span::styled("  ·  ".to_string(), theme.muted()),
-        Span::styled(app.message.clone(), theme.muted()),
-    ]);
+    // Status first: on a narrow terminal the hints get cut, not the result or
+    // error the user is waiting for. Each level gets its own color.
+    let mut spans = Vec::new();
+    if let Some((text, level)) = app.status.current() {
+        let style = match level {
+            Level::Success => theme.success(),
+            Level::Warning | Level::Progress => theme.warning(),
+            Level::Error => theme.error(),
+            Level::Info => theme.info(),
+        };
+        spans.push(Span::styled(text.to_string(), style));
+        spans.push(Span::styled("  ·  ".to_string(), theme.muted()));
+    }
+    spans.push(Span::styled(hints.to_string(), theme.muted()));
+    let footer = Line::from(spans);
     frame.render_widget(Paragraph::new(footer), areas[3]);
 
     if app.show_help {
@@ -1241,22 +1392,17 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) -> Result<bool> {
     }
 
     match key.code {
-        KeyCode::Char('q') | KeyCode::Esc => return Ok(true),
+        // Esc never quits: in the Simulator it is the key that leaves typing mode,
+        // and a second reflexive Esc used to close the whole dashboard.
+        KeyCode::Char('q') => return Ok(true),
         KeyCode::Char('?') => app.show_help = true,
         KeyCode::Right | KeyCode::Char('l') | KeyCode::Tab => app.select_tab(app.tab + 1),
         KeyCode::Left | KeyCode::Char('h') | KeyCode::BackTab => {
             app.select_tab((app.tab + TABS.len() - 1) % TABS.len())
         }
         KeyCode::Char(value @ '1'..='3') => app.select_tab((value as usize) - ('1' as usize)),
-        KeyCode::Char('r') => app.refresh(),
-        KeyCode::Char('t') => match run_checks() {
-            Ok(run) => {
-                app.refresh();
-                app.message = format!("self-check: {}/{} passed", run.passed, run.total);
-                app.select_tab(OPERATIONS_TAB);
-            }
-            Err(error) => app.message = format!("self-check failed: {error}"),
-        },
+        KeyCode::Char('r') => app.request_refresh(true),
+        KeyCode::Char('t') => app.request_checks(),
         _ if app.tab == SIMULATOR_TAB => app.simulator.handle_command_key(key),
         KeyCode::Down | KeyCode::Char('j') if app.tab == SESSIONS_TAB => {
             app.select_session(app.selected_session.saturating_add(1));
@@ -1264,10 +1410,10 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) -> Result<bool> {
         KeyCode::Up | KeyCode::Char('k') if app.tab == SESSIONS_TAB => {
             app.select_session(app.selected_session.saturating_sub(1));
         }
-        KeyCode::Down | KeyCode::Char('j') => app.scroll = app.scroll.saturating_add(1),
-        KeyCode::Up | KeyCode::Char('k') => app.scroll = app.scroll.saturating_sub(1),
-        KeyCode::PageDown => app.scroll = app.scroll.saturating_add(10),
-        KeyCode::PageUp => app.scroll = app.scroll.saturating_sub(10),
+        KeyCode::Down | KeyCode::Char('j') => app.scroll_down(1),
+        KeyCode::Up | KeyCode::Char('k') => app.scroll_up(1),
+        KeyCode::PageDown => app.scroll_down(10),
+        KeyCode::PageUp => app.scroll_up(10),
         KeyCode::Home | KeyCode::Char('g') => app.scroll = 0,
         KeyCode::End | KeyCode::Char('G') => app.scroll = u16::MAX,
         _ => {}
@@ -1277,6 +1423,7 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) -> Result<bool> {
 
 fn run_tui(mut app: App) -> Result<()> {
     let mut terminal = ratatui::init();
+    crate::dashboard_worker::restore_terminal_only_on_ui_thread_panic();
     let result = (|| -> Result<()> {
         let mut dirty = true;
         loop {
@@ -1303,12 +1450,16 @@ fn run_tui(mut app: App) -> Result<()> {
                 }
             }
             if app.simulator.poll() {
-                app.message = "simulator result ready".to_string();
+                dirty = true;
+            }
+            if app.poll_background() {
+                dirty = true;
+            }
+            if app.status.expire(Instant::now()) {
                 dirty = true;
             }
             if app.last_refresh.elapsed() >= REFRESH_INTERVAL {
-                app.refresh();
-                dirty = true;
+                app.request_refresh(false);
             }
         }
         Ok(())
@@ -1347,17 +1498,10 @@ pub fn run(json: bool, check_only: bool) -> Result<()> {
         println!("{}", serde_json::to_string_pretty(&snapshot)?);
         return Ok(());
     }
-    run_tui(App {
-        tab: SESSIONS_TAB,
-        scroll: 0,
-        selected_session: 0,
+    run_tui(App::new(
         snapshot,
-        simulator: crate::dashboard_simulator::SimulatorState::new(),
-        theme: crate::dashboard_theme::Theme::from_env(),
-        last_refresh: Instant::now(),
-        message: "auto-refresh 5s".to_string(),
-        show_help: false,
-    })
+        crate::dashboard_simulator::SimulatorState::new(),
+    ))
 }
 
 #[cfg(test)]
@@ -1643,17 +1787,11 @@ mod tests {
             checks: vec![check_run()],
             errors: Vec::new(),
         };
-        let mut app = App {
-            tab: SESSIONS_TAB,
-            scroll: 0,
-            selected_session: 0,
+        let mut app = App::new(
             snapshot,
-            simulator: crate::dashboard_simulator::SimulatorState::new(),
-            theme: crate::dashboard_theme::Theme::colored(),
-            last_refresh: Instant::now(),
-            message: "ready".into(),
-            show_help: false,
-        };
+            crate::dashboard_simulator::SimulatorState::without_history(),
+        );
+        app.theme = crate::dashboard_theme::Theme::colored();
         let backend = ratatui::backend::TestBackend::new(120, 40);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|frame| draw(frame, &app)).unwrap();
@@ -1829,59 +1967,58 @@ mod key_tests {
     /// A dashboard with no data. The key handler only reads `tab`, `simulator`
     /// and `show_help`, so an empty snapshot is enough to drive it — and it
     /// keeps these tests off the filesystem the real loader reads.
-    fn app() -> App {
-        App {
-            tab: SESSIONS_TAB,
-            scroll: 0,
-            selected_session: 0,
-            snapshot: DashboardSnapshot {
-                generated_at: String::new(),
-                cwd: String::new(),
-                runtime: RuntimeStatus {
-                    daemon_online: false,
-                    daemon_socket: String::new(),
-                    hooks_installed: 0,
-                    hooks_total: 0,
-                    settings_path: String::new(),
-                    documents: 0,
-                    dirty_documents: 0,
-                    collections: Vec::new(),
-                },
-                activity: Vec::new(),
-                journal: crate::journal::JournalView {
-                    from: String::new(),
-                    to: String::new(),
-                    anchor: crate::locality::Space {
-                        cwd: String::new(),
-                        repo: None,
-                        repo_root: None,
-                        worktree: None,
-                        worktree_root: None,
-                    },
-                    days: Vec::new(),
-                    session_count: 0,
-                    project_count: 0,
-                },
-                rag: RagSummary {
-                    total: 0,
-                    searched: 0,
-                    injected: 0,
-                    gated: 0,
-                    injection_rate_pct: 0.0,
-                    median_latency_ms: 0,
-                    p95_latency_ms: 0,
-                    sessions: Vec::new(),
-                    recent: Vec::new(),
-                },
-                evaluations: Vec::new(),
-                checks: Vec::new(),
-                errors: Vec::new(),
+    pub(super) fn app() -> App {
+        let mut app = App::new(
+            empty_snapshot(),
+            crate::dashboard_simulator::SimulatorState::without_history(),
+        );
+        app.theme = crate::dashboard_theme::Theme::colored();
+        app
+    }
+
+    pub(super) fn empty_snapshot() -> DashboardSnapshot {
+        DashboardSnapshot {
+            generated_at: String::new(),
+            cwd: String::new(),
+            runtime: RuntimeStatus {
+                daemon_online: false,
+                daemon_socket: String::new(),
+                hooks_installed: 0,
+                hooks_total: 0,
+                settings_path: String::new(),
+                documents: 0,
+                dirty_documents: 0,
+                collections: Vec::new(),
             },
-            simulator: crate::dashboard_simulator::SimulatorState::new(),
-            theme: crate::dashboard_theme::Theme::colored(),
-            last_refresh: Instant::now(),
-            message: String::new(),
-            show_help: false,
+            activity: Vec::new(),
+            journal: crate::journal::JournalView {
+                from: String::new(),
+                to: String::new(),
+                anchor: crate::locality::Space {
+                    cwd: String::new(),
+                    repo: None,
+                    repo_root: None,
+                    worktree: None,
+                    worktree_root: None,
+                },
+                days: Vec::new(),
+                session_count: 0,
+                project_count: 0,
+            },
+            rag: RagSummary {
+                total: 0,
+                searched: 0,
+                injected: 0,
+                gated: 0,
+                injection_rate_pct: 0.0,
+                median_latency_ms: 0,
+                p95_latency_ms: 0,
+                sessions: Vec::new(),
+                recent: Vec::new(),
+            },
+            evaluations: Vec::new(),
+            checks: Vec::new(),
+            errors: Vec::new(),
         }
     }
 
@@ -1973,3 +2110,7 @@ mod key_tests {
         assert_eq!(app.simulator.input, "ㅂ");
     }
 }
+
+#[cfg(test)]
+#[path = "dashboard_refresh_tests.rs"]
+mod refresh_tests;

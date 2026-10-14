@@ -3,8 +3,11 @@ mod bm25;
 mod config;
 mod daemon;
 mod dashboard;
+mod dashboard_layout;
 mod dashboard_simulator;
+mod dashboard_status;
 mod dashboard_theme;
+mod dashboard_worker;
 #[cfg(feature = "embed")]
 mod embed;
 mod eval;
