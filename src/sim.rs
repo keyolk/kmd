@@ -5,16 +5,17 @@
 //! 재생: ~/.claude/history.jsonl의 실제 프롬프트를 일괄 시뮬레이션해 주입률 리포트.
 
 use crate::bm25::SearchHit;
-use crate::rag::{self, RagOutcome};
-use anyhow::Result;
 use crate::dashboard_worker::Background;
+use crate::rag::{self, RagOutcome};
 use crate::theme::Theme;
+use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Wrap};
 use std::time::{Duration, Instant};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum SimulatorMode {
     Rag,
     Search,
@@ -398,7 +399,10 @@ fn draw(f: &mut Frame, app: &App) {
             (None, Some(o)) => match &o.gate_reason {
                 Some(r) => Line::from(vec![
                     Span::styled(format!("GATED: {r}"), theme.warning()),
-                    Span::styled(" — 이 프롬프트는 훅에서 검색 없이 스킵됩니다", theme.muted()),
+                    Span::styled(
+                        " — 이 프롬프트는 훅에서 검색 없이 스킵됩니다",
+                        theme.muted(),
+                    ),
                 ])
                 .into(),
                 None => Text::from(vec![
@@ -410,9 +414,7 @@ fn draw(f: &mut Frame, app: &App) {
                         Span::styled("hits: ", theme.label()),
                         Span::styled(o.hits.len().to_string(), theme.state(!o.hits.is_empty())),
                         Span::styled("  |  injected chunks: ", theme.label()),
-                        Span::raw(
-                            if o.context.is_some() { o.hits.len() } else { 0 }.to_string(),
-                        ),
+                        Span::raw(if o.context.is_some() { o.hits.len() } else { 0 }.to_string()),
                         Span::styled("  |  latency: ", theme.label()),
                         Span::raw(format!("{}ms", o.latency_ms)),
                     ]),
@@ -460,8 +462,8 @@ fn draw(f: &mut Frame, app: &App) {
     f.render_widget(ctx, body_chunks[1]);
 
     // 도움말
-    let help = Paragraph::new("Enter: run  ↑/↓: history  Ctrl-U: clear  Esc: quit")
-        .style(theme.muted());
+    let help =
+        Paragraph::new("Enter: run  ↑/↓: history  Ctrl-U: clear  Esc: quit").style(theme.muted());
     f.render_widget(help, chunks[3]);
 }
 

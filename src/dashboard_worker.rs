@@ -93,7 +93,8 @@ impl<T: Send + 'static> Background<T> {
         latest
     }
 
-    #[cfg(test)]
+    /// Blocks until the current job lands or `timeout` passes. Only for exit
+    /// paths and tests; the event loop polls.
     pub fn wait(&mut self, timeout: std::time::Duration) -> Option<Result<T, String>> {
         let deadline = std::time::Instant::now() + timeout;
         while std::time::Instant::now() < deadline {

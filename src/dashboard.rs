@@ -1,11 +1,12 @@
 //! Operations dashboard for kmd runtime state, activity, journal, RAG, and checks.
 
 use crate::activity::SessionActivity;
+use crate::dashboard_keys::{Action, Ctx, Keymap, STACKS};
 use crate::dashboard_status::{Level, StatusLine};
 use crate::dashboard_worker::Background;
 use anyhow::{Context, Result};
 use chrono::{Local, Utc};
-use crossterm::event::{self, Event, KeyCode, KeyEventKind};
+use crossterm::event::{self, Event, KeyEventKind};
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Tabs, Wrap};
 use serde::{Deserialize, Serialize};
@@ -24,24 +25,30 @@ const SIMULATOR_TAB: usize = 2;
 struct TabGuide {
     purpose: &'static str,
     source: &'static str,
-    action: &'static str,
+    /// The guide's "Action" line is derived from these contexts' footer hints
+    /// plus `also`, so it cannot drift from the keymap.
+    ctxs: &'static [Ctx],
+    also: &'static [Action],
 }
 
 const TAB_GUIDES: &[TabGuide] = &[
     TabGuide {
         purpose: "See which Claude sessions are querying kmd right now and what each one got.",
         source: "rag.jsonl query recency (active/recent/idle) plus live activity cards",
-        action: "j/k selects a session · PgUp/PgDn scrolls its activity and query history",
+        ctxs: &[Ctx::Sessions, Ctx::Scroll],
+        also: &[],
     },
     TabGuide {
         purpose: "Monitor runtime, retrieval quality, evaluations, and self-checks together.",
         source: "daemon, hooks, store, rag.jsonl, evaluations, and check history",
-        action: "r refreshes · t runs the complete self-check suite",
+        ctxs: &[Ctx::Operations, Ctx::Scroll],
+        also: &[Action::Refresh, Action::Checks],
     },
     TabGuide {
         purpose: "Run real queries against the local index without writing logs.",
         source: "RAG pipeline · raw BM25 · Global across session/knowledge/project",
-        action: "i types · Enter runs · m switches mode · ? lists every key",
+        ctxs: &[Ctx::Simulator],
+        also: &[Action::Help],
     },
 ];
 
@@ -618,6 +625,16 @@ struct App {
     manual_refresh: bool,
     status: StatusLine,
     show_help: bool,
+    help_scroll: u16,
+    /// Largest useful `help_scroll`, fed back from draw like `scroll_max`.
+    help_max: std::cell::Cell<u16>,
+    keys: Keymap,
+    /// Where UI state is persisted; None (tests, no HOME) disables it.
+    ui_path: Option<PathBuf>,
+    ui_saver: Background<()>,
+    /// The state last handed to `ui_saver`, so unchanged state is not rewritten.
+    ui_saved: crate::ui_state::UiState,
+    ui_checked: Instant,
 }
 
 impl App {
@@ -642,6 +659,13 @@ impl App {
             manual_refresh: false,
             status,
             show_help: false,
+            help_scroll: 0,
+            help_max: std::cell::Cell::new(u16::MAX),
+            keys: Keymap::defaults(),
+            ui_path: None,
+            ui_saver: Background::new(),
+            ui_saved: crate::ui_state::UiState::default(),
+            ui_checked: Instant::now(),
         }
     }
 
@@ -1210,62 +1234,6 @@ fn draw_scrolled(frame: &mut Frame, area: Rect, app: &App, paragraph: Paragraph,
     );
 }
 
-const HELP_ROWS: &[(&str, &str)] = &[
-    ("1-3 / Tab", "switch view"),
-    ("h/l / ←/→", "previous / next view"),
-    ("j/k / ↑/↓", "Sessions: select session · Operations: scroll"),
-    ("PgUp/PgDn", "scroll the timeline or Operations"),
-    ("g / G", "top / bottom"),
-    ("r", "refresh the snapshot"),
-    ("t", "run the self-check suite"),
-    ("i or /", "Simulator: start typing"),
-    ("Esc", "Simulator: stop typing · closes this help"),
-    ("Enter", "Simulator: run the query"),
-    ("m", "Simulator: RAG ⇄ BM25 search ⇄ Global"),
-    ("j/k", "Simulator: select a hit"),
-    ("J/K", "Simulator: scroll result detail"),
-    ("n/p", "Simulator: next / previous prompt history"),
-    ("x", "Simulator: clear the query"),
-    ("?", "toggle this help"),
-    ("q", "quit"),
-    (
-        "Ctrl-C",
-        "quit from anywhere, including while typing a query",
-    ),
-];
-
-fn draw_help(frame: &mut Frame, area: Rect, theme: crate::theme::Theme) {
-    let width = area.width.saturating_sub(4).clamp(20, 72);
-    let height = (HELP_ROWS.len() as u16 + 2).min(area.height.saturating_sub(2).max(3));
-    let popup = Rect {
-        x: area.x + (area.width.saturating_sub(width)) / 2,
-        y: area.y + (area.height.saturating_sub(height)) / 2,
-        width,
-        height,
-    };
-    let rows = HELP_ROWS
-        .iter()
-        .map(|(keys, description)| {
-            Line::from(vec![
-                Span::raw(" "),
-                Span::styled(format!("{keys:<18}"), theme.heading()),
-                Span::raw((*description).to_string()),
-            ])
-        })
-        .collect::<Vec<_>>();
-    frame.render_widget(Clear, popup);
-    frame.render_widget(
-        Paragraph::new(rows).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(theme.selected())
-                .title_style(theme.heading())
-                .title(" keys · ? or Esc closes "),
-        ),
-        popup,
-    );
-}
-
 fn draw(frame: &mut Frame, app: &App) {
     let theme = app.theme;
     let areas = Layout::vertical([
@@ -1293,6 +1261,20 @@ fn draw(frame: &mut Frame, app: &App) {
     frame.render_widget(tabs, areas[0]);
 
     let guide = &TAB_GUIDES[app.tab];
+    let guide_action = app
+        .keys
+        .hints(guide.ctxs)
+        .into_iter()
+        .map(|(_, keys, label)| (keys, label))
+        .chain(
+            guide
+                .also
+                .iter()
+                .filter_map(|action| app.keys.hint_for(*action)),
+        )
+        .map(|(keys, label)| format!("{keys} {label}"))
+        .collect::<Vec<_>>()
+        .join(" · ");
     let guide_text = Text::from(vec![
         Line::from(vec![
             Span::styled("Purpose  ", theme.heading()),
@@ -1304,7 +1286,7 @@ fn draw(frame: &mut Frame, app: &App) {
         ]),
         Line::from(vec![
             Span::styled("Action   ", theme.muted()),
-            Span::raw(guide.action),
+            Span::raw(guide_action),
         ]),
     ]);
     frame.render_widget(
@@ -1315,24 +1297,13 @@ fn draw(frame: &mut Frame, app: &App) {
     if app.tab == SESSIONS_TAB {
         draw_sessions(frame, areas[2], app);
     } else if app.tab == SIMULATOR_TAB {
-        crate::dashboard_simulator::draw(frame, areas[2], &app.simulator, theme);
+        crate::dashboard_simulator::draw(frame, areas[2], &app.simulator, theme, &app.keys);
     } else if let Some((kind, content)) = body_content(app) {
         let body = Paragraph::new(crate::dashboard_markup::style_body(kind, content, theme))
             .wrap(Wrap { trim: false });
         draw_scrolled(frame, areas[2], app, body, TABS[app.tab]);
     }
 
-    let hints = if app.tab == SIMULATOR_TAB {
-        if app.simulator.typing() {
-            "typing · Esc: command  Enter: run  ↑/↓: history  ?: keys"
-        } else {
-            "i: type  Enter: run  m: mode  j/k: hit  J/K: detail  x: clear  ?: keys"
-        }
-    } else if app.tab == SESSIONS_TAB {
-        "1-3/Tab: view  j/k: session  PgUp/PgDn: timeline  r: refresh  t: checks  ?: keys"
-    } else {
-        "1-3/Tab: view  j/k: scroll  g/G: top/bottom  r: refresh  t: checks  ?: keys"
-    };
     // Status first: on a narrow terminal the hints get cut, not the result or
     // error the user is waiting for. Each level gets its own color.
     let mut spans = Vec::new();
@@ -1346,78 +1317,60 @@ fn draw(frame: &mut Frame, app: &App) {
         spans.push(Span::styled(text.to_string(), style));
         spans.push(Span::styled("  ·  ".to_string(), theme.muted()));
     }
-    spans.push(Span::styled(hints.to_string(), theme.muted()));
+    // Footer hints come from the keymap for the active contexts, trimmed to
+    // the width the status left over.
+    let used: usize = spans.iter().map(|span| span.width()).sum();
+    let mut hints = String::new();
+    if app.ctx_stack().contains(&Ctx::Typing) {
+        hints.push_str("typing · ");
+    }
+    let budget = usize::from(areas[3].width)
+        .saturating_sub(used)
+        .saturating_sub(hints.len());
+    hints.push_str(&crate::dashboard_keys::fit_hints(
+        &app.keys.hints(app.ctx_stack()),
+        budget,
+    ));
+    spans.push(Span::styled(hints, theme.muted()));
     let footer = Line::from(spans);
     frame.render_widget(Paragraph::new(footer), areas[3]);
 
     if app.show_help {
-        draw_help(frame, frame.area(), theme);
+        actions::draw_help(frame, frame.area(), app);
     }
 }
 
 fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) -> Result<bool> {
-    // Ctrl-C quits from anywhere, ahead of the help overlay and the simulator's
-    // typing mode. It used to quit from nowhere: is_reserved_chord dropped it on
-    // the theory that the terminal would handle it, but ratatui::init puts the
-    // terminal in raw mode with no SIGINT handler, so nothing did.
-    if key
-        .modifiers
-        .contains(crossterm::event::KeyModifiers::CONTROL)
-        && matches!(key.code, KeyCode::Char('c' | 'C'))
-    {
-        return Ok(true);
-    }
-
-    // Ctrl/Alt/Super chords belong to the terminal or multiplexer and must pass through.
-    if crate::dashboard_simulator::is_reserved_chord(&key) {
-        return Ok(false);
-    }
-
     // Under a Korean input source the shortcut keys arrive as jamo (`q` -> `ㅂ`)
     // and do nothing until the input source is switched back. Rewrite them to
     // the Latin key at the same physical position -- but not while the simulator
     // is typing a query, where the jamo IS the input.
-    let key = if app.tab == SIMULATOR_TAB && app.simulator.typing() {
+    let typing = app.tab == SIMULATOR_TAB && app.simulator.typing();
+    let key = if typing {
         key
     } else {
         crate::keymap::normalize(key)
     };
-    if app.show_help {
-        app.show_help = false;
-        return Ok(false);
-    }
-    if app.tab == SIMULATOR_TAB && app.simulator.typing() {
-        app.simulator.handle_typing_key(key);
-        return Ok(false);
+
+    // One table decides. `ctrl+c` sits in the Always context, so it quits from
+    // the help overlay and from the query input too: raw mode leaves no SIGINT
+    // handler to do it.
+    if let Some(action) = app.keys.lookup(app.ctx_stack(), &key) {
+        return Ok(app.apply(action));
     }
 
-    match key.code {
-        // Esc never quits: in the Simulator it is the key that leaves typing mode,
-        // and a second reflexive Esc used to close the whole dashboard.
-        KeyCode::Char('q') => return Ok(true),
-        KeyCode::Char('?') => app.show_help = true,
-        KeyCode::Right | KeyCode::Char('l') | KeyCode::Tab => app.select_tab(app.tab + 1),
-        KeyCode::Left | KeyCode::Char('h') | KeyCode::BackTab => {
-            app.select_tab((app.tab + TABS.len() - 1) % TABS.len())
-        }
-        KeyCode::Char(value @ '1'..='3') => app.select_tab((value as usize) - ('1' as usize)),
-        KeyCode::Char('r') => app.request_refresh(true),
-        KeyCode::Char('t') => app.request_checks(),
-        _ if app.tab == SIMULATOR_TAB => app.simulator.handle_command_key(key),
-        KeyCode::Down | KeyCode::Char('j') if app.tab == SESSIONS_TAB => {
-            app.select_session(app.selected_session.saturating_add(1));
-        }
-        KeyCode::Up | KeyCode::Char('k') if app.tab == SESSIONS_TAB => {
-            app.select_session(app.selected_session.saturating_sub(1));
-        }
-        KeyCode::Down | KeyCode::Char('j') => app.scroll_down(1),
-        KeyCode::Up | KeyCode::Char('k') => app.scroll_up(1),
-        KeyCode::PageDown => app.scroll_down(10),
-        KeyCode::PageUp => app.scroll_up(10),
-        KeyCode::Home | KeyCode::Char('g') => app.scroll = 0,
-        KeyCode::End | KeyCode::Char('G') => app.scroll = u16::MAX,
-        _ => {}
+    // Other Ctrl/Alt/Super chords belong to the terminal or multiplexer.
+    if crate::dashboard_keys::is_reserved_chord(&key) {
+        return Ok(false);
     }
+    if app.show_help {
+        // Any key the overlay does not bind closes it.
+        app.show_help = false;
+    } else if typing {
+        app.simulator.type_key(key);
+    }
+    // Esc never quits: in the Simulator it is the key that leaves typing mode,
+    // and a second reflexive Esc used to close the whole dashboard.
     Ok(false)
 }
 
@@ -1461,10 +1414,14 @@ fn run_tui(mut app: App) -> Result<()> {
             if app.last_refresh.elapsed() >= REFRESH_INTERVAL {
                 app.request_refresh(false);
             }
+            app.persist_ui();
         }
         Ok(())
     })();
     ratatui::restore();
+    if let Err(error) = app.persist_ui_on_exit() {
+        eprintln!("kmd dashboard: could not save UI state: {error:#}");
+    }
     result
 }
 
@@ -1498,15 +1455,30 @@ pub fn run(json: bool, check_only: bool) -> Result<()> {
         println!("{}", serde_json::to_string_pretty(&snapshot)?);
         return Ok(());
     }
-    run_tui(App::new(
-        snapshot,
-        crate::dashboard_simulator::SimulatorState::new(),
-    ))
+    let mut app = App::new(snapshot, crate::dashboard_simulator::SimulatorState::new());
+    let (keys, key_warning) = Keymap::load(&crate::config::config_home().join("keys.yaml"));
+    app.keys = keys;
+    if let Some(warning) = key_warning {
+        app.status.set("keys", Level::Warning, warning);
+    }
+    app.ui_path = crate::ui_state::path();
+    if let Some(path) = app.ui_path.clone() {
+        match crate::ui_state::load(&path) {
+            Ok(saved) => app.restore_ui(saved),
+            Err(error) => app.status.set(
+                "ui-state",
+                Level::Warning,
+                format!("ignoring saved UI state: {error:#}"),
+            ),
+        }
+    }
+    run_tui(app)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crossterm::event::KeyCode;
 
     #[test]
     fn rag_summary_handles_empty_log() {
@@ -2111,6 +2083,13 @@ mod key_tests {
     }
 }
 
+#[path = "dashboard_actions.rs"]
+mod actions;
+
 #[cfg(test)]
 #[path = "dashboard_refresh_tests.rs"]
 mod refresh_tests;
+
+#[cfg(test)]
+#[path = "dashboard_ui_tests.rs"]
+mod ui_tests;
