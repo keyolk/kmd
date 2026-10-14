@@ -59,6 +59,27 @@ impl<T: Send + 'static> Background<T> {
         true
     }
 
+    /// Starts `job` even while an older one runs, and drops the older one's
+    /// result when it lands. For interactive queries: the user edited the query
+    /// and pressed Enter again, so the answer to the old text is no longer
+    /// wanted. The old thread is not killed (std threads cannot be); it runs to
+    /// completion and its send is ignored by `poll`.
+    pub fn replace<F>(&mut self, job: F)
+    where
+        F: FnOnce() -> anyhow::Result<T> + Send + 'static,
+    {
+        self.in_flight = false;
+        self.start(job);
+    }
+
+    /// Forgets the running job: its result will be discarded. Used when the
+    /// state the job was answering for changes under it (mode switch, cleared
+    /// query).
+    pub fn cancel(&mut self) {
+        self.generation += 1;
+        self.in_flight = false;
+    }
+
     /// Takes the finished job's result, if any. Results from superseded
     /// generations are discarded.
     pub fn poll(&mut self) -> Option<Result<T, String>> {
@@ -147,6 +168,38 @@ mod tests {
         assert_eq!(job.wait(Duration::from_secs(5)).unwrap().unwrap(), 1);
         assert!(job.start(|| Ok(3)), "next job starts once the first landed");
         assert_eq!(job.wait(Duration::from_secs(5)).unwrap().unwrap(), 3);
+    }
+
+    #[test]
+    fn replace_supersedes_the_running_job() {
+        let (release, gate) = mpsc::channel::<()>();
+        let mut job = Background::<u32>::new();
+        assert!(job.start(move || {
+            gate.recv().ok();
+            Ok(1)
+        }));
+        job.replace(|| Ok(2));
+        assert_eq!(job.wait(Duration::from_secs(5)).unwrap().unwrap(), 2);
+        release.send(()).unwrap();
+        // The superseded job's late result must never surface.
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(job.poll().is_none());
+        assert!(!job.in_flight());
+    }
+
+    #[test]
+    fn cancel_drops_the_running_jobs_result() {
+        let (release, gate) = mpsc::channel::<()>();
+        let mut job = Background::<u32>::new();
+        assert!(job.start(move || {
+            gate.recv().ok();
+            Ok(1)
+        }));
+        job.cancel();
+        assert!(!job.in_flight());
+        release.send(()).unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(job.poll().is_none());
     }
 
     #[test]

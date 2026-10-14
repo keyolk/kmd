@@ -608,7 +608,7 @@ struct App {
     selected_session: usize,
     snapshot: DashboardSnapshot,
     simulator: crate::dashboard_simulator::SimulatorState,
-    theme: crate::dashboard_theme::Theme,
+    theme: crate::theme::Theme,
     last_refresh: Instant,
     refresher: Background<DashboardSnapshot>,
     checker: Background<CheckRun>,
@@ -634,7 +634,7 @@ impl App {
             selected_session: 0,
             snapshot,
             simulator,
-            theme: crate::dashboard_theme::Theme::from_env(),
+            theme: crate::theme::Theme::from_env(),
             last_refresh: Instant::now(),
             refresher: Background::new(),
             checker: Background::new(),
@@ -794,9 +794,9 @@ fn active_sessions(snapshot: &DashboardSnapshot) -> usize {
 
 fn state_badge(ok: bool) -> &'static str {
     if ok {
-        crate::dashboard_theme::BADGE_OK
+        crate::dashboard_markup::BADGE_OK
     } else {
-        crate::dashboard_theme::BADGE_FAIL
+        crate::dashboard_markup::BADGE_FAIL
     }
 }
 
@@ -827,8 +827,8 @@ fn overview_text(snapshot: &DashboardSnapshot) -> String {
         .map(|run| format!("{} · {} · {}", run.kind, run.summary, run.timestamp))
         .unwrap_or_else(|| "not run".to_string());
     let hooks_warning =
-        crate::dashboard_theme::warning_suffix(runtime.hooks_installed < runtime.hooks_total);
-    let documents_warning = crate::dashboard_theme::warning_suffix(runtime.dirty_documents > 0);
+        crate::dashboard_markup::warning_suffix(runtime.hooks_installed < runtime.hooks_total);
+    let documents_warning = crate::dashboard_markup::warning_suffix(runtime.dirty_documents > 0);
     let mut output = format!(
         "Runtime\n  {:<12} {}\n  {:<12} {}/{} installed{}\n  {:<12} {} active / {} dirty{}\n  {:<12} {}\n  {:<12} {}\n\nKnowledge\n  {:<12} {} sessions / {} projects (7d)\n  {:<12} {} active now / {} with queries (7d)\n  {:<12} {} prompts / {:.0}% injection (7d)\n  {:<12} median {}ms / p95 {}ms\n  {:<12} {}\n",
         "daemon",
@@ -1084,10 +1084,10 @@ fn checks_text(snapshot: &DashboardSnapshot) -> String {
     output
 }
 
-fn body_content(app: &App) -> Option<(crate::dashboard_theme::BodyKind, String)> {
+fn body_content(app: &App) -> Option<(crate::dashboard_markup::BodyKind, String)> {
     match app.tab {
         OPERATIONS_TAB => Some((
-            crate::dashboard_theme::BodyKind::Operations,
+            crate::dashboard_markup::BodyKind::Operations,
             operations_text(&app.snapshot),
         )),
         _ => None,
@@ -1172,8 +1172,8 @@ fn draw_sessions(frame: &mut Frame, area: Rect, app: &App) {
         );
     frame.render_stateful_widget(sessions, columns[0], &mut state);
 
-    let detail = crate::dashboard_theme::style_body(
-        crate::dashboard_theme::BodyKind::Sessions,
+    let detail = crate::dashboard_markup::style_body(
+        crate::dashboard_markup::BodyKind::Sessions,
         session_details(&entries[selected], now),
         theme,
     );
@@ -1234,7 +1234,7 @@ const HELP_ROWS: &[(&str, &str)] = &[
     ),
 ];
 
-fn draw_help(frame: &mut Frame, area: Rect, theme: crate::dashboard_theme::Theme) {
+fn draw_help(frame: &mut Frame, area: Rect, theme: crate::theme::Theme) {
     let width = area.width.saturating_sub(4).clamp(20, 72);
     let height = (HELP_ROWS.len() as u16 + 2).min(area.height.saturating_sub(2).max(3));
     let popup = Rect {
@@ -1315,9 +1315,9 @@ fn draw(frame: &mut Frame, app: &App) {
     if app.tab == SESSIONS_TAB {
         draw_sessions(frame, areas[2], app);
     } else if app.tab == SIMULATOR_TAB {
-        crate::dashboard_simulator::draw(frame, areas[2], &app.simulator);
+        crate::dashboard_simulator::draw(frame, areas[2], &app.simulator, theme);
     } else if let Some((kind, content)) = body_content(app) {
-        let body = Paragraph::new(crate::dashboard_theme::style_body(kind, content, theme))
+        let body = Paragraph::new(crate::dashboard_markup::style_body(kind, content, theme))
             .wrap(Wrap { trim: false });
         draw_scrolled(frame, areas[2], app, body, TABS[app.tab]);
     }
@@ -1432,7 +1432,7 @@ fn run_tui(mut app: App) -> Result<()> {
                 dirty = false;
             }
 
-            let wait = if app.simulator.running {
+            let wait = if app.simulator.running() {
                 Duration::from_millis(40)
             } else {
                 Duration::from_millis(250)
@@ -1791,7 +1791,7 @@ mod tests {
             snapshot,
             crate::dashboard_simulator::SimulatorState::without_history(),
         );
-        app.theme = crate::dashboard_theme::Theme::colored();
+        app.theme = crate::theme::Theme::colored();
         let backend = ratatui::backend::TestBackend::new(120, 40);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|frame| draw(frame, &app)).unwrap();
@@ -1831,7 +1831,7 @@ mod tests {
         assert!(results.contains("session별 retrieval 결과"));
         assert!(!results.contains("대화 원문은 화면에 표시하지 않는다"));
 
-        app.theme = crate::dashboard_theme::Theme::plain();
+        app.theme = crate::theme::Theme::plain();
         terminal.draw(|frame| draw(frame, &app)).unwrap();
         assert!(
             terminal
@@ -1841,7 +1841,7 @@ mod tests {
                 .iter()
                 .all(|cell| cell.fg == Color::Reset)
         );
-        app.theme = crate::dashboard_theme::Theme::colored();
+        app.theme = crate::theme::Theme::colored();
 
         let mut second = app.snapshot.rag.sessions[0].clone();
         second.session_id = "87654321-session".into();
@@ -1972,7 +1972,7 @@ mod key_tests {
             empty_snapshot(),
             crate::dashboard_simulator::SimulatorState::without_history(),
         );
-        app.theme = crate::dashboard_theme::Theme::colored();
+        app.theme = crate::theme::Theme::colored();
         app
     }
 
