@@ -3,10 +3,11 @@ mod bm25;
 mod config;
 mod daemon;
 mod dashboard;
+mod dashboard_keys;
 mod dashboard_layout;
+mod dashboard_markup;
 mod dashboard_simulator;
 mod dashboard_status;
-mod dashboard_theme;
 mod dashboard_worker;
 #[cfg(feature = "embed")]
 mod embed;
@@ -22,13 +23,14 @@ mod locality;
 mod mcp;
 mod output;
 mod pageindex;
-mod palette;
 mod rag;
 mod scan;
 mod sim;
 mod stats;
 mod store;
+mod theme;
 mod tokenize;
+mod ui_state;
 mod util;
 
 use anyhow::Result;

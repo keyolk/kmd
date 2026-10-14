@@ -5,14 +5,17 @@
 //! 재생: ~/.claude/history.jsonl의 실제 프롬프트를 일괄 시뮬레이션해 주입률 리포트.
 
 use crate::bm25::SearchHit;
+use crate::dashboard_worker::Background;
 use crate::rag::{self, RagOutcome};
+use crate::theme::Theme;
 use anyhow::Result;
-use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Wrap};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum SimulatorMode {
     Rag,
     Search,
@@ -222,6 +225,94 @@ struct App {
     error: Option<String>,
     history: Vec<String>,
     history_idx: Option<usize>,
+    /// The pipeline opens the store, loads the tokenizer and may embed the
+    /// query; on Enter it used to run on the input thread, so the screen froze
+    /// and keys queued up until it returned. It now runs on a worker; a newer
+    /// Enter supersedes an older query.
+    job: Background<RagOutcome>,
+    theme: Theme,
+}
+
+impl App {
+    fn new(history: Vec<String>, theme: Theme) -> Self {
+        Self {
+            input: String::new(),
+            outcome: None,
+            error: None,
+            history,
+            history_idx: None,
+            job: Background::new(),
+            theme,
+        }
+    }
+
+    fn run_query(&mut self) {
+        let input = self.input.clone();
+        if input.trim().is_empty() {
+            return;
+        }
+        self.job.replace(move || rag::run_pipeline(&input));
+    }
+
+    /// Applies a finished query. Returns true when the screen changed.
+    fn poll(&mut self) -> bool {
+        let Some(result) = self.job.poll() else {
+            return false;
+        };
+        match result {
+            Ok(outcome) => {
+                self.outcome = Some(outcome);
+                self.error = None;
+            }
+            Err(error) => self.error = Some(error),
+        }
+        true
+    }
+
+    /// Returns true when the key quits.
+    fn handle_key(&mut self, key: KeyEvent) -> bool {
+        match (key.code, key.modifiers) {
+            (KeyCode::Esc, _) | (KeyCode::Char('c'), KeyModifiers::CONTROL) => return true,
+            (KeyCode::Enter, _) => self.run_query(),
+            (KeyCode::Backspace, _) => {
+                self.input.pop();
+            }
+            (KeyCode::Up, _) => {
+                if !self.history.is_empty() {
+                    let idx = match self.history_idx {
+                        None => self.history.len() - 1,
+                        Some(0) => 0,
+                        Some(i) => i - 1,
+                    };
+                    self.history_idx = Some(idx);
+                    self.input = self.history[idx].clone();
+                }
+            }
+            (KeyCode::Down, _) => {
+                if let Some(i) = self.history_idx {
+                    if i + 1 < self.history.len() {
+                        self.history_idx = Some(i + 1);
+                        self.input = self.history[i + 1].clone();
+                    } else {
+                        self.history_idx = None;
+                        self.input.clear();
+                    }
+                }
+            }
+            (KeyCode::Char('u'), KeyModifiers::CONTROL) => {
+                // The query the cleared text was for is no longer wanted.
+                self.job.cancel();
+                self.input.clear();
+                self.history_idx = None;
+            }
+            (KeyCode::Char(c), _) => {
+                self.input.push(c);
+                self.history_idx = None;
+            }
+            _ => {}
+        }
+        false
+    }
 }
 
 pub fn tui() -> Result<()> {
@@ -229,80 +320,45 @@ pub fn tui() -> Result<()> {
     let history = prompt_history();
 
     let mut terminal = ratatui::init();
-    let result = run_app(
-        &mut terminal,
-        App {
-            input: String::new(),
-            outcome: None,
-            error: None,
-            history,
-            history_idx: None,
-        },
-    );
+    crate::dashboard_worker::restore_terminal_only_on_ui_thread_panic();
+    let result = run_app(&mut terminal, App::new(history, Theme::from_env()));
     ratatui::restore();
     result
 }
 
 fn run_app(terminal: &mut Terminal<impl Backend>, mut app: App) -> Result<()> {
+    let mut dirty = true;
     loop {
-        terminal.draw(|f| draw(f, &app))?;
-        if let Event::Key(key) = event::read()? {
-            if key.kind != KeyEventKind::Press {
-                continue;
-            }
-            match (key.code, key.modifiers) {
-                (KeyCode::Esc, _) | (KeyCode::Char('c'), KeyModifiers::CONTROL) => return Ok(()),
-                (KeyCode::Enter, _) => {
-                    if !app.input.trim().is_empty() {
-                        match rag::run_pipeline(&app.input) {
-                            Ok(o) => {
-                                app.outcome = Some(o);
-                                app.error = None;
-                            }
-                            Err(e) => app.error = Some(e.to_string()),
-                        }
+        if dirty {
+            terminal.draw(|f| draw(f, &app))?;
+            dirty = false;
+        }
+        // Poll briefly while a query runs so its result shows as soon as it lands.
+        let wait = if app.job.in_flight() {
+            Duration::from_millis(40)
+        } else {
+            Duration::from_millis(250)
+        };
+        if event::poll(wait)? {
+            match event::read()? {
+                Event::Key(key) if key.kind == KeyEventKind::Press => {
+                    if app.handle_key(key) {
+                        return Ok(());
                     }
+                    dirty = true;
                 }
-                (KeyCode::Backspace, _) => {
-                    app.input.pop();
-                }
-                (KeyCode::Up, _) => {
-                    if !app.history.is_empty() {
-                        let idx = match app.history_idx {
-                            None => app.history.len() - 1,
-                            Some(0) => 0,
-                            Some(i) => i - 1,
-                        };
-                        app.history_idx = Some(idx);
-                        app.input = app.history[idx].clone();
-                    }
-                }
-                (KeyCode::Down, _) => {
-                    if let Some(i) = app.history_idx {
-                        if i + 1 < app.history.len() {
-                            app.history_idx = Some(i + 1);
-                            app.input = app.history[i + 1].clone();
-                        } else {
-                            app.history_idx = None;
-                            app.input.clear();
-                        }
-                    }
-                }
-                (KeyCode::Char('u'), KeyModifiers::CONTROL) => {
-                    app.input.clear();
-                    app.history_idx = None;
-                }
-                (KeyCode::Char(c), _) => {
-                    app.input.push(c);
-                    app.history_idx = None;
-                }
+                Event::Resize(_, _) => dirty = true,
                 _ => {}
             }
+        }
+        if app.poll() {
+            dirty = true;
         }
     }
 }
 
 fn draw(f: &mut Frame, app: &App) {
+    let theme = app.theme;
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -313,32 +369,62 @@ fn draw(f: &mut Frame, app: &App) {
         ])
         .split(f.area());
 
+    let block = |title: &'static str| {
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(theme.border())
+            .title(Span::styled(title, theme.heading()))
+    };
+
     // 입력창
     let input = Paragraph::new(app.input.as_str()).block(
         Block::default()
             .borders(Borders::ALL)
-            .title(" prompt (Enter=run) "),
+            .border_style(theme.border_focus())
+            .title(Span::styled(" prompt (Enter=run) ", theme.heading())),
     );
     f.render_widget(input, chunks[0]);
 
     // 파이프라인 상태
-    let status_text = match (&app.error, &app.outcome) {
-        (Some(e), _) => format!("error: {}", e),
-        (None, None) => "프롬프트를 입력하고 Enter — 훅과 동일한 파이프라인이 실행됩니다".into(),
-        (None, Some(o)) => match &o.gate_reason {
-            Some(r) => format!("GATED: {} — 이 프롬프트는 훅에서 검색 없이 스킵됩니다", r),
-            None => format!(
-                "query: {}\nhits: {}  |  injected chunks: {}  |  latency: {}ms",
-                o.query.as_deref().unwrap_or(""),
-                o.hits.len(),
-                if o.context.is_some() { o.hits.len() } else { 0 },
-                o.latency_ms
-            ),
-        },
+    let status: Text = if app.job.in_flight() {
+        Line::styled("running against the local kmd index…", theme.warning()).into()
+    } else {
+        match (&app.error, &app.outcome) {
+            (Some(e), _) => Line::styled(format!("error: {e}"), theme.error()).into(),
+            (None, None) => Line::styled(
+                "프롬프트를 입력하고 Enter — 훅과 동일한 파이프라인이 실행됩니다",
+                theme.muted(),
+            )
+            .into(),
+            (None, Some(o)) => match &o.gate_reason {
+                Some(r) => Line::from(vec![
+                    Span::styled(format!("GATED: {r}"), theme.warning()),
+                    Span::styled(
+                        " — 이 프롬프트는 훅에서 검색 없이 스킵됩니다",
+                        theme.muted(),
+                    ),
+                ])
+                .into(),
+                None => Text::from(vec![
+                    Line::from(vec![
+                        Span::styled("query: ", theme.label()),
+                        Span::styled(o.query.clone().unwrap_or_default(), theme.value()),
+                    ]),
+                    Line::from(vec![
+                        Span::styled("hits: ", theme.label()),
+                        Span::styled(o.hits.len().to_string(), theme.state(!o.hits.is_empty())),
+                        Span::styled("  |  injected chunks: ", theme.label()),
+                        Span::raw(if o.context.is_some() { o.hits.len() } else { 0 }.to_string()),
+                        Span::styled("  |  latency: ", theme.label()),
+                        Span::raw(format!("{}ms", o.latency_ms)),
+                    ]),
+                ]),
+            },
+        }
     };
-    let status = Paragraph::new(status_text)
+    let status = Paragraph::new(status)
         .wrap(Wrap { trim: false })
-        .block(Block::default().borders(Borders::ALL).title(" pipeline "));
+        .block(block(" pipeline "));
     f.render_widget(status, chunks[1]);
 
     // 히트 + 컨텍스트
@@ -354,20 +440,15 @@ fn draw(f: &mut Frame, app: &App) {
             o.hits
                 .iter()
                 .map(|h| {
-                    ListItem::new(format!(
-                        "{:.1} {}",
-                        h.score,
-                        h.file.strip_prefix("kmd://").unwrap_or(&h.file)
-                    ))
+                    ListItem::new(Line::from(vec![
+                        Span::styled(format!("{:.1} ", h.score), theme.success()),
+                        Span::raw(h.file.strip_prefix("kmd://").unwrap_or(&h.file).to_string()),
+                    ]))
                 })
                 .collect()
         })
         .unwrap_or_default();
-    let hits = List::new(hit_items).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title(" hits (claude collections) "),
-    );
+    let hits = List::new(hit_items).block(block(" hits (claude collections) "));
     f.render_widget(hits, body_chunks[0]);
 
     let ctx_text = app
@@ -375,15 +456,101 @@ fn draw(f: &mut Frame, app: &App) {
         .as_ref()
         .and_then(|o| o.context.clone())
         .unwrap_or_else(|| "(주입될 컨텍스트 없음)".into());
-    let ctx = Paragraph::new(ctx_text).wrap(Wrap { trim: false }).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title(" injected <kmd-context> "),
-    );
+    let ctx = Paragraph::new(ctx_text)
+        .wrap(Wrap { trim: false })
+        .block(block(" injected <kmd-context> "));
     f.render_widget(ctx, body_chunks[1]);
 
     // 도움말
-    let help = Paragraph::new("Enter: run  ↑/↓: history  Ctrl-U: clear  Esc: quit")
-        .style(crate::palette::muted());
+    let help =
+        Paragraph::new("Enter: run  ↑/↓: history  Ctrl-U: clear  Esc: quit").style(theme.muted());
     f.render_widget(help, chunks[3]);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn press(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn outcome(query: &str) -> RagOutcome {
+        RagOutcome {
+            gate_reason: None,
+            query: Some(query.to_string()),
+            hits: Vec::new(),
+            context: None,
+            latency_ms: 1,
+        }
+    }
+
+    /// Enter must return immediately and leave the query running on a worker;
+    /// the screen keeps drawing and the result lands through poll().
+    #[test]
+    fn a_running_query_does_not_block_and_lands_through_poll() {
+        let mut app = App::new(Vec::new(), Theme::plain());
+        let (release, gate) = std::sync::mpsc::channel::<()>();
+        app.job.replace(move || {
+            gate.recv().ok();
+            Ok(outcome("slow"))
+        });
+        assert!(app.job.in_flight());
+        assert!(!app.poll(), "nothing lands before the job finishes");
+
+        // Typing keeps working while the query runs.
+        app.handle_key(press(KeyCode::Char('x')));
+        assert_eq!(app.input, "x");
+
+        let backend = ratatui::backend::TestBackend::new(100, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        let screen: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(screen.contains("running against the local kmd index"));
+
+        release.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !app.poll() {
+            assert!(Instant::now() < deadline, "result never landed");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(app.outcome.unwrap().query.as_deref(), Some("slow"));
+    }
+
+    #[test]
+    fn clearing_the_prompt_drops_the_running_query() {
+        let mut app = App::new(Vec::new(), Theme::plain());
+        app.input = "old".into();
+        let (release, gate) = std::sync::mpsc::channel::<()>();
+        app.job.replace(move || {
+            gate.recv().ok();
+            Ok(outcome("old"))
+        });
+        app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        assert!(app.input.is_empty());
+        release.send(()).unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(!app.poll());
+        assert!(app.outcome.is_none());
+    }
+
+    #[test]
+    fn enter_on_an_empty_prompt_starts_nothing() {
+        let mut app = App::new(Vec::new(), Theme::plain());
+        app.handle_key(press(KeyCode::Enter));
+        assert!(!app.job.in_flight());
+    }
+
+    #[test]
+    fn esc_and_ctrl_c_quit() {
+        let mut app = App::new(Vec::new(), Theme::plain());
+        assert!(app.handle_key(press(KeyCode::Esc)));
+        assert!(app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)));
+    }
 }

@@ -1,5 +1,9 @@
-//! Semantic, terminal-native colors for the operations dashboard.
+//! Marks up the dashboard's plain-text bodies (Operations, session detail)
+//! with semantic roles from `crate::theme`: headings, OK/FAIL badges, warning
+//! suffixes, and RAG status tokens. Which role means which color lives in
+//! `theme.rs`; this module only decides which part of a line plays which role.
 
+use crate::theme::Theme;
 use ratatui::prelude::*;
 
 pub const BADGE_OK: &str = "● OK";
@@ -11,79 +15,9 @@ pub fn warning_suffix(warn: bool) -> &'static str {
 }
 
 #[derive(Clone, Copy, Debug)]
-pub struct Theme {
-    colors: bool,
-}
-
-#[derive(Clone, Copy, Debug)]
 pub enum BodyKind {
     Sessions,
     Operations,
-}
-
-impl Theme {
-    pub fn from_env() -> Self {
-        Self {
-            colors: std::env::var_os("NO_COLOR").is_none(),
-        }
-    }
-
-    #[cfg(test)]
-    pub fn colored() -> Self {
-        Self { colors: true }
-    }
-
-    #[cfg(test)]
-    pub fn plain() -> Self {
-        Self { colors: false }
-    }
-
-    fn fg(self, color: Color) -> Style {
-        // NO_COLOR removes hues while preserving non-color emphasis such as bold and reverse.
-        if self.colors {
-            Style::default().fg(color)
-        } else {
-            Style::default()
-        }
-    }
-
-    pub fn accent(self) -> Style {
-        self.fg(Color::Cyan)
-    }
-
-    pub fn muted(self) -> Style {
-        // Gray stays legible on dark themes where DarkGray often disappears.
-        self.fg(Color::Gray)
-    }
-
-    pub fn success(self) -> Style {
-        self.fg(Color::Green)
-    }
-
-    pub fn warning(self) -> Style {
-        self.fg(Color::Yellow)
-    }
-
-    pub fn error(self) -> Style {
-        self.fg(Color::Red)
-    }
-
-    pub fn info(self) -> Style {
-        self.fg(Color::LightBlue)
-    }
-
-    pub fn heading(self) -> Style {
-        self.accent().add_modifier(Modifier::BOLD)
-    }
-
-    pub fn selected(self) -> Style {
-        self.accent()
-            .add_modifier(Modifier::BOLD | Modifier::REVERSED)
-    }
-
-    pub fn border(self) -> Style {
-        self.muted()
-    }
 }
 
 pub fn style_body(kind: BodyKind, body: String, theme: Theme) -> Text<'static> {

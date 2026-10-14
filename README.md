@@ -189,19 +189,21 @@ are working right now rather than which ones merely finished something today.
 
 ### Keys
 
-No binding uses `Ctrl`, `Alt`, or `Cmd` — those chords stay with the terminal and
-the tmux prefix, and the dashboard passes them through untouched. Press `?` for
-the full keymap.
+No binding uses `Alt` or `Cmd`, and the only `Ctrl` chord is `Ctrl-C` (quit from
+anywhere, including while typing a query) — the rest stay with the terminal and the
+tmux prefix, and the dashboard passes them through untouched. Press `?` for the full
+keymap; the overlay, the footer hints and each view's "Action" line are all generated
+from the same table in `src/dashboard_keys.rs`, so they always match what the keys do.
 
 | Key | Action |
 |---|---|
 | `1`–`3`, `Tab`/`Shift-Tab`, `h`/`l`, `←`/`→` | switch view |
 | `j`/`k`, `↑`/`↓` | select a query session or scroll Operations |
-| `PgUp`/`PgDn`, `g`/`G` | scroll query results or the current view |
+| `PgUp`/`PgDn`, `g`/`G`, `Home`/`End` | scroll query results or the current view |
 | `r` | refresh the snapshot |
 | `t` | run the self-check suite |
-| `?` | toggle the keymap overlay |
-| `q`, `Esc` | quit |
+| `?` | keymap overlay (`j`/`k` scroll it, any other key closes it) |
+| `q`, `Ctrl-C` | quit (`Esc` never quits) |
 
 The Simulator view splits input into command and typing modes:
 
@@ -211,12 +213,28 @@ The Simulator view splits input into command and typing modes:
 | command | `Enter` | run the query |
 | command | `m` | RAG pipeline ⇄ BM25 search ⇄ Global |
 | command | `j`/`k` | select a hit |
-| command | `J`/`K` | scroll result detail |
+| command | `J`/`K`, `PgDn`/`PgUp` | scroll result detail |
 | command | `n`/`p` | next / previous prompt history |
 | command | `x` | clear the query |
 | typing | `Esc` | back to command mode |
 | typing | `Enter` | run the query |
 | typing | `↑`/`↓` | recall prompt history |
+
+Rebind any action by name in `~/.config/kmd/keys.yaml` (or `$KMD_CONFIG_DIR/keys.yaml`).
+Names are listed in `src/dashboard_keys.rs`; a value is one key or a list. Keys are a
+single character or one of `enter esc tab backtab up down left right pgup pgdn home end
+space`. A file with an unknown action, a Ctrl chord, or a key that would collide with
+another binding is ignored as a whole and the dashboard says why in its status line.
+
+```yaml
+sim.mode: M
+view.next: [tab, "]"]
+```
+
+The dashboard remembers the open view, the selected session, the Simulator mode and the
+last query in `$XDG_STATE_HOME/kmd/ui.json` (`~/.local/state/kmd/ui.json` by default)
+and restores them on the next start. The file is written from a worker thread with a
+temp-file rename, so a crash never leaves it half-written.
 
 RAG mode shows gate → extracted query → filtered hits → injected context; BM25 mode
 shows raw retrieval; Global mode is `kmd global` in the TUI — hits arrive grouped under

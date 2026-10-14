@@ -81,7 +81,7 @@ fn default_pattern() -> String {
     "**/*.md".to_string()
 }
 
-fn config_home() -> PathBuf {
+pub fn config_home() -> PathBuf {
     if let Ok(dir) = std::env::var("KMD_CONFIG_DIR") {
         return PathBuf::from(dir);
     }
