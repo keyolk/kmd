@@ -34,6 +34,9 @@ pub struct SimulatorState {
     pub running: bool,
     pub selected_hit: usize,
     pub detail_scroll: u16,
+    /// Largest useful `detail_scroll` for the detail pane drawn last (layout
+    /// feedback from draw, so `K` can scroll back up after overshooting).
+    detail_max: std::cell::Cell<u16>,
     typing: bool,
     history: Vec<String>,
     history_idx: Option<usize>,
@@ -44,6 +47,10 @@ pub struct SimulatorState {
 
 impl SimulatorState {
     pub fn new() -> Self {
+        Self::new_with_history(sim::prompt_history())
+    }
+
+    fn new_with_history(history: Vec<String>) -> Self {
         let (tx, rx) = mpsc::channel();
         Self {
             input: String::new(),
@@ -53,8 +60,9 @@ impl SimulatorState {
             running: false,
             selected_hit: 0,
             detail_scroll: 0,
+            detail_max: std::cell::Cell::new(u16::MAX),
             typing: false,
-            history: sim::prompt_history(),
+            history,
             history_idx: None,
             generation: 0,
             tx,
@@ -62,13 +70,22 @@ impl SimulatorState {
         }
     }
 
+    /// A simulator that does not read ~/.claude/history.jsonl, for hermetic tests.
+    #[cfg(test)]
+    pub fn without_history() -> Self {
+        Self::new_with_history(Vec::new())
+    }
+
     pub fn typing(&self) -> bool {
         self.typing
     }
 
+    /// Runs the current query. A query still running is superseded, not waited
+    /// on: Enter after editing used to be ignored while the old query ran, so
+    /// the result shown belonged to text no longer in the box.
     pub fn run(&mut self) {
         let input = self.input.trim().to_string();
-        if input.is_empty() || self.running {
+        if input.is_empty() {
             return;
         }
         self.generation += 1;
@@ -80,10 +97,22 @@ impl SimulatorState {
         self.selected_hit = 0;
         self.detail_scroll = 0;
         std::thread::spawn(move || {
+            // run_caught turns a panic into an error; otherwise nothing is sent
+            // and RUNNING never clears.
             let result =
-                sim::execute(mode, &input, SEARCH_LIMIT).map_err(|error| error.to_string());
+                crate::dashboard_worker::run_caught(|| sim::execute(mode, &input, SEARCH_LIMIT));
+            // The receiver lives as long as the dashboard; a failed send only
+            // means the dashboard already exited.
             let _ = tx.send((generation, result));
         });
+    }
+
+    /// Drops the in-flight query's result when it arrives. Used when the mode
+    /// or the query changes under it, so a result for the old mode or a cleared
+    /// query is never shown under the new state.
+    fn invalidate(&mut self) {
+        self.generation += 1;
+        self.running = false;
     }
 
     pub fn poll(&mut self) -> bool {
@@ -140,11 +169,13 @@ impl SimulatorState {
             KeyCode::Char('i') | KeyCode::Char('/') => self.typing = true,
             KeyCode::Enter => self.run(),
             KeyCode::Char('m') => {
+                self.invalidate();
                 self.mode = self.mode.toggle();
                 self.result = None;
                 self.error = None;
             }
             KeyCode::Char('x') => {
+                self.invalidate();
                 self.input.clear();
                 self.result = None;
                 self.error = None;
@@ -155,10 +186,16 @@ impl SimulatorState {
             KeyCode::Char('j') => self.next_hit(),
             KeyCode::Char('k') => self.previous_hit(),
             KeyCode::Char('J') | KeyCode::PageDown => {
-                self.detail_scroll = self.detail_scroll.saturating_add(8)
+                self.detail_scroll = self
+                    .detail_scroll
+                    .min(self.detail_max.get())
+                    .saturating_add(8)
             }
             KeyCode::Char('K') | KeyCode::PageUp => {
-                self.detail_scroll = self.detail_scroll.saturating_sub(8)
+                self.detail_scroll = self
+                    .detail_scroll
+                    .min(self.detail_max.get())
+                    .saturating_sub(8)
             }
             KeyCode::Home => self.detail_scroll = 0,
             _ => {}
@@ -545,21 +582,18 @@ fn draw_detail(frame: &mut Frame, area: Rect, state: &SimulatorState) {
             ))],
         ),
     };
-    frame.render_widget(
-        Paragraph::new(lines)
-            .scroll((state.detail_scroll, 0))
-            .wrap(Wrap { trim: false })
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_style(palette::border())
-                    .title(Line::from(vec![
-                        Span::styled(title.to_string(), palette::heading()),
-                        Span::styled("· J/K scrolls ".to_string(), palette::muted()),
-                    ])),
-            ),
-        area,
-    );
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(palette::border())
+        .title(Line::from(vec![
+            Span::styled(title.to_string(), palette::heading()),
+            Span::styled("· J/K scrolls ".to_string(), palette::muted()),
+        ]));
+    let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
+    let (scroll, max) =
+        crate::dashboard_layout::clamp_scroll(&paragraph, block.inner(area), state.detail_scroll);
+    state.detail_max.set(max);
+    frame.render_widget(paragraph.scroll((scroll, 0)).block(block), area);
 }
 
 #[cfg(test)]
@@ -688,6 +722,38 @@ mod tests {
 
         state.handle_command_key(press(KeyCode::Char('K')));
         assert_eq!(state.detail_scroll, 0);
+    }
+
+    /// A result for the previous mode used to land after `m` and show under
+    /// the new mode's title.
+    #[test]
+    fn mode_switch_drops_the_in_flight_result() {
+        let mut state = SimulatorState::without_history();
+        state.running = true;
+        let in_flight = state.generation;
+        state.handle_command_key(press(KeyCode::Char('m')));
+        assert!(!state.running);
+
+        state
+            .tx
+            .send((in_flight, Ok(global_result(vec![("session", 1)]))))
+            .unwrap();
+        assert!(!state.poll());
+        assert!(state.result.is_none());
+    }
+
+    #[test]
+    fn clearing_the_query_drops_the_in_flight_result() {
+        let mut state = SimulatorState::without_history();
+        state.input = "old query".into();
+        state.running = true;
+        let in_flight = state.generation;
+        state.handle_command_key(press(KeyCode::Char('x')));
+
+        state.tx.send((in_flight, Err("late".into()))).unwrap();
+        assert!(!state.poll());
+        assert!(state.error.is_none());
+        assert!(!state.running);
     }
 
     #[test]

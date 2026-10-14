@@ -1490,6 +1490,7 @@ dependencies = [
  "serde_yaml",
  "sha2",
  "tantivy",
+ "unicode-width 0.2.0",
  "walkdir",
 ]
 

@@ -41,7 +41,10 @@ anyhow = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 
 # TUI (kmd sim)
-ratatui = "0.29"
+# line_count() bounds pane scrolling to the wrapped content height.
+ratatui = { version = "0.29", features = ["unstable-rendered-line-info"] }
+# Cell widths for truncation; same version ratatui pins.
+unicode-width = "0.2.0"
 crossterm = "0.28"
 
 [profile.release]

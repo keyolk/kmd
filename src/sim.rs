@@ -384,6 +384,6 @@ fn draw(f: &mut Frame, app: &App) {
 
     // 도움말
     let help = Paragraph::new("Enter: run  ↑/↓: history  Ctrl-U: clear  Esc: quit")
-        .style(Style::default().fg(Color::DarkGray));
+        .style(crate::palette::muted());
     f.render_widget(help, chunks[3]);
 }
