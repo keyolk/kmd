@@ -729,9 +729,9 @@ mod tests {
     #[test]
     fn the_hangul_gate_admits_short_but_complete_questions() {
         for q in [
-            "노드가 안 뜨는데 어디를 봐야 하지",     // 19자
-            "메모리 사용량 그래프를 어디서 뽑지",     // 19자
-            "테라폼 레포가 어떻게 나뉘어 있지",       // 18자
+            "노드가 안 뜨는데 어디를 봐야 하지",  // 19자
+            "메모리 사용량 그래프를 어디서 뽑지", // 19자
+            "테라폼 레포가 어떻게 나뉘어 있지",   // 18자
         ] {
             assert!(
                 gate(q).is_ok(),

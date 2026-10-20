@@ -45,7 +45,12 @@ pub fn serve() -> Result<()> {
         let req: Value = match serde_json::from_str(trimmed) {
             Ok(v) => v,
             Err(e) => {
-                write_error(&mut out, Value::Null, -32700, &format!("parse error: {}", e))?;
+                write_error(
+                    &mut out,
+                    Value::Null,
+                    -32700,
+                    &format!("parse error: {}", e),
+                )?;
                 continue;
             }
         };
@@ -87,7 +92,11 @@ fn handle_tool_call(out: &mut impl Write, req: &Value, id: Value) -> Result<()> 
     let args = params.get("arguments").cloned().unwrap_or(json!({}));
 
     match call_tool(name, &args) {
-        Ok(text) => write_result(out, id, json!({"content": [{"type": "text", "text": text}]})),
+        Ok(text) => write_result(
+            out,
+            id,
+            json!({"content": [{"type": "text", "text": text}]}),
+        ),
         // 도구 오류는 in-band로 돌려준다. 요청 자체를 실패시키면 모델이 이유를
         // 못 보고 같은 호출을 반복한다.
         Err(e) => write_result(
@@ -202,7 +211,11 @@ fn search_axes(query: &str, limit: usize, axis: Option<&str>) -> Result<Vec<glob
 
 /// 데몬의 `global` 커맨드를 시도한다. 데몬이 없거나 그 커맨드를 모르는 구버전이면
 /// None을 돌려 호출자가 인프로세스로 폴백하게 한다.
-fn daemon_global(query: &str, limit: usize, axis: Option<&str>) -> Option<Vec<global::AxisResults>> {
+fn daemon_global(
+    query: &str,
+    limit: usize,
+    axis: Option<&str>,
+) -> Option<Vec<global::AxisResults>> {
     let mut payload = json!({"cmd": "global", "query": query, "limit": limit});
     if let Some(a) = axis {
         payload["axis"] = json!(a);
@@ -270,7 +283,10 @@ fn render_hit(hit: &bm25::SearchHit) -> String {
     // (컬렉션이 설정에서 빠진 경우) kmd URI로 폴백하되 열 수 없음을 명시한다.
     let mut s = match &hit.abspath {
         Some(p) => format!("{}\n", p),
-        None => format!("{} (path unresolved — collection not in index.yml)\n", hit.file),
+        None => format!(
+            "{} (path unresolved — collection not in index.yml)\n",
+            hit.file
+        ),
     };
     if !hit.title.is_empty() {
         s.push_str(&format!("  {}\n", one_line(&hit.title, 100)));
@@ -283,10 +299,7 @@ fn render_hit(hit: &bm25::SearchHit) -> String {
 
 /// 개행을 접고 길이를 자른다. 원문 개행이 그대로 나가면 히트 경계가 사라진다.
 fn one_line(s: &str, max: usize) -> String {
-    let folded: String = s
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ");
+    let folded: String = s.split_whitespace().collect::<Vec<_>>().join(" ");
     if folded.chars().count() <= max {
         return folded;
     }
@@ -463,6 +476,10 @@ mod tests {
             hits: vec![],
         }]);
         assert!(out.contains("no hits"), "{}", out);
-        assert!(out.contains("kmd_status"), "points at the diagnostic: {}", out);
+        assert!(
+            out.contains("kmd_status"),
+            "points at the diagnostic: {}",
+            out
+        );
     }
 }

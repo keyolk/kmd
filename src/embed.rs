@@ -62,8 +62,8 @@ impl Embedder {
         }
         let backend = LlamaBackend::init()?;
         let params = LlamaModelParams::default();
-        let model = LlamaModel::load_from_file(&backend, &path, &params)
-            .context("load embedding model")?;
+        let model =
+            LlamaModel::load_from_file(&backend, &path, &params).context("load embedding model")?;
         Ok(Embedder { backend, model })
     }
 
@@ -212,8 +212,10 @@ pub fn embed_pending(
     }
     sql.push_str(" ORDER BY d.id");
     let mut stmt = store.conn.prepare(&sql)?;
-    let params: Vec<&dyn rusqlite::ToSql> =
-        collections.iter().map(|c| c as &dyn rusqlite::ToSql).collect();
+    let params: Vec<&dyn rusqlite::ToSql> = collections
+        .iter()
+        .map(|c| c as &dyn rusqlite::ToSql)
+        .collect();
     let docs: Vec<(i64, String, String)> = stmt
         .query_map(params.as_slice(), |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
         .collect::<std::result::Result<_, _>>()?;
@@ -510,8 +512,7 @@ pub fn hybrid_with(
         .filter(|n| *n >= 1)
         .unwrap_or(CANDIDATE_FACTOR);
     let pool = (limit * factor).min(limit.max(CANDIDATE_CAP));
-    let bm = crate::bm25::search_in(tantivy_dir, cfg, query, pool, collections)
-        .unwrap_or_default();
+    let bm = crate::bm25::search_in(tantivy_dir, cfg, query, pool, collections).unwrap_or_default();
     let vs = vsearch_with(store, query, pool, collections, warm).unwrap_or_default();
 
     Ok(fuse_rrf(bm, vs, limit, K))
@@ -524,12 +525,7 @@ pub fn hybrid_with(
 /// 기여를 한 번 받고, 양쪽에 흔하게 걸친 무관 문서는 두 번 받는다. 후보창이
 /// 좁으면 이 산술이 뒤집힌다 — `pool=10`에서 양쪽 10위 문서(2/(60+10)=0.029)가
 /// 벡터 1위 정답(1/61=0.016)을 이긴다. 창을 넓히는 것이 호출부의 대응이다.
-fn fuse_rrf(
-    bm: Vec<SearchHit>,
-    vs: Vec<SearchHit>,
-    limit: usize,
-    k: f32,
-) -> Vec<SearchHit> {
+fn fuse_rrf(bm: Vec<SearchHit>, vs: Vec<SearchHit>, limit: usize, k: f32) -> Vec<SearchHit> {
     use std::collections::HashMap;
     let mut fused: HashMap<String, (f32, SearchHit)> = HashMap::new();
     for list in [bm, vs] {
@@ -598,8 +594,16 @@ mod tests {
         // b와 c는 (1위, 3위)와 (3위, 1위)로 정확히 같은 점수를 받는다.
         // a는 (2위, 2위)라 근소하게 낮다 — 1/61+1/63 > 2/62. 볼록성 때문이고,
         // 여기서 확인하려는 것은 그 서열이 아니라 **동점 b/c의 순서**다.
-        let bm = vec![hit("kmd://c/b.md"), hit("kmd://c/a.md"), hit("kmd://c/c.md")];
-        let vs = vec![hit("kmd://c/c.md"), hit("kmd://c/a.md"), hit("kmd://c/b.md")];
+        let bm = vec![
+            hit("kmd://c/b.md"),
+            hit("kmd://c/a.md"),
+            hit("kmd://c/c.md"),
+        ];
+        let vs = vec![
+            hit("kmd://c/c.md"),
+            hit("kmd://c/a.md"),
+            hit("kmd://c/b.md"),
+        ];
         let out = fuse_rrf(bm, vs, 3, 60.0);
         let files: Vec<&str> = out.iter().map(|h| h.file.as_str()).collect();
         assert_eq!(

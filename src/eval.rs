@@ -161,14 +161,9 @@ fn run_engine(
         #[cfg(feature = "embed")]
         Engine::Vector => crate::embed::vsearch_in(store, query, k, collections),
         #[cfg(feature = "embed")]
-        Engine::Hybrid => crate::embed::hybrid_in(
-            store,
-            &config::tantivy_dir(),
-            cfg,
-            query,
-            k,
-            collections,
-        ),
+        Engine::Hybrid => {
+            crate::embed::hybrid_in(store, &config::tantivy_dir(), cfg, query, k, collections)
+        }
         #[cfg(not(feature = "embed"))]
         Engine::Vector | Engine::Hybrid => {
             let _ = store;
@@ -214,10 +209,7 @@ fn embedded_collections(cfg: &config::IndexConfig) -> Vec<String> {
 ///
 /// 그래서 커버리지를 리포트에 같이 싣는다. 100%가 아닌 대조 결과는 엔진 우열의
 /// 근거로 쓸 수 없다 — 숫자는 나오지만 무엇을 재는지가 정해지지 않는다.
-fn embedding_coverage(
-    store: &crate::store::Store,
-    collections: &[&str],
-) -> Result<(i64, i64)> {
+fn embedding_coverage(store: &crate::store::Store, collections: &[&str]) -> Result<(i64, i64)> {
     if collections.is_empty() {
         return Ok((0, 0));
     }
@@ -234,9 +226,10 @@ fn embedding_coverage(
         .iter()
         .map(|c| c as &dyn rusqlite::ToSql)
         .collect();
-    let (total, embedded): (i64, Option<i64>) = store
-        .conn
-        .query_row(&sql, params.as_slice(), |r| Ok((r.get(0)?, r.get(1)?)))?;
+    let (total, embedded): (i64, Option<i64>) =
+        store
+            .conn
+            .query_row(&sql, params.as_slice(), |r| Ok((r.get(0)?, r.get(1)?)))?;
     Ok((total, embedded.unwrap_or(0)))
 }
 
@@ -269,7 +262,9 @@ fn warn_partial_coverage(
 /// 양쪽 경로를 동일 정규화(공백류→'-', 소문자)한 full-path로 매칭한다.
 fn rank_kmd(expected: &str, hits: &[String]) -> Option<usize> {
     let want = norm_path(expected);
-    hits.iter().position(|f| norm_path(f) == want).map(|i| i + 1)
+    hits.iter()
+        .position(|f| norm_path(f) == want)
+        .map(|i| i + 1)
 }
 
 /// 경로 정규화 — 스킴 접두어를 벗기고, 공백/연속 공백을 '-'로, 소문자화.
@@ -323,7 +318,11 @@ fn make_query(title: &str, body: &str) -> Option<(String, bool)> {
         .lines()
         .map(|l| l.trim())
         .filter(|l| l.chars().count() >= 12)
-        .max_by_key(|l| l.chars().filter(|c| ('\u{AC00}'..='\u{D7A3}').contains(c)).count());
+        .max_by_key(|l| {
+            l.chars()
+                .filter(|c| ('\u{AC00}'..='\u{D7A3}').contains(c))
+                .count()
+        });
 
     if let Some(line) = best_ko {
         if rag::has_hangul(line) {
@@ -357,16 +356,26 @@ fn fnv1a(s: &str) -> u64 {
     h
 }
 
-fn load_samples(collections: &[String], sample: usize, hangul_only: bool) -> Result<Vec<DocSample>> {
+fn load_samples(
+    collections: &[String],
+    sample: usize,
+    hangul_only: bool,
+) -> Result<Vec<DocSample>> {
     let store = crate::store::Store::open(&config::store_path())?;
-    let placeholders = collections.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    let placeholders = collections
+        .iter()
+        .map(|_| "?")
+        .collect::<Vec<_>>()
+        .join(",");
     let sql = format!(
         "SELECT collection, relpath, title, body FROM documents \
          WHERE active = 1 AND collection IN ({placeholders})"
     );
     let mut stmt = store.conn.prepare(&sql)?;
-    let params: Vec<&dyn rusqlite::ToSql> =
-        collections.iter().map(|c| c as &dyn rusqlite::ToSql).collect();
+    let params: Vec<&dyn rusqlite::ToSql> = collections
+        .iter()
+        .map(|c| c as &dyn rusqlite::ToSql)
+        .collect();
     let rows = stmt.query_map(params.as_slice(), |r| {
         Ok((
             r.get::<_, String>(0)?,
@@ -518,8 +527,8 @@ pub fn gold(
 ) -> Result<()> {
     let raw = std::fs::read_to_string(path)
         .with_context(|| format!("cannot read gold file {}", path.display()))?;
-    let cases: Vec<GoldCase> =
-        serde_yaml::from_str(&raw).with_context(|| format!("invalid gold yaml {}", path.display()))?;
+    let cases: Vec<GoldCase> = serde_yaml::from_str(&raw)
+        .with_context(|| format!("invalid gold yaml {}", path.display()))?;
     if cases.is_empty() {
         anyhow::bail!("gold file has no cases");
     }
@@ -556,8 +565,10 @@ pub fn gold(
             let t = Instant::now();
             let hits = run_engine(*eng, &cfg, &store, &query, &c.prompt, k, scope_ref)?;
             let lat = t.elapsed().as_millis();
-            let rank =
-                gold_rank(&c.expect_any, hits.iter().map(|h| (h.file.as_str(), h.title.as_str())));
+            let rank = gold_rank(
+                &c.expect_any,
+                hits.iter().map(|h| (h.file.as_str(), h.title.as_str())),
+            );
             rep.all.record(rank, lat);
             if hangul {
                 rep.korean.record(rank, lat);
@@ -617,7 +628,10 @@ fn print_report(mode: &str, scope: &[String], k: usize, reports: &[&EngineReport
     println!("scope: {}", scope.join(", "));
     println!();
     let q = reports[0].all.queries;
-    println!("queries: {} total  ({} korean, {} english)", q, reports[0].korean.queries, reports[0].english.queries);
+    println!(
+        "queries: {} total  ({} korean, {} english)",
+        q, reports[0].korean.queries, reports[0].english.queries
+    );
     println!();
 
     for label in ["all", "korean", "english"] {
@@ -675,7 +689,10 @@ mod tests {
             "qmd://learnings/20260429-0-abc.md".to_string(),
         ];
         // expected는 공백형, 히트는 하이픈형이어도 rank 2로 매칭.
-        assert_eq!(rank_kmd("qmd://learnings/20260429 0-abc.md", &hits), Some(2));
+        assert_eq!(
+            rank_kmd("qmd://learnings/20260429 0-abc.md", &hits),
+            Some(2)
+        );
     }
 
     #[test]
@@ -691,9 +708,18 @@ mod tests {
             ("qmd://claude-memory/tls-certs.md", "TLS Certs"),
         ];
         // 첫 매칭의 1-based rank.
-        assert_eq!(gold_rank(&["tls-certs".into()], hits.iter().copied()), Some(2));
-        assert_eq!(gold_rank(&["keepalive".into()], hits.iter().copied()), Some(1));
-        assert_eq!(gold_rank(&["nonexistent".into()], hits.iter().copied()), None);
+        assert_eq!(
+            gold_rank(&["tls-certs".into()], hits.iter().copied()),
+            Some(2)
+        );
+        assert_eq!(
+            gold_rank(&["keepalive".into()], hits.iter().copied()),
+            Some(1)
+        );
+        assert_eq!(
+            gold_rank(&["nonexistent".into()], hits.iter().copied()),
+            None
+        );
     }
 
     #[test]

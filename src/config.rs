@@ -72,8 +72,7 @@ impl Collection {
 
     /// 본문을 store에 복사할지 — 명시값이 없으면 source에서 정한다.
     pub fn stores_body(&self) -> bool {
-        self.store_body
-            .unwrap_or(self.source != Source::GitRepos)
+        self.store_body.unwrap_or(self.source != Source::GitRepos)
     }
 }
 

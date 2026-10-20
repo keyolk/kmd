@@ -56,10 +56,13 @@ fn build_answer_map() -> HashMap<(String, String), String> {
 fn scan_transcript(raw: &str, map: &mut HashMap<(String, String), String>) {
     let mut cur: Option<(String, String)> = None; // (session_id, prompt_key)
     let mut buf = String::new();
-    let flush = |cur: &Option<(String, String)>, buf: &mut String, map: &mut HashMap<(String, String), String>| {
+    let flush = |cur: &Option<(String, String)>,
+                 buf: &mut String,
+                 map: &mut HashMap<(String, String), String>| {
         if let Some(key) = cur {
             if !buf.trim().is_empty() {
-                map.entry(key.clone()).or_insert_with(|| std::mem::take(buf));
+                map.entry(key.clone())
+                    .or_insert_with(|| std::mem::take(buf));
             }
         }
         buf.clear();
@@ -214,7 +217,8 @@ pub fn print_utilization(since_secs: Option<u64>, json: bool) -> Result<()> {
     let mut korean_util = 0usize;
     let mut examples: Vec<(f64, String)> = Vec::new();
     // 무엇이 증강되나 — 컬렉션별 주입 파일 수
-    let mut coll_count: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    let mut coll_count: std::collections::BTreeMap<String, usize> =
+        std::collections::BTreeMap::new();
     for e in &entries {
         for h in &e.hits {
             *coll_count.entry(collection_of(&h.file)).or_default() += 1;
@@ -267,7 +271,10 @@ pub fn print_utilization(since_secs: Option<u64>, json: bool) -> Result<()> {
             continue;
         }
         let ans_tokens = tokens(answer);
-        let hit = sig_tokens.iter().filter(|t| ans_tokens.contains(*t)).count();
+        let hit = sig_tokens
+            .iter()
+            .filter(|t| ans_tokens.contains(*t))
+            .count();
         let overlap = hit as f64 / sig_tokens.len() as f64;
         overlap_sum += overlap;
         if overlap >= UTILIZED_THRESHOLD {
@@ -285,13 +292,20 @@ pub fn print_utilization(since_secs: Option<u64>, json: bool) -> Result<()> {
                 }
             }
         }
-        examples.push((overlap, format!("{:.0}% {}", overlap * 100.0, short(&e.prompt))));
+        examples.push((
+            overlap,
+            format!("{:.0}% {}", overlap * 100.0, short(&e.prompt)),
+        ));
     }
 
     examples.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
 
     let utilization_rate = pct(utilized, matched);
-    let avg_overlap = if matched > 0 { 100.0 * overlap_sum / matched as f64 } else { 0.0 };
+    let avg_overlap = if matched > 0 {
+        100.0 * overlap_sum / matched as f64
+    } else {
+        0.0
+    };
     let metrics = serde_json::json!({
         "injected_total": injected_total,
         "matched_to_answer": matched,
@@ -305,7 +319,9 @@ pub fn print_utilization(since_secs: Option<u64>, json: bool) -> Result<()> {
     });
     crate::evaluation_log::record(
         "utilization",
-        format!("{utilized}/{matched} utilized · {utilization_rate:.0}% · {injected_total} injected"),
+        format!(
+            "{utilized}/{matched} utilized · {utilization_rate:.0}% · {injected_total} injected"
+        ),
         metrics.clone(),
     );
 
@@ -327,7 +343,11 @@ pub fn print_utilization(since_secs: Option<u64>, json: bool) -> Result<()> {
         );
         println!(
             "평균 오버랩:        {:.0}%",
-            if matched > 0 { 100.0 * overlap_sum / matched as f64 } else { 0.0 }
+            if matched > 0 {
+                100.0 * overlap_sum / matched as f64
+            } else {
+                0.0
+            }
         );
         println!("한글 주입/활용:     {} / {}", korean_inj, korean_util);
         let total_files: usize = coll_count.values().sum();
@@ -372,11 +392,20 @@ pub fn print_utilization(since_secs: Option<u64>, json: bool) -> Result<()> {
 }
 
 fn short(s: &str) -> String {
-    s.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(48).collect()
+    s.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(48)
+        .collect()
 }
 
 fn pct(n: usize, d: usize) -> f64 {
-    if d == 0 { 0.0 } else { 100.0 * n as f64 / d as f64 }
+    if d == 0 {
+        0.0
+    } else {
+        100.0 * n as f64 / d as f64
+    }
 }
 
 fn now_secs() -> u64 {
@@ -392,9 +421,7 @@ fn now_secs() -> u64 {
 /// bench/test/hook 등 합성 세션은 제외.
 fn is_real_session(sid: &str) -> bool {
     let b = sid.as_bytes();
-    b.len() >= 9
-        && b[..8].iter().all(|c| c.is_ascii_hexdigit())
-        && b[8] == b'-'
+    b.len() >= 9 && b[..8].iter().all(|c| c.is_ascii_hexdigit()) && b[8] == b'-'
 }
 
 /// 사람이 실제로 물은 프롬프트인지 — task-notification/tool-result 등 자동
@@ -479,7 +506,15 @@ pub fn show(session: Option<&str>, limit: usize, all: bool, json: bool) -> Resul
             println!("      q: {}", q.chars().take(64).collect::<String>());
         }
         for h in &e.hits {
-            println!("      → {}", h.file.replace("qmd://", "").replace("kmd://", "").chars().take(78).collect::<String>());
+            println!(
+                "      → {}",
+                h.file
+                    .replace("qmd://", "")
+                    .replace("kmd://", "")
+                    .chars()
+                    .take(78)
+                    .collect::<String>()
+            );
         }
     }
     println!();
@@ -488,14 +523,22 @@ pub fn show(session: Option<&str>, limit: usize, all: bool, json: bool) -> Resul
 
 /// 답변이 이 엔트리의 주입 신호(snippet 우선, 없으면 query)를 얼마나 재사용했나(0..1).
 fn answer_uses(e: &RagLogEntry, answer: &str) -> f64 {
-    let logged: String = e.hits.iter().map(|h| h.snippet.as_str()).collect::<Vec<_>>().join(" ");
+    let logged: String = e
+        .hits
+        .iter()
+        .map(|h| h.snippet.as_str())
+        .collect::<Vec<_>>()
+        .join(" ");
     let signal = if logged.trim().is_empty() {
         e.query.clone().unwrap_or_default()
     } else {
         logged
     };
     let prompt_tokens = tokens(&e.prompt);
-    let sig: HashSet<String> = tokens(&signal).into_iter().filter(|t| !prompt_tokens.contains(t)).collect();
+    let sig: HashSet<String> = tokens(&signal)
+        .into_iter()
+        .filter(|t| !prompt_tokens.contains(t))
+        .collect();
     if sig.is_empty() {
         return 0.0;
     }
@@ -545,8 +588,12 @@ mod tests {
 
     #[test]
     fn human_prompt_filters_auto() {
-        assert!(is_human_prompt("soda의 모든 로그 소스 싱크 경로 리스트해줘"));
-        assert!(!is_human_prompt("<task-notification>\n<task-id>abc</task-id>"));
+        assert!(is_human_prompt(
+            "soda의 모든 로그 소스 싱크 경로 리스트해줘"
+        ));
+        assert!(!is_human_prompt(
+            "<task-notification>\n<task-id>abc</task-id>"
+        ));
         assert!(!is_human_prompt("<command-message>clear</command-message>"));
         assert!(!is_human_prompt("Caveat: The messages below..."));
     }

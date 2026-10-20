@@ -36,13 +36,16 @@ pub struct ScanStats {
 /// 누구나 같은 오염을 겪고, 그 사실을 알아야 exclude를 쓸 수 있다.
 const ALWAYS_EXCLUDE: &[&str] = &["**/eval/gold.yaml", "**/eval/prompts.txt"];
 
-
 pub fn update(cfg: &IndexConfig, store: &mut Store, force: bool) -> Result<ScanStats> {
     let mut stats = ScanStats::default();
 
     for (name, coll) in &cfg.collections {
         if !coll.path.is_dir() {
-            eprintln!("warn: collection {} path missing: {}", name, coll.path.display());
+            eprintln!(
+                "warn: collection {} path missing: {}",
+                name,
+                coll.path.display()
+            );
             continue;
         }
         // "**/*.{md,txt}" 같은 brace 패턴 지원
@@ -544,7 +547,10 @@ collections:
         assert_eq!(stats.added, 1, "stats: {:?}", stats);
 
         let docs = store.dirty_docs().unwrap();
-        let doc = docs.iter().find(|d| d.relpath.ends_with("main.go")).unwrap();
+        let doc = docs
+            .iter()
+            .find(|d| d.relpath.ends_with("main.go"))
+            .unwrap();
         assert!(doc.body.is_empty(), "body should not be copied into store");
         assert!(doc.abspath.is_some(), "abspath must be recorded");
         // 본문은 원본에서 읽힌다.
