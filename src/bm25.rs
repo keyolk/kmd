@@ -107,7 +107,11 @@ pub fn index_dirty(dir: &Path, store: &mut Store) -> Result<usize> {
             if let Some(body) = crate::store::body_of(d) {
                 // abspath가 있으면 body_stored를 비워 인덱스 크기를 아낀다.
                 // 스니펫은 검색 시점에 원본에서 읽는다.
-                let stored = if d.abspath.is_some() { "" } else { body.as_str() };
+                let stored = if d.abspath.is_some() {
+                    ""
+                } else {
+                    body.as_str()
+                };
                 writer.add_document(doc!(
                     f.doc_id => d.id,
                     f.collection => d.collection.clone(),
@@ -156,10 +160,8 @@ pub fn search_in(
     let reader = index.reader()?;
     let searcher = reader.searcher();
 
-    let mut parser = QueryParser::for_index(
-        &index,
-        vec![f.title_ko, f.title_en, f.body_ko, f.body_en],
-    );
+    let mut parser =
+        QueryParser::for_index(&index, vec![f.title_ko, f.title_en, f.body_ko, f.body_en]);
     parser.set_field_boost(f.title_ko, 2.0);
     parser.set_field_boost(f.title_en, 2.0);
     // 사용자 쿼리는 구문이 아니라 키워드 집합 — lenient 파싱
@@ -170,11 +172,10 @@ pub fn search_in(
     // (project 36만 건 추가 후 실제로 learnings가 통째로 사라졌다).
     let final_query: Box<dyn Query> = match collections {
         Some(want) if !want.is_empty() => {
-            let mut clauses: Vec<(Occur, Box<dyn Query>)> =
-                vec![(Occur::Must, Box::new(BooleanQuery::from(vec![(
-                    Occur::Must,
-                    parsed,
-                )])))];
+            let mut clauses: Vec<(Occur, Box<dyn Query>)> = vec![(
+                Occur::Must,
+                Box::new(BooleanQuery::from(vec![(Occur::Must, parsed)])),
+            )];
             let coll_clauses: Vec<(Occur, Box<dyn Query>)> = want
                 .iter()
                 .map(|c| {

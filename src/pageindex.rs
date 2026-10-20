@@ -761,19 +761,30 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
 
         let empty = learning_fingerprint(&dir);
-        assert!(empty.is_empty(), "an empty directory has an empty fingerprint");
+        assert!(
+            empty.is_empty(),
+            "an empty directory has an empty fingerprint"
+        );
 
         let a = dir.join("20260101-aaaaaaaa.md");
-        fs::write(&a, "Date: 20260101 0000
-").unwrap();
+        fs::write(
+            &a,
+            "Date: 20260101 0000
+",
+        )
+        .unwrap();
         let one = learning_fingerprint(&dir);
         assert_eq!(one.len(), 1, "a new file appears");
         assert_ne!(one, empty);
 
         // 내용이 커지면 크기가 달라진다 — mtime 해상도가 1초라 크기가 더 확실하다.
-        fs::write(&a, "Date: 20260101 0000
+        fs::write(
+            &a,
+            "Date: 20260101 0000
 **User**: something longer
-").unwrap();
+",
+        )
+        .unwrap();
         let grown = learning_fingerprint(&dir);
         assert_ne!(grown, one, "an edited file changes the fingerprint");
 

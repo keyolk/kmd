@@ -28,7 +28,11 @@ pub(crate) fn load_entries(since_secs: Option<u64>) -> Result<Vec<RagLogEntry>> 
 }
 
 fn pct(n: usize, d: usize) -> f64 {
-    if d == 0 { 0.0 } else { 100.0 * n as f64 / d as f64 }
+    if d == 0 {
+        0.0
+    } else {
+        100.0 * n as f64 / d as f64
+    }
 }
 
 pub fn print_stats(since_secs: Option<u64>) -> Result<()> {
@@ -151,12 +155,11 @@ pub fn print_log(count: usize, follow: bool) -> Result<()> {
 }
 
 fn print_entry(e: &RagLogEntry) {
-    let ts = e
-        .ts
-        .parse::<u64>()
-        .ok()
-        .map(fmt_epoch)
-        .unwrap_or_else(|| e.ts.clone());
+    let ts =
+        e.ts.parse::<u64>()
+            .ok()
+            .map(fmt_epoch)
+            .unwrap_or_else(|| e.ts.clone());
     let prompt_short: String = e.prompt.chars().take(60).collect();
     let lang = if e.hangul { "ko" } else { "en" };
 

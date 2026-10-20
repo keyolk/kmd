@@ -1,6 +1,6 @@
 //! Cell-aware text cuts and scroll bounds for the dashboard panes.
 
-use ratatui::layout::Rect;
+use ratatui::layout::{Position, Rect};
 use ratatui::widgets::Paragraph;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -36,6 +36,35 @@ pub fn clamp_scroll(paragraph: &Paragraph, inner: Rect, requested: u16) -> (u16,
     let lines = paragraph.line_count(inner.width);
     let max = u16::try_from(lines.saturating_sub(inner.height as usize)).unwrap_or(u16::MAX);
     (requested.min(max), max)
+}
+
+/// Hit regions the Simulator tab drew last, for the dashboard's mouse handler.
+#[derive(Clone, Debug, Default)]
+pub struct SimLayout {
+    pub query: Option<Rect>,
+    pub hits: Option<ListHit>,
+    pub detail: Option<Rect>,
+}
+
+/// A list as ratatui drew it: `rows[i]` is what screen row `first + i` of
+/// `area` holds (`None` for a header row that is not an item).
+#[derive(Clone, Debug, Default)]
+pub struct ListHit {
+    pub area: Rect,
+    pub first: usize,
+    pub row_height: u16,
+    pub rows: Vec<Option<usize>>,
+}
+
+impl ListHit {
+    /// The item under (x, y), if any.
+    pub fn item_at(&self, x: u16, y: u16) -> Option<usize> {
+        if !self.area.contains(Position { x, y }) || self.row_height == 0 {
+            return None;
+        }
+        let row = self.first + usize::from((y - self.area.y) / self.row_height);
+        self.rows.get(row).copied().flatten()
+    }
 }
 
 #[cfg(test)]

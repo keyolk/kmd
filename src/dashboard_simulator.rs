@@ -27,6 +27,8 @@ pub struct SimulatorState {
     /// Largest useful `detail_scroll` for the detail pane drawn last (layout
     /// feedback from draw, so `K` can scroll back up after overshooting).
     detail_max: std::cell::Cell<u16>,
+    /// Hit regions recorded by `draw`, read by the dashboard's mouse handler.
+    pub layout: std::cell::RefCell<crate::dashboard_layout::SimLayout>,
     typing: bool,
     history: Vec<String>,
     history_idx: Option<usize>,
@@ -49,6 +51,7 @@ impl SimulatorState {
             selected_hit: 0,
             detail_scroll: 0,
             detail_max: std::cell::Cell::new(u16::MAX),
+            layout: Default::default(),
             typing: false,
             history,
             history_idx: None,
@@ -204,6 +207,15 @@ impl SimulatorState {
         }
     }
 
+    /// Selects hit `index` (a mouse click), as `next_hit` would land on it.
+    pub fn select_hit(&mut self, index: usize) {
+        let count = self.result.as_ref().map_or(0, |result| result.hits.len());
+        if index < count {
+            self.selected_hit = index;
+            self.detail_scroll = 0;
+        }
+    }
+
     pub fn next_hit(&mut self) {
         let count = self.result.as_ref().map_or(0, |result| result.hits.len());
         if count > 0 {
@@ -242,6 +254,10 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &SimulatorState, theme: Theme,
         Constraint::Min(6),
     ])
     .split(area);
+    *state.layout.borrow_mut() = crate::dashboard_layout::SimLayout {
+        query: Some(rows[0]),
+        ..Default::default()
+    };
 
     draw_query(frame, rows[0], state, theme, keys);
     draw_status(frame, rows[1], state, theme, keys);
@@ -495,10 +511,18 @@ fn draw_hits(frame: &mut Frame, area: Rect, state: &SimulatorState, theme: Theme
                 .border_style(theme.border())
                 .title(Span::styled(title.to_string(), theme.heading())),
         );
+    let inner = Block::default().borders(Borders::ALL).inner(area);
     frame.render_stateful_widget(list, area, &mut list_state);
+    state.layout.borrow_mut().hits = Some(crate::dashboard_layout::ListHit {
+        area: inner,
+        first: list_state.offset(),
+        row_height: 1,
+        rows: row_to_hit,
+    });
 }
 
 fn draw_detail(frame: &mut Frame, area: Rect, state: &SimulatorState, theme: Theme, keys: &Keymap) {
+    state.layout.borrow_mut().detail = Some(area);
     let (title, lines) = match state.result.as_ref() {
         Some(result) if result.mode == SimulatorMode::Rag => (
             " injected context ",

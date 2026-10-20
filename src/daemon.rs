@@ -215,7 +215,10 @@ fn handle_conn(
             }
             "update" => {
                 if updating.swap(true, Ordering::SeqCst) {
-                    writeln!(writer, r#"{{"ok":true,"queued":false,"reason":"update already running"}}"#)?;
+                    writeln!(
+                        writer,
+                        r#"{{"ok":true,"queued":false,"reason":"update already running"}}"#
+                    )?;
                 } else {
                     // 응답 먼저 (훅이 기다리지 않게), 작업은 이 스레드에서 계속
                     writeln!(writer, r#"{{"ok":true,"queued":true}}"#)?;

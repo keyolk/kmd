@@ -628,6 +628,9 @@ struct App {
     help_scroll: u16,
     /// Largest useful `help_scroll`, fed back from draw like `scroll_max`.
     help_max: std::cell::Cell<u16>,
+    /// Hit regions recorded by the last draw; the mouse handler reads only
+    /// these, so a click lands on what was on screen.
+    mouse_map: mouse::MouseCell,
     keys: Keymap,
     /// Where UI state is persisted; None (tests, no HOME) disables it.
     ui_path: Option<PathBuf>,
@@ -661,6 +664,7 @@ impl App {
             show_help: false,
             help_scroll: 0,
             help_max: std::cell::Cell::new(u16::MAX),
+            mouse_map: Default::default(),
             keys: Keymap::defaults(),
             ui_path: None,
             ui_saver: Background::new(),
@@ -1194,7 +1198,14 @@ fn draw_sessions(frame: &mut Frame, area: Rect, app: &App) {
                     entries.len()
                 )),
         );
+    let list_inner = Block::default().borders(Borders::ALL).inner(columns[0]);
     frame.render_stateful_widget(sessions, columns[0], &mut state);
+    app.mouse_map.borrow_mut().sessions = Some(crate::dashboard_layout::ListHit {
+        area: list_inner,
+        first: state.offset(),
+        row_height: 2, // id line + summary line
+        rows: (0..entries.len()).map(Some).collect(),
+    });
 
     let detail = crate::dashboard_markup::style_body(
         crate::dashboard_markup::BodyKind::Sessions,
@@ -1221,6 +1232,7 @@ fn draw_scrolled(frame: &mut Frame, area: Rect, app: &App, paragraph: Paragraph,
     let (scroll, max) =
         crate::dashboard_layout::clamp_scroll(&paragraph, block.inner(area), app.scroll);
     app.scroll_max.set(max);
+    app.mouse_map.borrow_mut().scrolled = Some(area);
     let position = if max == 0 {
         String::new()
     } else {
@@ -1236,6 +1248,7 @@ fn draw_scrolled(frame: &mut Frame, area: Rect, app: &App, paragraph: Paragraph,
 
 fn draw(frame: &mut Frame, app: &App) {
     let theme = app.theme;
+    *app.mouse_map.borrow_mut() = mouse::MouseMap::default();
     let areas = Layout::vertical([
         Constraint::Length(3),
         Constraint::Length(4),
@@ -1243,11 +1256,14 @@ fn draw(frame: &mut Frame, app: &App) {
         Constraint::Length(1),
     ])
     .split(frame.area());
-    let titles = TABS
+    let title_text = TABS
         .iter()
         .enumerate()
-        .map(|(index, title)| Line::from(format!(" {}:{} ", index + 1, title)))
+        .map(|(index, title)| format!(" {}:{} ", index + 1, title))
         .collect::<Vec<_>>();
+    let tab_inner = Block::default().borders(Borders::ALL).inner(areas[0]);
+    app.mouse_map.borrow_mut().tabs = mouse::tab_rects(tab_inner, &title_text);
+    let titles = title_text.into_iter().map(Line::from).collect::<Vec<_>>();
     let tabs = Tabs::new(titles)
         .select(app.tab)
         .highlight_style(theme.selected())
@@ -1377,6 +1393,9 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) -> Result<bool> {
 fn run_tui(mut app: App) -> Result<()> {
     let mut terminal = ratatui::init();
     crate::dashboard_worker::restore_terminal_only_on_ui_thread_panic();
+    // ratatui::init does not report the mouse; restore() does not stop it, so
+    // the disable below and the panic hook's must both run.
+    crossterm::execute!(std::io::stdout(), crossterm::event::EnableMouseCapture)?;
     let result = (|| -> Result<()> {
         let mut dirty = true;
         loop {
@@ -1396,6 +1415,10 @@ fn run_tui(mut app: App) -> Result<()> {
                         if handle_key(&mut app, key)? {
                             break;
                         }
+                        dirty = true;
+                    }
+                    Event::Mouse(mouse_event) => {
+                        app.handle_mouse(mouse_event);
                         dirty = true;
                     }
                     Event::Resize(_, _) => dirty = true,
@@ -1418,7 +1441,11 @@ fn run_tui(mut app: App) -> Result<()> {
         }
         Ok(())
     })();
+    let mouse_off = crossterm::execute!(std::io::stdout(), crossterm::event::DisableMouseCapture);
     ratatui::restore();
+    if let Err(error) = mouse_off {
+        eprintln!("kmd dashboard: could not stop mouse reporting: {error}");
+    }
     if let Err(error) = app.persist_ui_on_exit() {
         eprintln!("kmd dashboard: could not save UI state: {error:#}");
     }
@@ -2085,6 +2112,13 @@ mod key_tests {
 
 #[path = "dashboard_actions.rs"]
 mod actions;
+
+#[path = "dashboard_mouse.rs"]
+mod mouse;
+
+#[cfg(test)]
+#[path = "dashboard_mouse_tests.rs"]
+mod mouse_tests;
 
 #[cfg(test)]
 #[path = "dashboard_refresh_tests.rs"]

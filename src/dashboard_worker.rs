@@ -137,6 +137,10 @@ pub fn restore_terminal_only_on_ui_thread_panic() {
     let ratatui_hook = panic::take_hook();
     panic::set_hook(Box::new(move |info| {
         if thread::current().id() == ui_thread {
+            // ratatui's hook leaves raw mode and the alternate screen but not
+            // mouse reporting; without this the shell receives escape codes
+            // for every click after a panic. Best effort: already failing.
+            let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableMouseCapture);
             ratatui_hook(info);
         }
     }));
