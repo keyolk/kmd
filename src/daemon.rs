@@ -237,8 +237,12 @@ fn handle_conn(
                         // 신규/변경 문서 임베딩 — 한 사이클에 200개 캡 (백그라운드 시간 바운드)
                         #[cfg(feature = "embed")]
                         {
-                            if let Err(e) = crate::embed::embed_pending(&mut store, Some(200), &[])
-                            {
+                            if let Err(e) = crate::embed::embed_pending_with(
+                                &mut store,
+                                Some(200),
+                                &[],
+                                embedder.as_ref(),
+                            ) {
                                 eprintln!("daemon embed failed (non-fatal): {}", e);
                             }
                         }
@@ -294,18 +298,37 @@ fn daemon_vector_search(_req: &Request, _embedder: &WarmEmbedder) -> Result<Stri
 
 // ---------------------------------------------------------------- client ----
 
-/// 데몬에 요청 한 번 보내고 응답 받기. 데몬 없으면 None.
+/// 데몬 요청 결과. 데몬이 없는 것과 데몬이 늦는 것을 호출자가 구분해야 한다.
+pub enum Reply {
+    /// 소켓 연결 실패 — 데몬이 떠 있지 않다.
+    Unreachable,
+    /// 연결은 됐지만 시간 안에 읽을 수 있는 응답이 없다. 데몬은 그 요청을
+    /// 끝까지 계산한다 — 버려지는 것은 응답뿐이다.
+    NoAnswer,
+    Answer(serde_json::Value),
+}
+
+/// 데몬에 요청 한 번 보내고 응답 받기. 데몬 없거나 응답 없으면 None.
 pub fn try_request(payload: &serde_json::Value) -> Option<serde_json::Value> {
-    let sock = socket_path();
-    let mut stream = UnixStream::connect(&sock).ok()?;
-    stream
-        .set_read_timeout(Some(std::time::Duration::from_secs(10)))
-        .ok()?;
-    writeln!(stream, "{}", payload).ok()?;
-    let mut reader = BufReader::new(stream);
-    let mut line = String::new();
-    reader.read_line(&mut line).ok()?;
-    serde_json::from_str(&line).ok()
+    match request(payload, std::time::Duration::from_secs(10)) {
+        Reply::Answer(v) => Some(v),
+        Reply::Unreachable | Reply::NoAnswer => None,
+    }
+}
+
+pub fn request(payload: &serde_json::Value, read_timeout: std::time::Duration) -> Reply {
+    let Ok(mut stream) = UnixStream::connect(socket_path()) else {
+        return Reply::Unreachable;
+    };
+    let answer = (|| -> Option<serde_json::Value> {
+        stream.set_read_timeout(Some(read_timeout)).ok()?;
+        writeln!(stream, "{}", payload).ok()?;
+        let mut reader = BufReader::new(stream);
+        let mut line = String::new();
+        reader.read_line(&mut line).ok()?;
+        serde_json::from_str(&line).ok()
+    })();
+    answer.map_or(Reply::NoAnswer, Reply::Answer)
 }
 
 /// launchd plist 생성 + 로드 안내.

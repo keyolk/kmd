@@ -193,6 +193,21 @@ pub fn embed_pending(
     limit: Option<usize>,
     collections: &[String],
 ) -> Result<usize> {
+    embed_pending_with(store, limit, collections, None)
+}
+
+/// `warm`을 주면 그 임베더를 쓴다.
+///
+/// 데몬은 이미 모델을 상주시킨다. 여기서 또 `Embedder::load()`를 부르면
+/// `LlamaBackend::init()`이 프로세스당 한 번만 허용되어 `BackendAlreadyInitialized`로
+/// 실패한다. 데몬의 embed 사이클은 이 에러를 non-fatal로 삼키므로 아무 문서도
+/// 임베딩되지 않은 채 pending만 늘었다(2026-10-22 daemon.log: 1230 → 1264).
+pub fn embed_pending_with(
+    store: &mut Store,
+    limit: Option<usize>,
+    collections: &[String],
+    warm: Option<&Embedder>,
+) -> Result<usize> {
     ensure_schema(store)?;
 
     // 임베딩 없는 활성 문서 목록.
@@ -237,7 +252,14 @@ pub fn embed_pending(
     }
 
     eprintln!("embedding {} documents (of {} pending) ...", todo, total);
-    let embedder = Embedder::load()?;
+    let owned;
+    let embedder = match warm {
+        Some(e) => e,
+        None => {
+            owned = Embedder::load()?;
+            &owned
+        }
+    };
     let mut ctx = embedder.make_context()?;
 
     let mut done = 0usize;

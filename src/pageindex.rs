@@ -333,11 +333,21 @@ fn parse_one(path: &PathBuf) -> Option<SessionEntry> {
 /// 파싱했다 — 실측 366ms로, 그 시점 검색 자체(231ms)보다 비쌌다. 코드 주석은
 /// 이 비용을 "~10ms"로 적고 있었다.
 ///
-/// 데몬은 프로세스가 오래 살아 있으므로 캐시가 맞다. 무효화는 디렉터리
-/// 엔트리의 (경로, mtime, 크기) 목록으로 한다 — 파일이 추가·수정·삭제되면
-/// 그 목록이 달라지므로 다시 파싱한다. CLI 경로는 프로세스가 한 번 돌고
-/// 끝나므로 캐시가 있으나 없으나 같다.
-type LearningCache = (Vec<(PathBuf, u64, u64)>, Vec<SessionEntry>);
+/// 데몬은 프로세스가 오래 살아 있으므로 캐시가 맞다. CLI 경로는 프로세스가
+/// 한 번 돌고 끝나므로 캐시가 있으나 없으나 같다.
+///
+/// 무효화는 **파일 단위**다. 예전에는 디렉터리 전체 지문 하나로 판정해서,
+/// learning 하나가 추가되면 전 파일을 다시 파싱했다. 세션 20여 개가 동시에
+/// 도는 환경에서는 SessionEnd가 시간당 ~6번 새 learning을 쓰므로 캐시가 거의
+/// 매번 깨졌고, 그때마다 1,995파일 260MB를 다시 읽었다(2026-10-22 실측: CLI
+/// 경로 filter 단계 1.33s, 데몬 캐시 미스 시 rag 3.9s 대 히트 0.84s). 메모리
+/// 압박으로 페이지 캐시가 밀린 상태에서 여러 요청이 동시에 미스하면 각자
+/// 260MB를 읽어 훅이 30초를 넘겼다. 이제 (mtime, 크기)가 바뀐 파일만 다시
+/// 파싱한다.
+///
+/// 락을 파싱 동안 쥐고 있는 것은 의도다 — 동시에 미스한 요청이 같은 파일을
+/// 각자 읽지 않고 먼저 온 요청의 결과를 기다린다.
+type LearningCache = HashMap<PathBuf, ((u64, u64), Option<SessionEntry>)>;
 static LEARNING_CACHE: std::sync::Mutex<Option<LearningCache>> = std::sync::Mutex::new(None);
 
 /// 캐시 유효성을 판정하는 디렉터리 지문. 파싱 없이 stat만 한다.
@@ -371,22 +381,39 @@ fn load_learning_files() -> Result<Vec<SessionEntry>> {
     let dir = learnings_dir();
     let fingerprint = learning_fingerprint(&dir);
 
-    if let Ok(cache) = LEARNING_CACHE.lock()
-        && let Some((cached_fp, entries)) = cache.as_ref()
-        && *cached_fp == fingerprint
-    {
-        return Ok(entries.clone());
-    }
-
-    let parsed: Vec<SessionEntry> = fingerprint
-        .iter()
-        .filter_map(|(path, _, _)| parse_one(path))
-        .collect();
-
-    if let Ok(mut cache) = LEARNING_CACHE.lock() {
-        *cache = Some((fingerprint, parsed.clone()));
-    }
+    // 락이 poison되면 캐시 없이 전부 파싱한다 — 느릴 뿐 결과는 같다.
+    let Ok(mut guard) = LEARNING_CACHE.lock() else {
+        return Ok(fingerprint
+            .iter()
+            .filter_map(|(path, _, _)| parse_one(path))
+            .collect());
+    };
+    let (next, parsed) = refresh_learning_cache(fingerprint, guard.take().unwrap_or_default());
+    *guard = Some(next);
     Ok(parsed)
+}
+
+/// 지문과 이전 캐시로 새 캐시와 엔트리 목록을 만든다. (mtime, 크기)가 같은
+/// 파일은 이전 파싱 결과를 쓰고, 나머지만 `parse_one`으로 읽는다.
+/// 디렉터리에서 사라진 파일은 `previous`에 남은 채 버려진다.
+fn refresh_learning_cache(
+    fingerprint: Vec<(PathBuf, u64, u64)>,
+    mut previous: LearningCache,
+) -> (LearningCache, Vec<SessionEntry>) {
+    let mut next: LearningCache = HashMap::with_capacity(fingerprint.len());
+    let mut parsed = Vec::with_capacity(fingerprint.len());
+    for (path, mtime, len) in fingerprint {
+        let stamp = (mtime, len);
+        let entry = match previous.remove(&path) {
+            Some((cached, entry)) if cached == stamp => entry,
+            _ => parse_one(&path),
+        };
+        if let Some(e) = &entry {
+            parsed.push(e.clone());
+        }
+        next.insert(path, (stamp, entry));
+    }
+    (next, parsed)
 }
 
 /// 모든 learning 파일을 날짜별 이력을 보존해 읽는다. 같은 세션·같은 날짜의
@@ -745,6 +772,41 @@ pub fn run_hook() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 증분 캐시가 추가·수정·삭제를 모두 반영해 전체 재파싱과 같은 결과를 내는지.
+    ///
+    /// 캐시가 낡으면 에러 없이 `filter_hits`의 L0 판정만 틀어진다 — 새 세션
+    /// hit이 커버로 오판되거나 지워진 세션이 계속 축을 가진다.
+    #[test]
+    fn the_incremental_cache_matches_a_full_reparse() {
+        let dir = std::env::temp_dir().join(format!("kmd-inc-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let a = dir.join("20260101-aaaaaaaa.md");
+        let b = dir.join("20260102-bbbbbbbb.md");
+        fs::write(&a, "Date: 20260101 0000\n").unwrap();
+        fs::write(&b, "Date: 20260102 0000\n").unwrap();
+        let (cache, _) = refresh_learning_cache(learning_fingerprint(&dir), HashMap::new());
+
+        // 수정(크기 변화), 삭제, 추가를 한 번에.
+        fs::write(&a, "Date: 20260101 0000\n**User**: grown\n").unwrap();
+        fs::remove_file(&b).unwrap();
+        let c = dir.join("20260103-cccccccc.md");
+        fs::write(&c, "Date: 20260103 0000\n").unwrap();
+
+        let (next, incremental) = refresh_learning_cache(learning_fingerprint(&dir), cache);
+        let (_, full) = refresh_learning_cache(learning_fingerprint(&dir), HashMap::new());
+        let key = |v: &[SessionEntry]| -> Vec<(String, usize)> {
+            v.iter().map(|e| (e.id8.clone(), e.bytes)).collect()
+        };
+        assert_eq!(key(&incremental), key(&full));
+        assert_eq!(
+            key(&incremental),
+            vec![("aaaaaaaa".to_string(), 36), ("cccccccc".to_string(), 20)]
+        );
+        assert!(!next.contains_key(&b), "a deleted file leaves the cache");
+        let _ = fs::remove_dir_all(&dir);
+    }
 
     /// 캐시 무효화의 근거인 디렉터리 지문이 실제 변화를 잡아내는지.
     ///
