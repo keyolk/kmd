@@ -5,6 +5,7 @@ mod daemon;
 mod dashboard;
 mod dashboard_keys;
 mod dashboard_layout;
+mod dashboard_link;
 mod dashboard_markup;
 mod dashboard_selection;
 mod dashboard_simulator;

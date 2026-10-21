@@ -208,6 +208,25 @@ impl SimulatorState {
     }
 
     /// Selects hit `index` (a mouse click), as `next_hit` would land on it.
+    /// The text the result detail shows: the injected context in RAG mode,
+    /// the selected hit otherwise. `o` looks for links here.
+    pub fn detail_text(&self) -> Option<String> {
+        let result = self.result.as_ref()?;
+        if result.mode == SimulatorMode::Rag {
+            return result.context.clone();
+        }
+        let hit = result.hits.get(self.selected_hit)?;
+        Some(
+            [
+                hit.file.as_str(),
+                hit.title.as_str(),
+                hit.context.as_deref().unwrap_or(""),
+                hit.snippet.as_deref().unwrap_or(""),
+            ]
+            .join("\n"),
+        )
+    }
+
     pub fn select_hit(&mut self, index: usize) {
         let count = self.result.as_ref().map_or(0, |result| result.hits.len());
         if index < count {

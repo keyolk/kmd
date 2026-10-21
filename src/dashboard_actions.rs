@@ -64,8 +64,37 @@ impl App {
             Action::SimDetailUp => self.simulator.detail_up(),
             Action::SimDetailTop => self.simulator.detail_top(),
             Action::TypingStop => self.simulator.stop_typing(),
+            Action::SessionOpenLink => {
+                let text = self.selected_session_text();
+                self.open_link(text.as_deref(), "no link in this session");
+            }
+            Action::SimOpenLink => {
+                let text = self.simulator.detail_text();
+                self.open_link(text.as_deref(), "no link in the result detail");
+            }
         }
         false
+    }
+
+    /// The selected session's text as the detail pane shows it.
+    fn selected_session_text(&self) -> Option<String> {
+        let entries = merge_session_entries(&self.snapshot.rag.sessions, &self.snapshot.activity);
+        let entry = entries.get(self.selected_session)?;
+        Some(session_details(entry, Utc::now().timestamp()))
+    }
+
+    /// `o`: open the first URL in `text` and say what happened. A key always
+    /// answers, so no URL is said too, with `none`.
+    fn open_link(&mut self, text: Option<&str>, none: &str) {
+        use crate::dashboard_link::{self as link, OpenError};
+        let urls = text.map(link::find).unwrap_or_default();
+        let opened = link::open_first(self.launcher, &urls);
+        let (level, note) = match &opened.err {
+            None => (Level::Success, opened.note()),
+            Some(OpenError::NoLink) => (Level::Info, none.to_string()),
+            Some(_) => (Level::Error, opened.note()),
+        };
+        self.status.set("link", level, note);
     }
 
     pub(super) fn ui_state(&self) -> crate::ui_state::UiState {
