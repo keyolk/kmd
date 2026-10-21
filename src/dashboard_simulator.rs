@@ -29,6 +29,9 @@ pub struct SimulatorState {
     detail_max: std::cell::Cell<u16>,
     /// Hit regions recorded by `draw`, read by the dashboard's mouse handler.
     pub layout: std::cell::RefCell<crate::dashboard_layout::SimLayout>,
+    /// hits | detail, side by side from `WIDE_WIDTH` up and stacked below.
+    pub wide: crate::split::Split,
+    pub stacked: crate::split::Split,
     typing: bool,
     history: Vec<String>,
     history_idx: Option<usize>,
@@ -52,6 +55,8 @@ impl SimulatorState {
             detail_scroll: 0,
             detail_max: std::cell::Cell::new(u16::MAX),
             layout: Default::default(),
+            wide: crate::dashboard_layout::sim_wide_split(),
+            stacked: crate::dashboard_layout::sim_stacked_split(),
             typing: false,
             history,
             history_idx: None,
@@ -251,6 +256,9 @@ impl SimulatorState {
 
 pub fn draw(frame: &mut Frame, area: Rect, state: &SimulatorState, theme: Theme, keys: &Keymap) {
     if area.width < MIN_WIDTH || area.height < MIN_HEIGHT {
+        // Nothing to hit: regions from a larger frame would take clicks and
+        // divider drags for panes that are not on screen.
+        *state.layout.borrow_mut() = Default::default();
         let message = Paragraph::new(format!(
             "Simulator needs at least {MIN_WIDTH}x{MIN_HEIGHT}. Current area: {}x{}",
             area.width, area.height
@@ -281,17 +289,21 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &SimulatorState, theme: Theme,
     draw_query(frame, rows[0], state, theme, keys);
     draw_status(frame, rows[1], state, theme, keys);
 
-    if area.width >= WIDE_WIDTH {
-        let columns = Layout::horizontal([Constraint::Percentage(42), Constraint::Percentage(58)])
-            .split(rows[2]);
-        draw_hits(frame, columns[0], state, theme);
-        draw_detail(frame, columns[1], state, theme, keys);
+    use crate::dashboard_layout::SplitId;
+    let (id, split) = if area.width >= WIDE_WIDTH {
+        (SplitId::SimWide, &state.wide)
     } else {
-        let body = Layout::vertical([Constraint::Percentage(45), Constraint::Percentage(55)])
-            .split(rows[2]);
-        draw_hits(frame, body[0], state, theme);
-        draw_detail(frame, body[1], state, theme, keys);
+        (SplitId::SimStacked, &state.stacked)
+    };
+    state.layout.borrow_mut().split = Some((id, rows[2]));
+    let (hits, detail) = split.bordered(rows[2]);
+    if !hits.is_empty() {
+        draw_hits(frame, hits, state, theme);
     }
+    if !detail.is_empty() {
+        draw_detail(frame, detail, state, theme, keys);
+    }
+    split.mark_drag(frame.buffer_mut(), split.layout(rows[2]).1);
 }
 
 fn draw_query(frame: &mut Frame, area: Rect, state: &SimulatorState, theme: Theme, keys: &Keymap) {

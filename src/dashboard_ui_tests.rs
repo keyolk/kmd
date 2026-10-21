@@ -86,7 +86,9 @@ fn the_help_overlay_lists_every_binding() {
     let mut app = app();
     handle_key(&mut app, press(KeyCode::Char('?'))).unwrap();
     assert!(app.show_help);
-    let help = screen(&app, 120, 60);
+    // Tall enough for the whole overlay unscrolled (the split section made
+    // it longer than 60 rows).
+    let help = screen(&app, 120, 70);
     for binding in app.keys.bindings() {
         assert!(
             help.contains(binding.help),
@@ -192,6 +194,7 @@ fn unknown_saved_values_are_ignored() {
         session_id: Some("no-such-session".into()),
         simulator_mode: None,
         query: String::new(),
+        ..Default::default()
     });
     assert_eq!(app.tab, SESSIONS_TAB);
     assert_eq!(app.selected_session, 0);

@@ -80,9 +80,26 @@ pub(super) fn finish(frame: &mut Frame, app: &App, tabs: Rect, guide: Rect, foot
 }
 
 impl App {
-    /// One mouse event: the selection first, then, unless it consumed the
-    /// event, the click handling it had before. Returns text to copy.
+    /// One mouse event: the split first, then the selection, then, unless
+    /// one of them consumed the event, the click handling it had before.
+    /// Returns text to copy.
     pub(super) fn on_mouse(&mut self, event: MouseEvent, now: Instant) -> Option<String> {
+        // Help owns the mouse while open; the split under it is not there.
+        let split = self.mouse_map.borrow().split.filter(|_| !self.show_help);
+        if let Some((id, area)) = split
+            && self.split_mut(id).mouse(&event, area, now).consumed
+        {
+            // The press never reaches the selection, which would otherwise
+            // have dropped its old highlight: drop it here, or a stale
+            // highlight is painted over panes that just moved.
+            if matches!(
+                event.kind,
+                crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left)
+            ) {
+                self.selection.clear();
+            }
+            return None;
+        }
         let map = self.mouse_map.borrow();
         let out = self.selection.mouse(&event, &map.panes, &map.frame, now);
         let offset = map
