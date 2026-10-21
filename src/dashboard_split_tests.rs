@@ -236,14 +236,20 @@ fn the_keys_move_the_sessions_divider_and_the_footer_names_them() {
 
 #[test]
 fn one_shrink_after_growing_past_the_limit_moves_at_once() {
+    // 60 columns: the detail's minimum stops the divider well before the
+    // ratio bound, the gap where an unclamped ratio made presses dead.
     let mut app = app_with_sessions();
-    render(&app);
+    let at_60 = |app: &App| {
+        let b = render_at(app, 60, H);
+        divider_x(&b, find(&b, "s0000000").1).expect("divider at 60 columns")
+    };
+    at_60(&app);
     for _ in 0..60 {
         key(&mut app, '>');
     }
-    let (limit, _) = sessions_divider(&app);
+    let limit = at_60(&app);
     key(&mut app, '<');
-    assert!(sessions_divider(&app).0 < limit, "dead zone at {limit}");
+    assert!(at_60(&app) < limit, "dead zone at {limit}");
 }
 
 #[test]
