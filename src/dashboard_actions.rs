@@ -4,6 +4,7 @@
 //! private fields.
 
 use super::*;
+use crate::dashboard_layout::SplitId;
 
 impl App {
     /// Active key contexts, innermost first. Must be one of
@@ -72,8 +73,29 @@ impl App {
                 let text = self.simulator.detail_text();
                 self.open_link(text.as_deref(), "no link in the result detail");
             }
+            Action::SplitShrink => self.split_key(crate::split::Action::Shrink),
+            Action::SplitGrow => self.split_key(crate::split::Action::Grow),
+            Action::SplitReset => self.split_key(crate::split::Action::Reset),
         }
         false
+    }
+
+    pub(super) fn split_mut(&mut self, id: SplitId) -> &mut crate::split::Split {
+        match id {
+            SplitId::Sessions => &mut self.sessions_split,
+            SplitId::SimWide => &mut self.simulator.wide,
+            SplitId::SimStacked => &mut self.simulator.stacked,
+        }
+    }
+
+    /// `<` `>` `=` move the split the last frame drew, against the area it
+    /// was drawn in, so a step starts from the divider on screen. With none
+    /// on screen (no sessions yet) there is nothing to move.
+    fn split_key(&mut self, action: crate::split::Action) {
+        let drawn = self.mouse_map.borrow().split;
+        if let Some((id, area)) = drawn {
+            self.split_mut(id).handle(action, area);
+        }
     }
 
     /// The selected session's text as the detail pane shows it.
@@ -103,6 +125,9 @@ impl App {
             session_id: self.session_ids().get(self.selected_session).cloned(),
             simulator_mode: Some(self.simulator.mode),
             query: String::new(),
+            split_sessions: self.sessions_split.state(),
+            split_sim_wide: self.simulator.wide.state(),
+            split_sim_stacked: self.simulator.stacked.state(),
         }
         .with_query(&self.simulator.input)
     }
@@ -127,6 +152,16 @@ impl App {
             self.simulator.set_mode(mode);
         }
         self.simulator.input = saved.query.clone();
+        // Out of range (NaN, a percentage) is rejected and the default kept.
+        for (id, state) in [
+            (SplitId::Sessions, saved.split_sessions),
+            (SplitId::SimWide, saved.split_sim_wide),
+            (SplitId::SimStacked, saved.split_sim_stacked),
+        ] {
+            if let Some(state) = state {
+                self.split_mut(id).restore(state);
+            }
+        }
         // What was just restored is what is on disk; do not rewrite it.
         self.ui_saved = self.ui_state();
     }

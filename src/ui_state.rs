@@ -18,7 +18,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// second history file.
 const QUERY_LIMIT: usize = 4096;
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct UiState {
     /// View name, lowercase: "sessions", "operations", "simulator".
@@ -28,6 +28,23 @@ pub struct UiState {
     pub session_id: Option<String>,
     pub simulator_mode: Option<SimulatorMode>,
     pub query: String,
+    /// Each pane split, only once the user has moved it: an unmoved split
+    /// follows the default. A garbage value drops that ratio, not the file.
+    #[serde(
+        deserialize_with = "crate::split::lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub split_sessions: Option<crate::split::State>,
+    #[serde(
+        deserialize_with = "crate::split::lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub split_sim_wide: Option<crate::split::State>,
+    #[serde(
+        deserialize_with = "crate::split::lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub split_sim_stacked: Option<crate::split::State>,
 }
 
 impl UiState {
@@ -111,6 +128,9 @@ mod tests {
             session_id: Some("12345678-session".into()),
             simulator_mode: Some(SimulatorMode::Global),
             query: String::new(),
+            split_sessions: Some(crate::split::State { ratio: 0.4 }),
+            split_sim_wide: None,
+            split_sim_stacked: Some(crate::split::State { ratio: 0.6 }),
         }
         .with_query("벡터 검색");
         save(&path, &state).unwrap();
@@ -158,6 +178,21 @@ mod tests {
             Some(PathBuf::from("/home/u/.local/state/kmd/ui.json"))
         );
         assert_eq!(path_from(None, None), None);
+    }
+
+    #[test]
+    fn a_garbage_split_drops_that_ratio_and_keeps_the_rest() {
+        let state: UiState = serde_json::from_str(
+            r#"{"view":"simulator","split_sessions":{"ratio":"wide"},"split_sim_wide":{"ratio":0.3},"split_sim_stacked":[]}"#,
+        )
+        .unwrap();
+        assert_eq!(state.view.as_deref(), Some("simulator"));
+        assert_eq!(state.split_sessions, None);
+        assert_eq!(
+            state.split_sim_wide,
+            Some(crate::split::State { ratio: 0.3 })
+        );
+        assert_eq!(state.split_sim_stacked, None);
     }
 
     #[test]

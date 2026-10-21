@@ -1,5 +1,6 @@
 //! Cell-aware text cuts and scroll bounds for the dashboard panes.
 
+use crate::split::{Config, Orientation, Split};
 use ratatui::layout::{Position, Rect};
 use ratatui::widgets::Paragraph;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -38,9 +39,65 @@ pub fn clamp_scroll(paragraph: &Paragraph, inner: Rect, requested: u16) -> (u16,
     (requested.min(max), max)
 }
 
+/// Which resizable split a view drew, so the mouse and the split keys move
+/// the one on screen.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SplitId {
+    /// Sessions: list | detail.
+    Sessions,
+    /// Simulator from `WIDE_WIDTH` up: hits | detail side by side.
+    SimWide,
+    /// Simulator below it: hits above detail.
+    SimStacked,
+}
+
+/// The Sessions list | detail split, 34/66 as it was fixed before. The
+/// divider is the two adjacent block borders (see `Split::bordered`).
+pub fn sessions_split() -> Split {
+    Split::new(Config {
+        divider: 2,
+        default: 0.34,
+        min_a: 16,
+        min_b: 20,
+        lo: 0.15,
+        hi: 0.85,
+        ..Config::default()
+    })
+}
+
+/// The Simulator's hits | detail split on a wide terminal, 42/58.
+pub fn sim_wide_split() -> Split {
+    Split::new(Config {
+        divider: 2,
+        default: 0.42,
+        min_a: 20,
+        min_b: 30,
+        lo: 0.15,
+        hi: 0.85,
+        ..Config::default()
+    })
+}
+
+/// The Simulator's hits above detail on a narrow terminal, 45/55. Its own
+/// ratio: rows and columns are not the same proportion.
+pub fn sim_stacked_split() -> Split {
+    Split::new(Config {
+        orientation: Orientation::Vertical,
+        divider: 2,
+        default: 0.45,
+        min_a: 2,
+        min_b: 2,
+        lo: 0.15,
+        hi: 0.85,
+        ..Config::default()
+    })
+}
+
 /// Hit regions the Simulator tab drew last, for the dashboard's mouse handler.
 #[derive(Clone, Debug, Default)]
 pub struct SimLayout {
+    /// The hits | detail split drawn, and the area it was laid out in.
+    pub split: Option<(SplitId, Rect)>,
     pub query: Option<Rect>,
     pub hits: Option<ListHit>,
     pub detail: Option<Rect>,

@@ -28,6 +28,7 @@ mod pageindex;
 mod rag;
 mod scan;
 mod sim;
+mod split;
 mod stats;
 mod store;
 mod theme;

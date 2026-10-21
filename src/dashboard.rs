@@ -644,6 +644,8 @@ struct App {
     ui_checked: Instant,
     /// Opens a URL in the browser; tests put a recorder here.
     launcher: crate::dashboard_link::Launcher,
+    /// Sessions list | detail. The Simulator's splits live on its state.
+    sessions_split: crate::split::Split,
 }
 
 impl App {
@@ -679,6 +681,7 @@ impl App {
             ui_saved: crate::ui_state::UiState::default(),
             ui_checked: Instant::now(),
             launcher: crate::dashboard_link::DEFAULT,
+            sessions_split: crate::dashboard_layout::sessions_split(),
         }
     }
 
@@ -1157,10 +1160,10 @@ fn draw_sessions(frame: &mut Frame, area: Rect, app: &App) {
         .iter()
         .filter(|entry| entry.activity(now) == SessionActivity::Active)
         .count();
-    let columns =
-        Layout::horizontal([Constraint::Percentage(34), Constraint::Percentage(66)]).split(area);
+    app.mouse_map.borrow_mut().split = Some((crate::dashboard_layout::SplitId::Sessions, area));
+    let (list_area, detail_area) = app.sessions_split.bordered(area);
     // Borders (2), the "> " highlight gutter (2), and the summary indent (2).
-    let summary_width = usize::from(columns[0].width.saturating_sub(6));
+    let summary_width = usize::from(list_area.width.saturating_sub(6));
     let items = entries
         .iter()
         .map(|entry| {
@@ -1207,9 +1210,9 @@ fn draw_sessions(frame: &mut Frame, area: Rect, app: &App) {
                     entries.len()
                 )),
         );
-    let list_inner = Block::default().borders(Borders::ALL).inner(columns[0]);
+    let list_inner = Block::default().borders(Borders::ALL).inner(list_area);
     drag::record(app, "sessions", list_inner, drag::Kind::List);
-    frame.render_stateful_widget(sessions, columns[0], &mut state);
+    frame.render_stateful_widget(sessions, list_area, &mut state);
     app.mouse_map.borrow_mut().sessions = Some(crate::dashboard_layout::ListHit {
         area: list_inner,
         first: state.offset(),
@@ -1222,13 +1225,17 @@ fn draw_sessions(frame: &mut Frame, area: Rect, app: &App) {
         session_details(&entries[selected], now),
         theme,
     );
-    draw_scrolled(
-        frame,
-        columns[1],
-        app,
-        Paragraph::new(detail).wrap(Wrap { trim: false }),
-        "kmd query → results",
-    );
+    if !detail_area.is_empty() {
+        draw_scrolled(
+            frame,
+            detail_area,
+            app,
+            Paragraph::new(detail).wrap(Wrap { trim: false }),
+            "kmd query → results",
+        );
+    }
+    let (_, divider, _) = app.sessions_split.layout(area);
+    app.sessions_split.mark_drag(frame.buffer_mut(), divider);
 }
 
 /// Draws a scrollable pane with its offset clamped to the content, and the
@@ -1325,6 +1332,7 @@ fn draw(frame: &mut Frame, app: &App) {
         draw_sessions(frame, areas[2], app);
     } else if app.tab == SIMULATOR_TAB {
         crate::dashboard_simulator::draw(frame, areas[2], &app.simulator, theme, &app.keys);
+        app.mouse_map.borrow_mut().split = app.simulator.layout.borrow().split;
     } else if let Some((kind, content)) = body_content(app) {
         let body = Paragraph::new(crate::dashboard_markup::style_body(kind, content, theme))
             .wrap(Wrap { trim: false });
@@ -2144,6 +2152,10 @@ mod drag;
 #[cfg(test)]
 #[path = "dashboard_drag_tests.rs"]
 mod drag_tests;
+
+#[cfg(test)]
+#[path = "dashboard_split_tests.rs"]
+mod split_tests;
 
 #[cfg(test)]
 #[path = "dashboard_mouse_tests.rs"]

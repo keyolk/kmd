@@ -35,6 +35,8 @@ pub(super) struct MouseMap {
     /// The scrollable paragraph pane (session detail or Operations body).
     pub scrolled: Option<Rect>,
     pub help: Option<Rect>,
+    /// The list | detail split drawn, and the area it was laid out in.
+    pub split: Option<(crate::dashboard_layout::SplitId, Rect)>,
     /// Panes a drag can select in, in drawing order (`dashboard_drag`).
     pub panes: Vec<crate::dashboard_selection::Pane>,
     /// The frame as drawn, before the highlight: text of panes without

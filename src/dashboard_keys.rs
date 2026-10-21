@@ -43,6 +43,8 @@ pub enum Ctx {
     Scroll,
     /// Simulator outside text input.
     Simulator,
+    /// Views with a resizable split: Sessions and the Simulator.
+    Split,
 }
 
 impl Ctx {
@@ -56,17 +58,19 @@ impl Ctx {
             Self::Operations => "Operations",
             Self::Scroll => "Sessions & Operations",
             Self::Simulator => "Simulator",
+            Self::Split => "Sessions & Simulator · split",
         }
     }
 
     /// Order of sections in the help overlay.
-    const HELP_ORDER: [Ctx; 8] = [
+    const HELP_ORDER: [Ctx; 9] = [
         Ctx::Global,
         Ctx::Always,
         Ctx::Sessions,
         Ctx::Operations,
         Ctx::Scroll,
         Ctx::Simulator,
+        Ctx::Split,
         Ctx::Typing,
         Ctx::Help,
     ];
@@ -76,9 +80,15 @@ impl Ctx {
 pub const STACKS: &[&[Ctx]] = &[
     &[Ctx::Always, Ctx::Help],
     &[Ctx::Always, Ctx::Typing],
-    &[Ctx::Always, Ctx::Global, Ctx::Sessions, Ctx::Scroll],
+    &[
+        Ctx::Always,
+        Ctx::Global,
+        Ctx::Sessions,
+        Ctx::Scroll,
+        Ctx::Split,
+    ],
     &[Ctx::Always, Ctx::Global, Ctx::Operations, Ctx::Scroll],
-    &[Ctx::Always, Ctx::Global, Ctx::Simulator],
+    &[Ctx::Always, Ctx::Global, Ctx::Simulator, Ctx::Split],
 ];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -121,6 +131,9 @@ pub enum Action {
     TypingRun,
     TypingHistoryPrev,
     TypingHistoryNext,
+    SplitShrink,
+    SplitGrow,
+    SplitReset,
 }
 
 /// Footer entry: lower priority numbers survive a narrow terminal longer;
@@ -210,6 +223,11 @@ const DEFAULTS: &[DefaultBinding] = &[
     bind!(TypingRun, "typing.run", Typing, ["enter"], "run the query", hint(1, "run")),
     bind!(TypingHistoryPrev, "typing.history_prev", Typing, ["up"], "previous prompt from history", hint_pair(2, "history", Action::TypingHistoryNext)),
     bind!(TypingHistoryNext, "typing.history_next", Typing, ["down"], "next prompt from history", None),
+    // Last in the footer: resizing is rare next to the view's own keys.
+    // Shrink first, so the hint reads `</>` in keyboard order.
+    bind!(SplitShrink, "split.shrink", Split, ["<"], "narrow the list (first pane)", hint_pair(5, "split", Action::SplitGrow)),
+    bind!(SplitGrow, "split.grow", Split, [">"], "widen the list (first pane)", None),
+    bind!(SplitReset, "split.reset", Split, ["="], "reset the split (so does a double click on it)", hint(5, "reset split")),
     bind!(HelpClose, "help.close", Help, ["?", "esc", "q"], "close this overlay (so does any unbound key)", hint(1, "close")),
     bind!(HelpDown, "help.down", Help, ["j", "down"], "scroll this overlay down", hint_pair(2, "scroll", Action::HelpUp)),
     bind!(HelpUp, "help.up", Help, ["k", "up"], "scroll this overlay up", None),
