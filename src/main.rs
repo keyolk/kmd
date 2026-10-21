@@ -6,6 +6,7 @@ mod dashboard;
 mod dashboard_keys;
 mod dashboard_layout;
 mod dashboard_markup;
+mod dashboard_selection;
 mod dashboard_simulator;
 mod dashboard_status;
 mod dashboard_worker;

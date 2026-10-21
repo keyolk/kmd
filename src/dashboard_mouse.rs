@@ -35,6 +35,11 @@ pub(super) struct MouseMap {
     /// The scrollable paragraph pane (session detail or Operations body).
     pub scrolled: Option<Rect>,
     pub help: Option<Rect>,
+    /// Panes a drag can select in, in drawing order (`dashboard_drag`).
+    pub panes: Vec<crate::dashboard_selection::Pane>,
+    /// The frame as drawn, before the highlight: text of panes without
+    /// their own lines is read from it.
+    pub frame: ratatui::buffer::Buffer,
 }
 
 pub(super) type MouseCell = RefCell<MouseMap>;

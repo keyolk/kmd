@@ -187,6 +187,7 @@ pub(super) fn draw_help(frame: &mut Frame, area: Rect, app: &App) {
         crate::dashboard_layout::clamp_scroll(&paragraph, block.inner(popup), app.help_scroll);
     app.help_max.set(max);
     app.mouse_map.borrow_mut().help = Some(popup);
+    drag::record_text(app, "help", block.inner(popup), &paragraph, scroll);
     let close = app.keys.key_label(Action::HelpClose);
     let title = if max == 0 {
         format!(" keys · {close} closes ")

@@ -44,6 +44,10 @@ pub struct SimLayout {
     pub query: Option<Rect>,
     pub hits: Option<ListHit>,
     pub detail: Option<Rect>,
+    /// The detail pane's wrapped lines and the first one drawn, for drag
+    /// selection (it scrolls the pane and keeps scrolled-out lines).
+    pub detail_lines: Vec<String>,
+    pub detail_offset: usize,
 }
 
 /// A list as ratatui drew it: `rows[i]` is what screen row `first + i` of

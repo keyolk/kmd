@@ -631,6 +631,10 @@ struct App {
     /// Hit regions recorded by the last draw; the mouse handler reads only
     /// these, so a click lands on what was on screen.
     mouse_map: mouse::MouseCell,
+    /// The mouse drag selection, drawn until the next press or key.
+    selection: crate::dashboard_selection::Selection,
+    /// Background clipboard writes report here.
+    copied: drag::CopiedChannel,
     keys: Keymap,
     /// Where UI state is persisted; None (tests, no HOME) disables it.
     ui_path: Option<PathBuf>,
@@ -665,6 +669,8 @@ impl App {
             help_scroll: 0,
             help_max: std::cell::Cell::new(u16::MAX),
             mouse_map: Default::default(),
+            selection: Default::default(),
+            copied: std::sync::mpsc::channel(),
             keys: Keymap::defaults(),
             ui_path: None,
             ui_saver: Background::new(),
@@ -1199,6 +1205,7 @@ fn draw_sessions(frame: &mut Frame, area: Rect, app: &App) {
                 )),
         );
     let list_inner = Block::default().borders(Borders::ALL).inner(columns[0]);
+    drag::record(app, "sessions", list_inner, drag::Kind::List);
     frame.render_stateful_widget(sessions, columns[0], &mut state);
     app.mouse_map.borrow_mut().sessions = Some(crate::dashboard_layout::ListHit {
         area: list_inner,
@@ -1233,6 +1240,7 @@ fn draw_scrolled(frame: &mut Frame, area: Rect, app: &App, paragraph: Paragraph,
         crate::dashboard_layout::clamp_scroll(&paragraph, block.inner(area), app.scroll);
     app.scroll_max.set(max);
     app.mouse_map.borrow_mut().scrolled = Some(area);
+    drag::record_text(app, "scrolled", block.inner(area), &paragraph, scroll);
     let position = if max == 0 {
         String::new()
     } else {
@@ -1354,9 +1362,12 @@ fn draw(frame: &mut Frame, app: &App) {
     if app.show_help {
         actions::draw_help(frame, frame.area(), app);
     }
+    drag::finish(frame, app, tab_inner, areas[1], areas[3]);
 }
 
 fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) -> Result<bool> {
+    // A key is the "next action" that ends a drag selection's highlight.
+    app.selection.clear();
     // Under a Korean input source the shortcut keys arrive as jamo (`q` -> `ㅂ`)
     // and do nothing until the input source is switched back. Rewrite them to
     // the Latin key at the same physical position -- but not while the simulator
@@ -1418,7 +1429,12 @@ fn run_tui(mut app: App) -> Result<()> {
                         dirty = true;
                     }
                     Event::Mouse(mouse_event) => {
-                        app.handle_mouse(mouse_event);
+                        if let Some(text) = app.on_mouse(mouse_event, Instant::now()) {
+                            crate::dashboard_selection::copy_in_background(
+                                text,
+                                app.copied.0.clone(),
+                            );
+                        }
                         dirty = true;
                     }
                     Event::Resize(_, _) => dirty = true,
@@ -1429,6 +1445,9 @@ fn run_tui(mut app: App) -> Result<()> {
                 dirty = true;
             }
             if app.poll_background() {
+                dirty = true;
+            }
+            if app.take_copied() {
                 dirty = true;
             }
             if app.status.expire(Instant::now()) {
@@ -2115,6 +2134,13 @@ mod actions;
 
 #[path = "dashboard_mouse.rs"]
 mod mouse;
+
+#[path = "dashboard_drag.rs"]
+mod drag;
+
+#[cfg(test)]
+#[path = "dashboard_drag_tests.rs"]
+mod drag_tests;
 
 #[cfg(test)]
 #[path = "dashboard_mouse_tests.rs"]
