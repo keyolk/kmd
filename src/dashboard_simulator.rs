@@ -611,6 +611,12 @@ fn draw_detail(frame: &mut Frame, area: Rect, state: &SimulatorState, theme: The
     let (scroll, max) =
         crate::dashboard_layout::clamp_scroll(&paragraph, block.inner(area), state.detail_scroll);
     state.detail_max.set(max);
+    {
+        let mut layout = state.layout.borrow_mut();
+        layout.detail_lines =
+            crate::dashboard_selection::paragraph_lines(&paragraph, block.inner(area).width);
+        layout.detail_offset = usize::from(scroll);
+    }
     frame.render_widget(paragraph.scroll((scroll, 0)).block(block), area);
 }
 
