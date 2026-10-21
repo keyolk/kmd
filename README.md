@@ -202,6 +202,7 @@ from the same table in `src/dashboard_keys.rs`, so they always match what the ke
 | `PgUp`/`PgDn`, `g`/`G`, `Home`/`End` | scroll query results or the current view |
 | `r` | refresh the snapshot |
 | `t` | run the self-check suite |
+| `o` | Sessions: open the first link in the selected session's text |
 | `?` | keymap overlay (`j`/`k` scroll it, any other key closes it) |
 | `q`, `Ctrl-C` | quit (`Esc` never quits) |
 
@@ -216,9 +217,15 @@ The Simulator view splits input into command and typing modes:
 | command | `J`/`K`, `PgDn`/`PgUp` | scroll result detail |
 | command | `n`/`p` | next / previous prompt history |
 | command | `x` | clear the query |
+| command | `o` | open the first link in the result detail |
 | typing | `Esc` | back to command mode |
 | typing | `Enter` | run the query |
 | typing | `↑`/`↓` | recall prompt history |
+
+`o` opens only http(s) URLs, says which one it opened and how many there were (or that
+there was none), and opens nothing over SSH, where the browser would start on the remote
+host. It never opens on a click; URLs are printed in full, so the terminal's own
+cmd/ctrl+click already reaches them.
 
 Rebind any action by name in `~/.config/kmd/keys.yaml` (or `$KMD_CONFIG_DIR/keys.yaml`).
 Names are listed in `src/dashboard_keys.rs`; a value is one key or a list. Keys are a

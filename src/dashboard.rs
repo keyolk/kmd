@@ -642,6 +642,8 @@ struct App {
     /// The state last handed to `ui_saver`, so unchanged state is not rewritten.
     ui_saved: crate::ui_state::UiState,
     ui_checked: Instant,
+    /// Opens a URL in the browser; tests put a recorder here.
+    launcher: crate::dashboard_link::Launcher,
 }
 
 impl App {
@@ -676,6 +678,7 @@ impl App {
             ui_saver: Background::new(),
             ui_saved: crate::ui_state::UiState::default(),
             ui_checked: Instant::now(),
+            launcher: crate::dashboard_link::DEFAULT,
         }
     }
 
@@ -2153,3 +2156,7 @@ mod refresh_tests;
 #[cfg(test)]
 #[path = "dashboard_ui_tests.rs"]
 mod ui_tests;
+
+#[cfg(test)]
+#[path = "dashboard_link_tests.rs"]
+mod link_tests;
