@@ -370,8 +370,8 @@ fn search_candidates(
 
 pub fn filter_hits(hits: Vec<SearchHit>) -> Vec<SearchHit> {
     // L0 page index가 커버하는 learnings hit은 주입에서 제외 — 중복 주입 비용을
-    // 줄인다. pageindex::load_sessions가 파일을 읽어야 하므로 매 호출마다 약간의
-    // I/O 비용이 있지만, 훅 1회당 한 번이고 181세션 메타 파싱은 ~10ms 수준이다.
+    // 줄인다. learnings 전체(1,995파일 260MB)를 파싱해야 하므로 데몬은 파일 단위
+    // 캐시로 바뀐 파일만 다시 읽는다(pageindex::load_learning_files 참고).
     let id_axes = crate::pageindex::load_session_axes().unwrap_or_default();
     let allowed = inject_collections();
     let mut seen = std::collections::HashSet::new();
@@ -602,8 +602,20 @@ pub fn log_outcome(prompt: &str, session_id: &str, outcome: &RagOutcome) {
     });
 }
 
+/// 훅이 데몬 응답을 기다리는 시간. `KMD_HOOK_DAEMON_TIMEOUT_MS`로 덮는다.
+///
+/// Claude Code는 UserPromptSubmit 훅이 30초를 넘기면 출력을 통째로 버린다.
+/// activity 렌더와 프로세스 기동을 더해도 그 한계에서 충분히 떨어지게 잡는다.
+fn hook_daemon_timeout() -> std::time::Duration {
+    std::env::var("KMD_HOOK_DAEMON_TIMEOUT_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .map(std::time::Duration::from_millis)
+        .unwrap_or(std::time::Duration::from_secs(10))
+}
+
 /// `kmd rag --hook`: stdin JSON → stdout 컨텍스트 (+ rag.jsonl 로깅).
-/// 데몬이 떠 있으면 데몬 경유(빠름), 아니면 인프로세스 폴백.
+/// 데몬이 떠 있으면 데몬 경유(빠름), 데몬이 없을 때만 인프로세스 폴백.
 /// 훅은 절대 실패하면 안 되므로 모든 에러는 빈 출력 + exit 0.
 pub fn run_hook() -> Result<()> {
     let mut raw = String::new();
@@ -623,18 +635,39 @@ pub fn run_hook() -> Result<()> {
         .flatten();
 
     // 1) 데몬 경유 시도
-    if let Some(resp) = crate::daemon::try_request(&serde_json::json!({
-        "cmd": "rag",
-        "prompt": input.prompt,
-        "session_id": input.session_id,
-    })) {
-        if resp.get("ok").and_then(|v| v.as_bool()) == Some(true) {
+    let reply = crate::daemon::request(
+        &serde_json::json!({
+            "cmd": "rag",
+            "prompt": input.prompt,
+            "session_id": input.session_id,
+        }),
+        hook_daemon_timeout(),
+    );
+    match reply {
+        crate::daemon::Reply::Answer(resp)
+            if resp.get("ok").and_then(|v| v.as_bool()) == Some(true) =>
+        {
             let context = resp.get("context").and_then(|v| v.as_str());
             if let Some(combined) = combine_contexts(activity.as_deref(), context) {
                 println!("{}", combined);
             }
             return Ok(());
         }
+        // 데몬이 살아 있는데 늦으면 폴백하지 않는다. 예전에는 10초를 기다린 뒤
+        // 같은 hybrid 파이프라인을 인프로세스로 다시 돌렸다 — 313MB 모델 로드와
+        // learnings 전체 파싱부터 다시 하고, 데몬은 그동안 같은 요청을 계속
+        // 계산한다. 데몬이 늦는 것은 대개 머신이 포화됐기 때문이라, 이 폴백은
+        // 포화를 키우고 훅을 30초 너머로 밀었다(2026-10-22 rag.jsonl: 데몬 쪽
+        // 158~207s 요청이 같은 순간 몰려 끝남, 훅은 30s 타임아웃). 늦은 응답은
+        // 버리고 activity만 낸다.
+        crate::daemon::Reply::NoAnswer => {
+            if let Some(activity) = activity {
+                println!("{}", activity);
+            }
+            return Ok(());
+        }
+        // 데몬 에러 응답이나 데몬 부재는 인프로세스로 처리한다.
+        crate::daemon::Reply::Answer(_) | crate::daemon::Reply::Unreachable => {}
     }
 
     // 2) 인프로세스 폴백

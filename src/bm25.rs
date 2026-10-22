@@ -132,6 +132,12 @@ pub fn index_dirty(dir: &Path, store: &mut Store) -> Result<usize> {
     }
     writer.commit()?;
     store.clear_dirty(&ids)?;
+    // commit이 시작한 백그라운드 merge를 끝까지 기다린다. writer를 그냥 drop하면
+    // 진행 중인 merge가 버려진다. 데몬은 dirty가 생길 때마다 이 함수로 작은
+    // segment를 하나씩 commit하므로, merge가 한 번도 완주하지 못한 채 segment가
+    // 818개까지 쌓였다(그중 692개가 문서 100개 미만, 2026-10-22). 검색은
+    // segment마다 term dictionary를 열어야 해서 segment 수에 비례해 느려진다.
+    writer.wait_merging_threads()?;
     Ok(indexed)
 }
 
