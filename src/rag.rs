@@ -214,7 +214,33 @@ pub fn gate(prompt: &str) -> std::result::Result<String, &'static str> {
 }
 
 /// 자동 주입성/비질의 프롬프트 판별 — 사람이 타이핑한 질문이 아닌 것.
+/// Claude Code relays plugin and peer-session messages behind a one-line English
+/// lead-in ("The cc-mods plugin sent a message: <task-notification>…"). The
+/// payload after it decides whether the turn is noise, so peel the lead-in off.
+fn strip_relay_wrapper(p: &str) -> &str {
+    const MARK: &str = " sent a message:";
+    let head_end = p.char_indices().nth(80).map(|(i, _)| i).unwrap_or(p.len());
+    if let Some(i) = p[..head_end].find(MARK) {
+        let lead = &p[..i];
+        if (lead.starts_with("The ") && lead.ends_with(" plugin"))
+            || lead == "Another Claude session"
+        {
+            return p[i + MARK.len()..].trim_start();
+        }
+    }
+    p
+}
+
+/// Whether the hook should attach daily-activity. Automated turns (task
+/// notifications, monitor events) arrive by the hundred in a busy session and
+/// each copy of activity is several KB the model never asked for; measured on
+/// 2026-11-12: 209 of 224 injections in one session were notification turns.
+fn wants_activity(prompt: &str) -> bool {
+    !is_structural_noise(prompt.trim())
+}
+
 fn is_structural_noise(p: &str) -> bool {
+    let p = strip_relay_wrapper(p);
     // 1) 자동 태그로 시작 (Claude Code가 주입하는 알림/커맨드/툴 결과)
     const NOISE_PREFIXES: &[&str] = &[
         "<task-notification",
@@ -628,11 +654,16 @@ pub fn run_hook() -> Result<()> {
         return Ok(());
     }
 
-    // Live activity is independent of BM25: even gated prompts should see recent
-    // work from other sessions, while the current session is always excluded.
-    let activity = crate::activity::render_recent(&input.session_id, &input.cwd, 6)
-        .ok()
-        .flatten();
+    // Live activity is independent of BM25: short or keyword-poor prompts still
+    // see recent work from other sessions (the current session is excluded).
+    // Automated notification turns do not — nobody is asking anything there.
+    let activity = if wants_activity(&input.prompt) {
+        crate::activity::render_recent(&input.session_id, &input.cwd, 6)
+            .ok()
+            .flatten()
+    } else {
+        None
+    };
 
     // 1) 데몬 경유 시도
     let reply = crate::daemon::request(
@@ -739,6 +770,45 @@ mod tests {
             gate("<kmd-context>\nRelevant knowledge from your kmd index:"),
             Err("noise")
         );
+    }
+
+    #[test]
+    fn gate_rejects_relayed_notifications() {
+        assert_eq!(
+            gate(
+                "The cc-mods plugin sent a message: <task-notification> <task-id>cw-1</task-id> <summary>Monitor event</summary>"
+            ),
+            Err("noise")
+        );
+        assert_eq!(
+            gate(
+                "Another Claude session sent a message: <system-reminder> long injected reminder text"
+            ),
+            Err("noise")
+        );
+        // A relayed peer message may carry a real instruction; keep it.
+        assert_ne!(
+            gate(
+                "Another Claude session sent a message: <cross-session-message from=\"x\"> 사람의 지시: 머지할 PR을 끝까지 마무리"
+            ),
+            Err("noise")
+        );
+        // The lead-in must be at the start, not somewhere in a real prompt.
+        assert_ne!(
+            gate("왜 The cc-mods plugin sent a message: 형태의 알림이 activity를 받는지 확인해줘"),
+            Err("noise")
+        );
+    }
+
+    #[test]
+    fn activity_skips_notification_turns_only() {
+        assert!(!wants_activity("<task-notification> <task-id>b1</task-id>"));
+        assert!(!wants_activity(
+            "The cc-mods plugin sent a message: <task-notification> x"
+        ));
+        // Short real prompts still get activity even though BM25 gates them.
+        assert!(wants_activity("keep going"));
+        assert!(wants_activity("계속 진행해 주세요"));
     }
 
     #[test]
