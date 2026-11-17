@@ -50,6 +50,25 @@ pub fn max_results() -> usize {
         .filter(|n| *n >= 1)
         .unwrap_or(DEFAULT_MAX_RESULTS)
 }
+/// Whether hook output is disabled for this process.
+///
+/// A caller that runs `claude -p` as a pure tool runner (slx's Slack fetch) sets
+/// `KMD_HOOKS=off`. Measured 2026-11-16: 71% of all injected context (4,453 of
+/// 6,280 prompts over 7 days) went to that one bot prompt, where nothing reads
+/// it. The hook inherits the env from claude, so the caller decides, not a
+/// prompt-text heuristic that would need updating every time the bot's prompt
+/// changes.
+pub fn hooks_disabled() -> bool {
+    hooks_disabled_value(std::env::var("KMD_HOOKS").ok().as_deref())
+}
+
+fn hooks_disabled_value(v: Option<&str>) -> bool {
+    matches!(
+        v.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
+        Some("off" | "0" | "false")
+    )
+}
+
 const SKIP_PREFIXES: &[&str] = &["/", "yes", "no", "ok", "sure", "thanks", "thank"];
 
 /// 주입 대상 컬렉션. memory/rules는 CLAUDE.md로 상시 로드되므로 제외 대상 후보지만
@@ -644,6 +663,9 @@ fn hook_daemon_timeout() -> std::time::Duration {
 /// 데몬이 떠 있으면 데몬 경유(빠름), 데몬이 없을 때만 인프로세스 폴백.
 /// 훅은 절대 실패하면 안 되므로 모든 에러는 빈 출력 + exit 0.
 pub fn run_hook() -> Result<()> {
+    if hooks_disabled() {
+        return Ok(());
+    }
     let mut raw = String::new();
     std::io::stdin().read_to_string(&mut raw)?;
     let input: HookInput = match serde_json::from_str(&raw) {
@@ -809,6 +831,17 @@ mod tests {
         // Short real prompts still get activity even though BM25 gates them.
         assert!(wants_activity("keep going"));
         assert!(wants_activity("계속 진행해 주세요"));
+    }
+
+    #[test]
+    fn hooks_disabled_values() {
+        assert!(hooks_disabled_value(Some("off")));
+        assert!(hooks_disabled_value(Some("OFF")));
+        assert!(hooks_disabled_value(Some("0")));
+        assert!(hooks_disabled_value(Some("false")));
+        assert!(!hooks_disabled_value(None));
+        assert!(!hooks_disabled_value(Some("")));
+        assert!(!hooks_disabled_value(Some("on")));
     }
 
     #[test]

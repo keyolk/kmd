@@ -761,6 +761,9 @@ fn hook_payload(additional_context: String) -> serde_json::Value {
 }
 
 pub fn run_hook() -> Result<()> {
+    if crate::rag::hooks_disabled() {
+        return Ok(());
+    }
     let out = match build() {
         Ok(idx) => render_l0(&idx),
         Err(_) => String::new(),
