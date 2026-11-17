@@ -84,12 +84,16 @@ const SKIP_PREFIXES: &[&str] = &["/", "yes", "no", "ok", "sure", "thanks", "than
 /// gold의 wiki 앵커 비중(11%)이 실제 프롬프트 분포를 대표한다는 근거가 없어,
 /// 순이득 3건을 근거로 채택하지 않는다. 다시 판단하려면 실사용 프롬프트에서
 /// wiki 문서의 채택률을 재야 한다.
+///
+/// `claude-skills`와 `claude-contexts`는 뺐다(2026-11-17). 7일 주입을 답변과
+/// 짝지어 재 보니 skills hit의 사용률은 3.1%였고, 그나마 대부분은 스킬 목록이
+/// 시스템 프롬프트에 이미 있어서였다 — 같은 정보를 두 번 넣고 있었다.
+/// contexts는 원본 디렉터리(`~/.claude/contexts`)가 없어 늘 0건이었다.
+/// 다시 넣고 싶으면 `KMD_INJECT_COLLECTIONS`로 넣고 사용률을 재 본다.
 pub const CLAUDE_COLLECTIONS: &[&str] = &[
     "claude-memory",
     "claude-rules",
     "claude-agents",
-    "claude-skills",
-    "claude-contexts",
     "learnings",
 ];
 
@@ -940,14 +944,25 @@ mod tests {
     #[test]
     fn filter_hits_boosts_curated_over_learnings() {
         // learnings가 원 BM25 점수는 약간 높아도, 정제 지식 부스트로 앞서야 한다.
-        // learnings 40*0.75=30 vs skills 34*1.3=44.2 → skills 우선.
+        // learnings 40*0.75=30 vs memory 34*1.3=44.2 → memory 우선.
         let raw = vec![
             hit("kmd://learnings/20260101 0-aaa.md", 40.0),
-            hit("kmd://claude-skills/sb:jira-ticket/SKILL.md", 34.0),
+            hit("kmd://claude-memory/k8s.md", 34.0),
             hit("kmd://learnings/20260102 0-bbb.md", 38.0),
         ];
         let out = filter_hits(raw);
-        assert_eq!(collection_of(&out[0].file), "claude-skills");
+        assert_eq!(collection_of(&out[0].file), "claude-memory");
+    }
+
+    #[test]
+    fn filter_hits_drops_skills_by_default() {
+        // 스킬 목록은 시스템 프롬프트에 이미 있어 기본 주입 대상이 아니다.
+        let raw = vec![
+            hit("kmd://claude-skills/sb:jira-ticket/SKILL.md", 90.0),
+            hit("kmd://learnings/a.md", 10.0),
+        ];
+        let out = filter_hits(raw);
+        assert!(out.iter().all(|h| collection_of(&h.file) != "claude-skills"));
     }
 
     #[test]
