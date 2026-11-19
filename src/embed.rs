@@ -49,6 +49,29 @@ pub fn model_path() -> PathBuf {
     crate::config::models_dir().join("hf_ggml-org_embeddinggemma-300M-Q8_0.gguf")
 }
 
+/// llama.cpp/ggml 로그를 끈다. `KMD_LLAMA_LOG=1`이면 그대로 둔다.
+///
+/// llama.cpp는 기본으로 모델 로드·컨텍스트 생성·Metal 파이프라인 컴파일마다 수백
+/// 줄을 stderr에 쓴다. `kmd dashboard`는 alternate screen 위에서 그리므로 이 출력이
+/// 화면을 그대로 덮어써 TUI가 깨진다(첫 RAG 질의에서 `Embedder::load`가 불릴 때).
+/// 대시보드만 막지 않고 전역으로 끄는 이유: daemon·hook·CLI 어디서도 이 로그를
+/// 읽는 곳이 없고, hook 출력에 섞이면 오히려 해롭다.
+///
+/// `LlamaBackend::init` 전에 불러야 backend 초기화 로그까지 막는다.
+/// `send_logs_to_tracing`은 ggml 쪽 콜백(Metal 로그)도 함께 바꾼다 —
+/// `LlamaBackend::void_logs`는 `llama_log_set`만 바꾼다.
+fn silence_llama_logs() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        if std::env::var_os("KMD_LLAMA_LOG").is_some() {
+            return;
+        }
+        llama_cpp_2::send_logs_to_tracing(
+            llama_cpp_2::LogOptions::default().with_logs_enabled(false),
+        );
+    });
+}
+
 pub struct Embedder {
     backend: LlamaBackend,
     model: LlamaModel,
@@ -60,6 +83,7 @@ impl Embedder {
         if !path.exists() {
             return Err(anyhow!("embedding model not found: {}", path.display()));
         }
+        silence_llama_logs();
         let backend = LlamaBackend::init()?;
         let params = LlamaModelParams::default();
         let model =
