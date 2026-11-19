@@ -34,6 +34,7 @@ mod stats;
 mod store;
 mod theme;
 mod tokenize;
+mod transcript;
 mod ui_state;
 mod util;
 
@@ -248,6 +249,11 @@ enum Command {
         /// Re-process already processed sessions
         #[arg(long)]
         force: bool,
+        /// Rewrite every existing learnings file with the current extraction rules: one
+        /// file per session, re-exported from its transcript when it still exists,
+        /// otherwise scrubbed of injected text in place
+        #[arg(long)]
+        rebuild: bool,
     },
     /// Recent cross-session activity collected from live transcripts
     Activity {
@@ -408,7 +414,14 @@ fn main() -> Result<()> {
             recent,
             dry_run,
             force,
-        } => learnings::run(session.as_deref(), recent, dry_run, force),
+            rebuild,
+        } => {
+            if rebuild {
+                learnings::rebuild(dry_run)
+            } else {
+                learnings::run(session.as_deref(), recent, dry_run, force)
+            }
+        }
         Command::Activity { limit, json } => activity::run(limit, json),
         Command::Journal {
             days,

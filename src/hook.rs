@@ -32,7 +32,8 @@ fn append_sync(line: &str) {
         .open(sync_log())
     {
         use std::io::Write;
-        let _ = writeln!(f, "{}", line);
+        // One write per line so concurrent hooks cannot interleave (see rag::append_log).
+        let _ = f.write_all(format!("{}\n", line).as_bytes());
     }
 }
 

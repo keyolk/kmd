@@ -44,36 +44,23 @@ fn normalize(text: &str, limit: usize) -> String {
     format!("{}…", compact.chars().take(limit).collect::<String>())
 }
 
-fn meaningful_user_text(text: &str) -> bool {
-    let text = text.trim();
+/// A short control word ("계속") or harness text is not what the session is about.
+fn human_topic(text: &str) -> Option<String> {
+    let crate::transcript::UserText::Human(text) = crate::transcript::classify_user_text(text) else {
+        return None;
+    };
     if text.chars().count() < 4 {
-        return false;
+        return None;
     }
-    let lower = text.to_lowercase();
-    const PREFIXES: &[&str] = &[
-        "<local-command",
-        "<command-",
-        "<system-reminder",
-        "<task-notification",
-        "<tool-use",
-        "<bash-",
-        "<teammate-",
-        "caveat:",
-        "tool loaded.",
-        "skill /",
-        "base directory for this skill:",
-        "stop hook feedback:",
-        "a session-scoped stop hook is now active",
-        "this session is being continued",
-        "the user sent a new message while you were working",
-        "[request interrupted",
-        "[your previous response had no visible output",
-        "[image",
-    ];
-    if PREFIXES.iter().any(|prefix| lower.starts_with(prefix)) {
-        return false;
+    if matches!(text.to_lowercase().as_str(), "continue" | "계속" | "진행해" | "해줘") {
+        return None;
     }
-    !matches!(lower.as_str(), "continue" | "계속" | "진행해" | "해줘")
+    Some(text)
+}
+
+#[cfg(test)]
+fn meaningful_user_text(text: &str) -> bool {
+    human_topic(text).is_some()
 }
 
 fn push_unique(values: &mut Vec<String>, value: String) {
@@ -115,6 +102,7 @@ fn collect_text_and_tools(content: &Value, files: &mut Vec<String>) -> Vec<Strin
 fn parse_transcript(raw: &str, session_id: &str) -> Option<ActivityCard> {
     let url_re = Regex::new(r#"https?://[^\s<>\)\]\}"']+"#).ok()?;
     let mut users = Vec::new();
+    let mut relays = Vec::new();
     let mut assistants = Vec::new();
     let mut files = Vec::new();
     let mut cwd = String::new();
@@ -139,6 +127,9 @@ fn parse_transcript(raw: &str, session_id: &str) -> Option<ActivityCard> {
             latest = Some(parsed);
         }
 
+        if !crate::transcript::is_turn(&entry) {
+            continue;
+        }
         let message = entry.get("message").unwrap_or(&entry);
         let role = message.get("role").and_then(Value::as_str).unwrap_or("");
         let Some(content) = message.get("content") else {
@@ -147,11 +138,17 @@ fn parse_transcript(raw: &str, session_id: &str) -> Option<ActivityCard> {
         let texts = collect_text_and_tools(content, &mut files);
         match role {
             "user" => {
-                let text = texts
-                    .into_iter()
-                    .filter(|text| meaningful_user_text(text))
-                    .collect::<Vec<_>>()
-                    .join("\n\n");
+                let mut human = Vec::new();
+                for text in texts {
+                    if let crate::transcript::UserText::Relay(relay) =
+                        crate::transcript::classify_user_text(&text)
+                    {
+                        relays.push(normalize(&relay, 280));
+                    } else if let Some(topic) = human_topic(&text) {
+                        human.push(topic);
+                    }
+                }
+                let text = human.join("\n\n");
                 if !text.is_empty() {
                     users.push(normalize(&text, 280));
                 }
@@ -170,6 +167,12 @@ fn parse_transcript(raw: &str, session_id: &str) -> Option<ActivityCard> {
         }
     }
 
+    // A session driven only by relayed messages (a coordinator, a worker) still needs a
+    // card, but its summary must say the text came from another session rather than pass
+    // a worker's report off as the person's request.
+    if users.is_empty() {
+        users.push(format!("↪ {}", relays.last()?));
+    }
     let latest_user = users.last()?.clone();
     let summary = users
         .iter()

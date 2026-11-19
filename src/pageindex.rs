@@ -132,22 +132,32 @@ fn is_noise_repo(seg: &str) -> bool {
     NOISE_SEGMENTS.contains(&seg) || NOISE_PREFIXES.iter().any(|p| seg.starts_with(p))
 }
 
-/// 파일 경로 → 작업 축. `~/src/[sendbird/]<repo>` 와 `~/.claude/<file>` 두 형태를
-/// 인식한다. 이 환경의 실제 레이아웃에 맞춘 휴리스틱.
+/// 파일 경로 → 작업 축. `~/src/<repo>`, `~/src/<owner>/<repo>` 와 `~/.claude/<file>`
+/// 세 형태를 인식한다. 이 환경의 실제 레이아웃에 맞춘 휴리스틱.
+///
+/// `~/src` holds both plain clones (`~/src/slk`) and owner folders (`~/src/keyolk/kmd`,
+/// `~/src/openai/codex`). Taking the first segment made every personal repo one axis
+/// called `keyolk`, so "same repo first" in daily-activity and the session index could
+/// not tell kmd from cc-mods. A first segment that exists on disk without its own `.git`
+/// is an owner folder; the repo is the next segment. Paths that no longer exist keep the
+/// old reading, since the disk cannot say which layout they had.
 pub fn repo_of(path: &str) -> Option<String> {
-    if let Some(rest) = path.split("/src/").nth(1) {
+    if let Some((root, rest)) = path.split_once("/src/") {
         let mut segs = rest.split('/').filter(|s| !s.is_empty());
         let first = segs.next()?;
-        // sendbird org 하위는 한 단계 더 들어간다
+        let second = segs.next();
+        let src = std::path::Path::new(root).join("src");
         let repo = if first == "sendbird" {
-            segs.next()?
+            repo_dir_name(&src.join(first), second?)
+        } else if let Some(second) = second.filter(|_| is_owner_dir(&src.join(first))) {
+            repo_dir_name(&src.join(first), second)
         } else {
-            first
+            first.to_string()
         };
-        if is_noise_repo(repo) {
+        if is_noise_repo(&repo) {
             return None;
         }
-        return Some(repo.to_string());
+        return Some(repo);
     }
     if let Some(rest) = path.split(".claude/").nth(1) {
         let seg = rest.split('/').next()?;
@@ -157,6 +167,47 @@ pub fn repo_of(path: &str) -> Option<String> {
         return Some(format!("~/.claude/{}", seg));
     }
     None
+}
+
+fn layout_cache() -> &'static std::sync::Mutex<HashMap<PathBuf, String>> {
+    static CACHE: OnceLock<std::sync::Mutex<HashMap<PathBuf, String>>> = OnceLock::new();
+    CACHE.get_or_init(Default::default)
+}
+
+/// An existing directory without `.git` of its own groups repos by owner.
+fn is_owner_dir(dir: &std::path::Path) -> bool {
+    let key = dir.join(".owner?");
+    if let Some(hit) = layout_cache().lock().ok().and_then(|c| c.get(&key).cloned()) {
+        return hit == "y";
+    }
+    let owner = dir.is_dir() && !dir.join(".git").exists();
+    if let Ok(mut cache) = layout_cache().lock() {
+        cache.insert(key, if owner { "y" } else { "n" }.into());
+    }
+    owner
+}
+
+/// The repo a directory under an owner folder belongs to. A linked worktree
+/// (`kmd-wt-x/.git` is a file pointing at `kmd/.git/worktrees/kmd-wt-x`) counts as its
+/// main repo, so work in a worktree ranks with work in the checkout.
+fn repo_dir_name(owner: &std::path::Path, name: &str) -> String {
+    let dir = owner.join(name);
+    if let Some(hit) = layout_cache().lock().ok().and_then(|c| c.get(&dir).cloned()) {
+        return hit;
+    }
+    let main = fs::read_to_string(dir.join(".git"))
+        .ok()
+        .and_then(|text| {
+            let gitdir = text.trim().strip_prefix("gitdir:")?.trim().to_string();
+            let (repo_git, _) = gitdir.split_once("/.git/worktrees/")?;
+            repo_git.rsplit('/').next().map(str::to_string)
+        })
+        .filter(|main| !main.is_empty())
+        .unwrap_or_else(|| name.to_string());
+    if let Ok(mut cache) = layout_cache().lock() {
+        cache.insert(dir, main.clone());
+    }
+    main
 }
 
 fn is_boilerplate(s: &str) -> bool {
@@ -888,10 +939,33 @@ mod tests {
 
     #[test]
     fn repo_of_extracts_plain_src_repos() {
+        // A path that is not on disk keeps the first segment: nothing says it was an owner.
         assert_eq!(
             repo_of("/Users/x/src/keyolk/ccx/internal/tui/app.go").as_deref(),
             Some("keyolk")
         );
+    }
+
+    #[test]
+    fn repo_of_reads_owner_folders_and_worktrees_from_disk() {
+        let root = std::env::temp_dir().join(format!("kmd-repo-of-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let src = root.join("src");
+        fs::create_dir_all(src.join("plain/.git")).unwrap();
+        fs::create_dir_all(src.join("owner/kmd/.git/worktrees/kmd-wt-x")).unwrap();
+        fs::create_dir_all(src.join("owner/kmd-wt-x")).unwrap();
+        fs::write(
+            src.join("owner/kmd-wt-x/.git"),
+            format!("gitdir: {}/owner/kmd/.git/worktrees/kmd-wt-x\n", src.display()),
+        )
+        .unwrap();
+        fs::create_dir_all(src.join("owner/cc-mods/.git")).unwrap();
+        let at = |rel: &str| repo_of(&format!("{}/{}", src.display(), rel));
+        assert_eq!(at("owner/kmd/src/rag.rs").as_deref(), Some("kmd"));
+        assert_eq!(at("owner/cc-mods/hooks/coord.ts").as_deref(), Some("cc-mods"));
+        assert_eq!(at("owner/kmd-wt-x/src/rag.rs").as_deref(), Some("kmd"));
+        assert_eq!(at("plain/main.go").as_deref(), Some("plain"));
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

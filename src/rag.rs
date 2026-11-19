@@ -92,6 +92,10 @@ const SKIP_PREFIXES: &[&str] = &["/", "yes", "no", "ok", "sure", "thanks", "than
 /// 다시 넣고 싶으면 `KMD_INJECT_COLLECTIONS`로 넣고 사용률을 재 본다.
 pub const CLAUDE_COLLECTIONS: &[&str] = &[
     "claude-memory",
+    // Claude Code auto-memory (`~/.claude/projects/<cwd>/memory/`). A session only loads
+    // the MEMORY.md index of its own cwd, so without this a memory one session wrote never
+    // reached a session started elsewhere.
+    "claude-project-memory",
     "claude-rules",
     "claude-agents",
     "learnings",
@@ -316,8 +320,8 @@ fn is_structural_noise(p: &str) -> bool {
 /// 재빌드 없이 스윕하려면 런타임 값이어야 한다.
 fn collection_weight(coll: &str) -> f32 {
     match coll {
-        "claude-memory" | "claude-skills" | "claude-agents" | "claude-rules"
-        | "claude-contexts" => curated_weight(),
+        "claude-memory" | "claude-project-memory" | "claude-skills" | "claude-agents"
+        | "claude-rules" | "claude-contexts" => curated_weight(),
         "learnings" => 0.75,
         _ => 1.0,
     }
@@ -417,6 +421,20 @@ fn search_candidates(
     bm25::search_in(&config::tantivy_dir(), cfg, query, limit, Some(&scope_refs))
 }
 
+/// One injected hit per source: a learnings export is keyed by its session, because a
+/// session resumed on several days was exported once per day and the same passage came
+/// back two or three times in one `<kmd-context>` (seen on 2026-11-20 for `4c769ec1`).
+fn dedupe_key(file: &str) -> String {
+    if collection_of(file) == "learnings" {
+        let stem = file.rsplit('/').next().unwrap_or(file);
+        let stem = stem.strip_suffix(".md").unwrap_or(stem);
+        if let Some(id8) = stem.rsplit('-').next() {
+            return format!("learnings:{}", id8);
+        }
+    }
+    file.to_string()
+}
+
 pub fn filter_hits(hits: Vec<SearchHit>) -> Vec<SearchHit> {
     // L0 page index가 커버하는 learnings hit은 주입에서 제외 — 중복 주입 비용을
     // 줄인다. learnings 전체(1,995파일 260MB)를 파싱해야 하므로 데몬은 파일 단위
@@ -434,7 +452,7 @@ pub fn filter_hits(hits: Vec<SearchHit>) -> Vec<SearchHit> {
             if coll == "learnings" && is_l0_covered(&h.file, &id_axes) {
                 return false;
             }
-            seen.insert(h.file.clone())
+            seen.insert(dedupe_key(&h.file))
         })
         .collect();
     // 컬렉션 가중을 적용한 유효 점수로 재정렬 (원 score는 표시용으로 보존).
@@ -494,14 +512,19 @@ fn append_log(entry: &RagLogEntry) {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    if let Ok(line) = serde_json::to_string(entry) {
+    if let Ok(mut line) = serde_json::to_string(entry) {
         use std::io::Write;
+        // One write per record: every session's hook appends here at once, and `writeln!`
+        // issues the JSON and the newline as separate writes, so two hooks could produce
+        // `{A}{B}\n\n` — 9 lines of rag.jsonl were glued that way by 2026-11-20. A single
+        // O_APPEND write lands as one unit.
+        line.push('\n');
         if let Ok(mut f) = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(&path)
         {
-            let _ = writeln!(f, "{}", line);
+            let _ = f.write_all(line.as_bytes());
         }
     }
 }
@@ -939,6 +962,18 @@ mod tests {
             context: None,
             snippet: Some("x".into()),
         }
+    }
+
+    #[test]
+    fn filter_hits_keeps_one_export_per_session() {
+        let raw = vec![
+            hit("kmd://learnings/20260908-4c769ec1.md", 40.0),
+            hit("kmd://learnings/20260915-4c769ec1.md", 39.0),
+            hit("kmd://learnings/20260915-0badf00d.md", 30.0),
+        ];
+        let out = filter_hits(raw);
+        let same = out.iter().filter(|h| h.file.ends_with("-4c769ec1.md")).count();
+        assert!(same <= 1, "{:?}", out.iter().map(|h| &h.file).collect::<Vec<_>>());
     }
 
     #[test]
