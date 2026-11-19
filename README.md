@@ -120,6 +120,22 @@ else → `knowledge`), so existing configs keep working untouched.
 The `project` axis is deliberately excluded from the RAG hook's automatic injection
 (`rag.rs`'s `CLAUDE_COLLECTIONS`) — source files surface only when you ask for them.
 
+Claude Code's auto-memory lives per working directory (`~/.claude/projects/<cwd>/memory/`)
+and a session only loads its own cwd's `MEMORY.md` index. Index every project's memory as
+one collection so a memory written in one place reaches sessions started elsewhere; the
+RAG hook injects it as curated knowledge:
+
+```yaml
+  claude-project-memory:
+    path: ~/.claude/projects
+    pattern: "*/memory/**/*.md"
+```
+
+Learnings exports follow the same rules as the activity cards (`src/transcript.rs`): only
+user/assistant turns, human text as **User**, peer and plugin messages as **Relay**, and
+injected harness text dropped. After a rule change, `kmd learnings-extract --rebuild`
+re-exports every session whose transcript still exists and scrubs the rest in place.
+
 ### Indexing source code
 
 Code collections use `source: git-repos`, which finds git repositories under `path` and
