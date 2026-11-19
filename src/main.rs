@@ -15,6 +15,7 @@ mod dashboard_worker;
 mod embed;
 mod eval;
 mod evaluation_log;
+mod get;
 mod global;
 mod hook;
 mod hook_config;
@@ -59,6 +60,9 @@ enum Command {
         r#async: bool,
     },
     /// Keyword search (Korean morphological BM25)
+    ///
+    /// Each hit prints as `<score>  kmd://<collection>/<path>  <title>`.
+    /// Read a hit with `kmd get kmd://<collection>/<path>` (or `kmd get <docid>` from --json).
     Search {
         query: String,
         /// Max results
@@ -68,6 +72,23 @@ enum Command {
         #[arg(short, long)]
         collection: Option<String>,
         /// JSON output (docid/score/file/title/context/snippet)
+        #[arg(long)]
+        json: bool,
+    },
+    /// Print a document: a search hit's kmd:// URI, its docid, or a file path
+    ///
+    /// TARGET is what `kmd search` prints (kmd://<collection>/<path>), the `docid`
+    /// from `kmd search --json` (#06ab80 — quote it, or drop the `#`, which a shell
+    /// reads as a comment), or a file path. A `:<line>` suffix starts at that line.
+    Get {
+        target: String,
+        /// First line to print (1-based)
+        #[arg(long, value_name = "LINE")]
+        from: Option<usize>,
+        /// Number of lines to print
+        #[arg(short = 'l', long, value_name = "N")]
+        lines: Option<usize>,
+        /// JSON output (file/abspath/docid/title/content)
         #[arg(long)]
         json: bool,
     },
@@ -312,6 +333,12 @@ fn main() -> Result<()> {
             collection,
             json,
         } => cmd_search(&query, limit, collection.as_deref(), json),
+        Command::Get {
+            target,
+            from,
+            lines,
+            json,
+        } => get::run(&target, from, lines, json),
         Command::Global {
             query,
             limit,
