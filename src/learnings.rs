@@ -298,7 +298,9 @@ fn process_session_dir(dir: &Path, session_id: &str, dry_run: bool) -> Result<bo
         return Ok(true);
     }
 
-    let date_prefix = timestamp.get(..10).unwrap_or(&timestamp).replace('-', "");
+    // Snapshot stems look like `20260223T1…`; keep the eight date digits only, or the
+    // hour leaks into the name (`20260223 1-<id8>.md`, 286 such files by 2026-11-20).
+    let date_prefix: String = timestamp.chars().filter(char::is_ascii_digit).take(8).collect();
     let out = write_learning(&learnings_dir(), session_id, &date_prefix, &md)?;
     mark_processed(session_id)?;
     println!(
@@ -321,14 +323,22 @@ fn write_learning(dir: &Path, session_id: &str, date_prefix: &str, md: &str) -> 
     let name = format!("{}-{}.md", date_prefix, id8);
     let out = dir.join(&name);
     fs::write(&out, md)?;
-    let suffix = format!("-{}.md", id8);
     for entry in fs::read_dir(dir)?.flatten() {
         let other = entry.file_name().to_string_lossy().to_string();
-        if other != name && other.ends_with(&suffix) && other.len() == name.len() {
+        if other != name && export_id8(&other).as_deref() == Some(id8.as_str()) {
             fs::remove_file(entry.path())?;
         }
     }
     Ok(out)
+}
+
+/// The session an export file belongs to: `<8 date digits>[ <hour>]-<id8>.md`.
+fn export_id8(name: &str) -> Option<String> {
+    let stem = name.strip_suffix(".md")?;
+    let (date, id8) = stem.rsplit_once('-')?;
+    let dated = date.len() >= 8 && date.chars().take(8).all(|c| c.is_ascii_digit());
+    let hex = id8.len() == 8 && id8.chars().all(|c| c.is_ascii_hexdigit());
+    (dated && hex).then(|| id8.to_string())
 }
 
 /// Process a live Claude Code transcript without waiting for compaction.
@@ -427,10 +437,8 @@ pub fn rebuild(dry_run: bool) -> Result<()> {
     let mut by_session: std::collections::BTreeMap<String, Vec<String>> = Default::default();
     for entry in fs::read_dir(&dir)?.flatten() {
         let name = entry.file_name().to_string_lossy().to_string();
-        let Some(stem) = name.strip_suffix(".md") else { continue };
-        let Some((date, id8)) = stem.split_once('-') else { continue };
-        if date.len() == 8 && date.chars().all(|c| c.is_ascii_digit()) && id8.len() == 8 {
-            by_session.entry(id8.to_string()).or_default().push(name);
+        if let Some(id8) = export_id8(&name) {
+            by_session.entry(id8).or_default().push(name);
         }
     }
     let (mut dropped, mut reexported, mut scrubbed, mut unchanged) = (0, 0, 0, 0);
@@ -605,6 +613,8 @@ mod tests {
         fs::write(dir.join("20260908-4c769ec1.md"), "old").unwrap();
         fs::write(dir.join("20260912-4c769ec1.md"), "older").unwrap();
         fs::write(dir.join("20260912-99999999.md"), "other session").unwrap();
+        fs::write(dir.join("20260224 0-4c769ec1.md"), "snapshot-era name").unwrap();
+        fs::write(dir.join("README.md"), "not an export").unwrap();
         let out = write_learning(&dir, "4c769ec1-aaaa", "20260915", "new").unwrap();
         let mut names: Vec<String> = fs::read_dir(&dir)
             .unwrap()
@@ -612,7 +622,7 @@ mod tests {
             .map(|e| e.file_name().to_string_lossy().to_string())
             .collect();
         names.sort();
-        assert_eq!(names, vec!["20260912-99999999.md", "20260915-4c769ec1.md"]);
+        assert_eq!(names, vec!["20260912-99999999.md", "20260915-4c769ec1.md", "README.md"]);
         assert_eq!(fs::read_to_string(out).unwrap(), "new");
         let _ = fs::remove_dir_all(dir);
     }
