@@ -2,7 +2,7 @@
 //! tantivy 인덱스는 파생물이며, 여기가 source of truth.
 
 use anyhow::Result;
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use std::path::Path;
 
 pub struct Store {
@@ -160,6 +160,19 @@ impl Store {
             })
         })?;
         Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
+    /// (collection, relpath) → 문서 id. 검색 히트의 `kmd://collection/relpath`를
+    /// 거꾸로 푸는 데 쓴다. 비활성(삭제된) 문서는 없는 것으로 본다.
+    pub fn id_of(&self, collection: &str, relpath: &str) -> Result<Option<i64>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT id FROM documents WHERE collection = ?1 AND relpath = ?2 AND active = 1",
+                params![collection, relpath],
+                |r| r.get(0),
+            )
+            .optional()?)
     }
 
     pub fn is_active(&self, id: i64) -> Result<bool> {

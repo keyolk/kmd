@@ -88,6 +88,8 @@ which is why they lasted:
 ```sh
 kmd update              # index collections from ~/.config/kmd/index.yml
 kmd search "인증서 SAN" -n 5 --json
+kmd get kmd://wiki/tls/san.md        # open a hit: the kmd:// URI search prints, or its docid
+kmd get '#06ab80' --from 120 -l 40   # a slice; `kmd://…/file.md:120` also starts at line 120
 kmd status
 
 # Cross-axis search: past sessions, curated knowledge, and project source at once.
@@ -273,6 +275,10 @@ field: a hit's `file` is a `kmd://<collection>/<relpath>` URI, and `abspath` is
 the real path to open. It is absent only when the hit's collection is no longer
 in `index.yml`, in which case no path can be derived and saying so beats guessing.
 
+`kmd get <file>` prints a hit's content, given the `file` URI from either output,
+the `docid` (`'#06ab80'` or `06ab80`), or a path; `--json` returns
+file/abspath/docid/title/content. It reads the same index as search, without the daemon.
+
 ## MCP (other clients)
 
 Claude Code reaches kmd two ways already — the `UserPromptSubmit` hook injects
@@ -308,6 +314,7 @@ trip first, whereas `Bash(kmd:*)` is callable immediately.
 - `src/tokenize.rs` — lindera ko-dic (Korean) + lowercase/stemmer (English)
 - `src/bm25.rs` — tantivy index, dual ko/en fields, search + snippets
 - `src/global.rs` — cross-axis search (`kmd global`)
+- `src/get.rs` — print one document by URI, docid, or path (`kmd get`)
 - `src/mcp.rs` — MCP server over stdio (`kmd mcp`), for non-Claude-Code clients
 - `src/output.rs` — JSON / CLI output, per-axis rendering
 - `src/dashboard.rs` — operations TUI, JSON snapshot, checks and evaluation history

@@ -35,6 +35,29 @@ pub struct SearchHit {
     pub snippet: Option<String>,
 }
 
+/// `kmd get`이 출력하는 문서 하나. 필드는 검색 히트와 같은 방식으로 만든다
+/// (`docid_of`, `uri_of`, `resolve_abspath`) — 에이전트가 히트의 `file`이나
+/// `docid`를 그대로 넘기면 같은 문서가 돌아와야 하기 때문이다.
+#[derive(Debug, Serialize)]
+pub struct Document {
+    pub file: String,
+    pub abspath: Option<String>,
+    /// 인덱스 밖의 파일을 경로로 읽었으면 None.
+    pub docid: Option<String>,
+    pub title: String,
+    pub content: String,
+}
+
+/// 히트의 docid 표기. store 문서 id의 16진수.
+pub(crate) fn docid_of(doc_id: i64) -> String {
+    format!("#{:06x}", doc_id)
+}
+
+/// 히트의 `file` 표기: kmd://collection/relpath.
+pub(crate) fn uri_of(collection: &str, relpath: &str) -> String {
+    format!("kmd://{}/{}", collection, relpath)
+}
+
 struct Fields {
     doc_id: Field,
     collection: Field,
@@ -236,9 +259,9 @@ pub fn search_in(
         };
         let relpath = get_str(f.relpath);
         hits.push(SearchHit {
-            docid: format!("#{:06x}", doc_id),
+            docid: docid_of(doc_id),
             score,
-            file: format!("kmd://{}/{}", coll, relpath),
+            file: uri_of(&coll, &relpath),
             // 본문 미저장 문서는 인덱스가 절대경로를 들고 있다. 본문 저장
             // 문서는 컬렉션 루트 + relpath로 만든다.
             abspath: resolve_abspath(cfg, &abspath, &coll, &relpath),
@@ -251,6 +274,59 @@ pub fn search_in(
         }
     }
     Ok(hits)
+}
+
+/// store 문서 id로 인덱스의 문서 하나를 꺼낸다(`kmd get`).
+///
+/// 검색과 같은 tantivy 문서에서 읽으므로, 검색이 보여 준 히트는 여기서도
+/// 같은 본문으로 열린다. 본문 미저장 문서는 원본 파일을 읽는다. 인덱스에는
+/// 있는데 원본이 사라졌으면 에러다 — 검색은 그런 히트를 조용히 버리지만,
+/// 여기서는 호출자가 그 문서를 콕 집어 달라고 했으므로 이유를 알려 준다.
+pub fn fetch(dir: &Path, cfg: &IndexConfig, doc_id: i64) -> Result<Option<Document>> {
+    let (index, f) = open_or_create(dir)?;
+    let searcher = index.reader()?.searcher();
+    let q = TermQuery::new(
+        Term::from_field_i64(f.doc_id, doc_id),
+        IndexRecordOption::Basic,
+    );
+    let Some((_, addr)) = searcher
+        .search(&q, &TopDocs::with_limit(1))?
+        .into_iter()
+        .next()
+    else {
+        return Ok(None);
+    };
+    let retrieved: TantivyDocument = searcher.doc(addr)?;
+    let get_str = |field: Field| -> String {
+        retrieved
+            .get_first(field)
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string()
+    };
+    let coll = get_str(f.collection);
+    let relpath = get_str(f.relpath);
+    let file = uri_of(&coll, &relpath);
+    let indexed = get_str(f.abspath);
+    let content = if indexed.is_empty() {
+        get_str(f.body_stored)
+    } else {
+        std::fs::read_to_string(&indexed).map_err(|e| {
+            anyhow::anyhow!(
+                "{} is indexed but its file {} cannot be read ({}) — run `kmd update`",
+                file,
+                indexed,
+                e
+            )
+        })?
+    };
+    Ok(Some(Document {
+        abspath: resolve_abspath(cfg, &indexed, &coll, &relpath),
+        docid: Some(docid_of(doc_id)),
+        file,
+        title: get_str(f.title),
+        content,
+    }))
 }
 
 /// 히트의 읽을 수 있는 절대경로.
