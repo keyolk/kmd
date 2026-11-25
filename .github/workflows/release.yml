@@ -1,0 +1,201 @@
+name: release
+
+# Every merge to main publishes the next patch release (latest v* tag + 1, or
+# v0.1.0 when there is none), so a workspace that installs kmd from its
+# release is never older than main. Push a v* tag yourself for a minor/major
+# bump; later merges count up from it. Docs-only merges do not release.
+# pull_request and workflow_dispatch build every platform in snapshot mode,
+# publish nothing, and keep the archives on the run as the `dist` artifact.
+#
+# Asset contract (an installer depends on it; keep it stable):
+#   kmd_<version>_<os>_<arch>.tar.gz with the binary at the archive root,
+#   plus checksums.txt (sha256) covering every archive.
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+    paths-ignore: ["**.md", "docs/**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+# One release run at a time, never cancelled mid-upload, so two quick merges
+# cannot both pick the same next patch number. GitHub keeps only the newest
+# pending run; a merge whose run is dropped ships in the next one.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  version:
+    runs-on: ubuntu-22.04
+    outputs:
+      skip: ${{ steps.v.outputs.skip }}
+      publish: ${{ steps.v.outputs.publish }}
+      tag: ${{ steps.v.outputs.tag }}
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+
+      - id: v
+        shell: bash
+        run: |
+          next_patch() {
+            local last
+            last=$(git tag -l 'v[0-9]*' --sort=-v:refname | head -1)
+            if [ -z "$last" ]; then echo "v0.1.0"; return; fi
+            last=${last#v}
+            IFS=. read -r ma mi pa <<<"${last%%-*}"
+            echo "v$ma.$mi.$((pa + 1))"
+          }
+          if [ "$GITHUB_EVENT_NAME" = push ] && [ "$GITHUB_REF_TYPE" = tag ]; then
+            tag=$GITHUB_REF_NAME
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          elif [ "$GITHUB_EVENT_NAME" = push ]; then
+            if [ -n "$(git tag --points-at HEAD 'v*')" ]; then
+              echo "HEAD is already released as $(git tag --points-at HEAD 'v*')"
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            # The release job creates this tag on the built commit only after
+            # every platform built, so a failed build leaves no orphan tag.
+            # A tag created with GITHUB_TOKEN starts no workflow, so it does
+            # not trigger a second run of this one.
+            tag=$(next_patch)
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          else
+            tag="$(next_patch)-SNAPSHOT-$(git rev-parse --short=7 HEAD)"
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
+          echo "building $tag"
+
+  build:
+    needs: version
+    if: needs.version.outputs.skip != 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Built natively on ubuntu-22.04 so the binary needs glibc <= 2.35.
+          # x86-64-v3 (AVX2/FMA/F16C, every x86 server CPU since ~2015):
+          # llama-cpp-sys-2 turns off GGML_NATIVE and enables ggml's SIMD
+          # kernels only from the Rust target features, so the x86-64
+          # baseline would run embeddings on scalar code.
+          - os: linux
+            arch: amd64
+            runner: ubuntu-22.04
+            features: embed,llama-cpp-2/static-openmp
+            rustflags: -C target-cpu=x86-64-v3
+          # llama-cpp-sys-2 pins ggml to armv8-a on aarch64 Linux, which runs
+          # on every arm64 host (Graviton, Ampere, Apple VMs).
+          - os: linux
+            arch: arm64
+            runner: ubuntu-22.04-arm
+            features: embed,llama-cpp-2/static-openmp
+            rustflags: ""
+          - os: darwin
+            arch: arm64
+            runner: macos-14
+            features: embed
+            rustflags: ""
+    runs-on: ${{ matrix.runner }}
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+      RUSTFLAGS: ${{ matrix.rustflags }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # cmake builds llama.cpp; bindgen needs libclang.
+      - if: matrix.os == 'linux'
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake clang libclang-dev
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.os }}-${{ matrix.arch }}
+
+      # clap prints CARGO_PKG_VERSION for --version, so stamp the release
+      # version into the manifest; the released binary then reports its tag.
+      - name: Stamp version
+        shell: bash
+        run: perl -0pi -e 's/^version = "[^"]*"/version = "$ENV{VERSION}"/m' Cargo.toml
+
+      # Same feature set as `make install` (build-embed), so the release has
+      # vector search. On Linux the `metal` feature of llama-cpp-2 is a no-op
+      # (ggml enables Metal only on Apple), so this is the CPU backend.
+      # static-openmp links libgomp into the binary: ubuntu base images do
+      # not ship libgomp1.
+      - name: Build
+        shell: bash
+        run: cargo build --release --features "${{ matrix.features }}"
+
+      - name: Smoke test
+        shell: bash
+        run: |
+          ./target/release/kmd --version
+          ./target/release/kmd --version | grep -qF "$VERSION"
+
+      - name: Package
+        shell: bash
+        run: |
+          name="kmd_${VERSION}_${{ matrix.os }}_${{ matrix.arch }}"
+          mkdir -p "stage/$name" dist
+          cp target/release/kmd README.md "stage/$name/"
+          # Binary at the archive root: the installer extracts without a prefix.
+          tar -C "stage/$name" -czf "dist/$name.tar.gz" .
+          tar -tzvf "dist/$name.tar.gz"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kmd_${{ matrix.os }}_${{ matrix.arch }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  release:
+    needs: [version, build]
+    if: needs.version.outputs.skip != 'true'
+    runs-on: ubuntu-22.04
+    env:
+      TAG: ${{ needs.version.outputs.tag }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: kmd_*
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        working-directory: dist
+        run: |
+          sha256sum kmd_*.tar.gz > checksums.txt
+          cat checksums.txt
+
+      - if: needs.version.outputs.publish != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: |
+            dist/*.tar.gz
+            dist/checksums.txt
+
+      # For a merge to main the tag does not exist yet; gh creates it on the
+      # built commit. For a pushed v* tag it already points there.
+      - if: needs.version.outputs.publish == 'true'
+        name: Publish
+        run: |
+          gh release create "$TAG" dist/kmd_*.tar.gz dist/checksums.txt \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "$TAG" \
+            --generate-notes
